@@ -3,6 +3,7 @@ uvicorn==0.48.0
 SQLAlchemy==2.0.50
 pydantic==2.13.4
 httpx==0.28.1
+cryptography==49.0.0
 opentelemetry-api==1.44.0
 opentelemetry-sdk==1.44.0
 opentelemetry-exporter-otlp-proto-http==1.44.0

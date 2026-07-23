@@ -65,7 +65,8 @@ Detailed design: [`ARCHITECTURE.md`](ARCHITECTURE.md). Security model:
 ## Implemented safety properties
 
 - All protected operator endpoints require `X-Operator-Key`.
-- Node and activation credentials are returned once and stored only as HMAC-SHA256 digests.
+- Node and activation credentials are stored only as HMAC-SHA256 digests; exact
+  idempotent retries can recover them from short-lived AES-GCM response envelopes.
 - Activation-token consumption is serialized and succeeds at most once under concurrency.
 - Expired leases and expired unactivated spawn intents cannot be revived.
 - `CANCEL_RUN` is restricted to the human operator or root coordinator and must target the root.
@@ -85,7 +86,7 @@ Detailed design: [`ARCHITECTURE.md`](ARCHITECTURE.md). Security model:
 - A supervised invariant auditor persists stale-commit violations and an at-least-once
   telemetry outbox independently of proof requests.
 - Request-body size and process-local rate limits are enforced before route execution.
-- Database schema version **15** validates required tables, columns, indexes, foreign keys and
+- Database schema version **16** validates required tables, columns, indexes, foreign keys and
   check constraints and fails closed on incompatible databases.
 - Missing, ambiguous or contradictory SigNoz evidence cannot become `VERIFIED`.
 
@@ -121,10 +122,11 @@ make install-full    # runtime + test/static tools + MCP/OTel instrumentation
 cp .env.example .env
 python -c "import secrets; print(secrets.token_urlsafe(32))"  # operator key
 python -c "import secrets; print(secrets.token_urlsafe(48))"  # token hash secret
+python -c "import secrets; print(secrets.token_urlsafe(48))"  # credential recovery key
 python -c "import secrets; print(secrets.token_urlsafe(48))"  # evidence signing key
 ```
 
-Use three independently generated values. Export the file in each terminal:
+Use four independently generated values. Export the file in each terminal:
 
 ```bash
 set -a
@@ -136,6 +138,18 @@ export PYTHONPATH=src
 Outside `TRACEFENCE_ENV=test`, startup fails closed when secrets are missing, too short,
 placeholder-like or reused across trust domains. Invalid boolean/integer environment values
 also fail closed.
+
+Credential-bearing spawn, replacement and activation requests should always supply a stable
+`operation_key`. Before commit, a failure rolls back the node, token digest and envelope
+together. After commit but before the response, or after a response is lost, an authenticated
+exact retry returns the same encrypted response while the envelope is live. A different
+payload under the key conflicts. After envelope expiry, a still-pending activation credential
+or a live node credential is rotated atomically; an inactive or terminal subject is not
+revived. An activation-expired replacement remains terminal; its designated live parent must
+use a new operation key to register a new pending attempt under the same immutable correction
+manifest. The database stores only credential digests and authenticated ciphertext. Recovery
+uses `TRACEFENCE_CREDENTIAL_RECOVERY_KEY`, independently generated from operator, token-hash
+and evidence keys, with the bounded `TRACEFENCE_CREDENTIAL_RECOVERY_TTL_SECONDS` lifetime.
 
 Reset an incompatible local database explicitly:
 

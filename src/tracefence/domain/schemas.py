@@ -67,6 +67,7 @@ class RunCreated(BaseModel):
 
 
 class SpawnCreate(StrictModel):
+    operation_key: str | None = Field(default=None, min_length=4, max_length=160)
     role: str = Field(min_length=1, max_length=80)
     instruction: dict[str, Any] = Field(default_factory=dict)
     capabilities: list[str] = Field(default_factory=list, max_length=32)
@@ -86,6 +87,7 @@ class SpawnCreated(BaseModel):
 
 
 class NodeActivate(StrictModel):
+    operation_key: str | None = Field(default=None, min_length=4, max_length=160)
     activation_token: str = Field(min_length=16)
     process_id: int | None = Field(default=None, ge=1)
 

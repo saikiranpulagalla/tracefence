@@ -208,7 +208,7 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 def init_db(target_engine: Engine | None = None) -> None:

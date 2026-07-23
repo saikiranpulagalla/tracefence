@@ -129,9 +129,9 @@ class Node(Base):
             "status != 'COMPLETED' OR completed_at IS NOT NULL",
             name="ck_node_completion_shape",
         ),
-        UniqueConstraint("caused_by_command_id", name="uq_node_replacement_command"),
         Index("ix_nodes_run", "run_id"),
         Index("ix_nodes_parent", "parent_id"),
+        Index("ix_nodes_caused_by_command", "caused_by_command_id"),
         Index("ix_nodes_lineage", "lineage_path"),
         Index("ix_nodes_lease", "lease_expires_at"),
         Index("ix_nodes_status", "status"),
@@ -222,6 +222,45 @@ class SpawnIntent(Base):
     trace_context_json: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class CredentialRecoveryEnvelope(Base):
+    __tablename__ = "credential_recovery_envelopes"
+    __table_args__ = (
+        UniqueConstraint(
+            "operation_type",
+            "caller_node_id",
+            "operation_key",
+            name="uq_credential_recovery_operation",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "caller_node_id"],
+            ["nodes.run_id", "nodes.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "subject_node_id"],
+            ["nodes.run_id", "nodes.id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "operation_type IN ('SPAWN','REPLACEMENT','ACTIVATION')",
+            name="ck_credential_recovery_operation_type",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    operation_type: Mapped[str] = mapped_column(String(24))
+    caller_node_id: Mapped[str] = mapped_column(String(36))
+    subject_node_id: Mapped[str] = mapped_column(String(36))
+    operation_key: Mapped[str] = mapped_column(String(160))
+    request_payload_digest: Mapped[str] = mapped_column(String(64))
+    nonce: Mapped[str] = mapped_column(String(24))
+    ciphertext: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class CorrectionProposal(Base):

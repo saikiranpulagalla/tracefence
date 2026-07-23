@@ -14,6 +14,7 @@ from tracefence.db.models import (
     CommandAcknowledgement,
     ControlCommand,
     ControlScope,
+    CredentialRecoveryEnvelope,
     Node,
     Run,
     SpawnIntent,
@@ -43,6 +44,12 @@ from tracefence.services.common import (
     utcnow,
     validate_node_runtime_state,
 )
+from tracefence.services.credential_recovery import (
+    find_envelope,
+    open_envelope,
+    recovery_request_digest,
+    seal_envelope,
+)
 from tracefence.services.run_lifecycle import transition_run
 from tracefence.telemetry.instruments import telemetry
 
@@ -56,6 +63,7 @@ class SpawnService:
     async def create_spawn(
         self, parent_node_id: str, parent_token: str, request: SpawnCreate
     ) -> SpawnCreated:
+        request_digest = recovery_request_digest(request)
         with telemetry.tracer.start_as_current_span(
             "tracefence.node.spawn_authorize"
         ) as span:
@@ -65,17 +73,51 @@ class SpawnService:
                 session.execute(text("BEGIN IMMEDIATE"))
                 try:
                     parent = await authenticate_node(session, parent_node_id, parent_token)
-                    allowed, reason, _ = await validate_node_runtime_state(session, parent)
-                    if not allowed:
-                        raise ConflictError(
-                            f"Parent cannot spawn: {reason}", code=reason or "SPAWN_DENIED"
+                    recovered = False
+                    if request.operation_key is not None:
+                        envelope = find_envelope(
+                            session,
+                            operation_type="SPAWN",
+                            caller_node_id=parent.id,
+                            operation_key=request.operation_key,
+                            request_digest=request_digest,
                         )
-                    self._enforce_graph_budget(session, parent)
-                    self._enforce_parent_child_budget(session, parent)
-                    self._validate_capability_delegation(parent, request)
-                    created = self._create_spawn_locked(
-                        session, parent, request, trace_context=carrier
-                    )
+                        if envelope is not None:
+                            created = self._recover_spawn_response(
+                                session,
+                                envelope,
+                            )
+                            recovered = True
+                    if not recovered:
+                        allowed, reason, _ = await validate_node_runtime_state(
+                            session, parent
+                        )
+                        if not allowed:
+                            raise ConflictError(
+                                f"Parent cannot spawn: {reason}",
+                                code=reason or "SPAWN_DENIED",
+                            )
+                        self._enforce_graph_budget(session, parent)
+                        self._enforce_parent_child_budget(session, parent)
+                        self._validate_capability_delegation(parent, request)
+                        created = self._create_spawn_locked(
+                            session, parent, request, trace_context=carrier
+                        )
+                        if request.operation_key is not None:
+                            # The envelope's composite subject FK requires the
+                            # newly registered node to exist first.
+                            session.flush()
+                            seal_envelope(
+                                session,
+                                existing=None,
+                                run_id=parent.run_id,
+                                operation_type="SPAWN",
+                                caller_node_id=parent.id,
+                                subject_node_id=created.child_node_id,
+                                operation_key=request.operation_key,
+                                request_digest=request_digest,
+                                response=created,
+                            )
                     session.commit()
                 except Exception:
                     session.rollback()
@@ -91,6 +133,7 @@ class SpawnService:
         permanent_token = generate_token()
         now = utcnow()
         lease_expires_at = now + timedelta(seconds=settings.lease_ttl_seconds)
+        request_digest = recovery_request_digest(request)
 
         with self.session_factory() as session:
             # Serialize token consumption before checking consumed_at. This makes
@@ -109,6 +152,50 @@ class SpawnService:
                     raise ConflictError(
                         "Invalid activation token", code="INVALID_ACTIVATION_TOKEN"
                     )
+                if request.operation_key is not None:
+                    envelope = find_envelope(
+                        session,
+                        operation_type="ACTIVATION",
+                        caller_node_id=node.id,
+                        operation_key=request.operation_key,
+                        request_digest=request_digest,
+                    )
+                    if envelope is not None:
+                        if envelope.expires_at > now:
+                            recovered = open_envelope(envelope, NodeActivated)
+                            session.commit()
+                            return NodeActivated.model_validate(recovered)
+                        if (
+                            node.status not in {NodeStatus.ACTIVE, NodeStatus.WAITING}
+                            or node.lease_expires_at is None
+                            or node.lease_expires_at <= now
+                        ):
+                            raise ConflictError(
+                                "Expired activation recovery cannot revive an inactive node",
+                                code="CREDENTIAL_RECOVERY_EXPIRED",
+                            )
+                        permanent_token = generate_token()
+                        node.token_hash = hash_token(permanent_token)
+                        rotated = NodeActivated(
+                            node_id=node.id,
+                            run_id=node.run_id,
+                            role=node.role,
+                            node_token=permanent_token,
+                            lease_expires_at=node.lease_expires_at,
+                        )
+                        seal_envelope(
+                            session,
+                            existing=envelope,
+                            run_id=node.run_id,
+                            operation_type="ACTIVATION",
+                            caller_node_id=node.id,
+                            subject_node_id=node.id,
+                            operation_key=request.operation_key,
+                            request_digest=request_digest,
+                            response=rotated,
+                        )
+                        session.commit()
+                        return rotated
                 if intent.consumed_at is not None:
                     raise ConflictError(
                         "Activation token already used", code="ACTIVATION_TOKEN_USED"
@@ -146,6 +233,25 @@ class SpawnService:
                             code="REPLACEMENT_LIFECYCLE_INVALID",
                         )
                     command.replacement_status = ReplacementStatus.ACTIVE
+                activated = NodeActivated(
+                    node_id=node_id,
+                    run_id=node.run_id,
+                    role=node.role,
+                    node_token=permanent_token,
+                    lease_expires_at=lease_expires_at,
+                )
+                if request.operation_key is not None:
+                    seal_envelope(
+                        session,
+                        existing=None,
+                        run_id=node.run_id,
+                        operation_type="ACTIVATION",
+                        caller_node_id=node.id,
+                        subject_node_id=node.id,
+                        operation_key=request.operation_key,
+                        request_digest=request_digest,
+                        response=activated,
+                    )
                 session.commit()
             except Exception:
                 session.rollback()
@@ -154,13 +260,7 @@ class SpawnService:
         logger.info("node_activated node_id=%s", node_id)
         with telemetry.tracer.start_as_current_span("tracefence.node.activate") as span:
             span.set_attribute("tracefence.node.id", node_id)
-        return NodeActivated(
-            node_id=node_id,
-            run_id=node.run_id,
-            role=node.role,
-            node_token=permanent_token,
-            lease_expires_at=lease_expires_at,
-        )
+        return activated
 
     async def heartbeat(self, node_id: str, node_token: str) -> Node:
         now = utcnow()
@@ -387,6 +487,10 @@ class SpawnService:
         correction_command_id: str,
         request: SpawnCreate,
     ) -> SpawnCreated:
+        request_digest = recovery_request_digest(
+            request,
+            context=correction_command_id,
+        )
         with telemetry.tracer.start_as_current_span(
             "tracefence.node.spawn_replacement"
         ) as span:
@@ -396,13 +500,45 @@ class SpawnService:
                 session.execute(text("BEGIN IMMEDIATE"))
                 try:
                     parent = await authenticate_node(session, parent_node_id, parent_token)
-                    allowed, reason, _ = await validate_node_runtime_state(session, parent)
-                    if not allowed:
-                        raise ConflictError(
-                            f"Replacement parent is not live: {reason}",
-                            code=reason or "REPLACEMENT_PARENT_DENIED",
+                    recovered = False
+                    command: ControlCommand | None = None
+                    if request.operation_key is not None:
+                        envelope = find_envelope(
+                            session,
+                            operation_type="REPLACEMENT",
+                            caller_node_id=parent.id,
+                            operation_key=request.operation_key,
+                            request_digest=request_digest,
                         )
-                    command = session.get(ControlCommand, correction_command_id)
+                        if envelope is not None:
+                            command = session.get(
+                                ControlCommand,
+                                correction_command_id,
+                            )
+                            if (
+                                command is None
+                                or command.replacement_node_id
+                                != envelope.subject_node_id
+                            ):
+                                raise ConflictError(
+                                    "Recovered replacement does not match the command",
+                                    code="CREDENTIAL_RECOVERY_SUBJECT_MISMATCH",
+                                )
+                            created = self._recover_spawn_response(
+                                session,
+                                envelope,
+                            )
+                            recovered = True
+                    if not recovered:
+                        allowed, reason, _ = await validate_node_runtime_state(
+                            session, parent
+                        )
+                        if not allowed:
+                            raise ConflictError(
+                                f"Replacement parent is not live: {reason}",
+                                code=reason or "REPLACEMENT_PARENT_DENIED",
+                            )
+                        command = session.get(ControlCommand, correction_command_id)
                     if command is None:
                         raise NotFoundError(
                             f"Correction command {correction_command_id} was not found"
@@ -418,13 +554,25 @@ class SpawnService:
                         raise AuthorizationError(
                             "Only the command-designated parent may create the replacement"
                         )
-                    if command.replacement_node_id is not None:
-                        raise ConflictError(
-                            "Correction command already has a replacement node",
-                            code="REPLACEMENT_ALREADY_CREATED",
+                    if not recovered and command.replacement_node_id is not None:
+                        prior_replacement = session.get(
+                            Node,
+                            command.replacement_node_id,
                         )
+                        retry_allowed = (
+                            command.replacement_status
+                            == ReplacementStatus.ACTIVATION_EXPIRED
+                            and prior_replacement is not None
+                            and prior_replacement.status == NodeStatus.LEASE_EXPIRED
+                        )
+                        if not retry_allowed:
+                            raise ConflictError(
+                                "Correction command already has a replacement node",
+                                code="REPLACEMENT_ALREADY_CREATED",
+                            )
 
-                    self._enforce_graph_budget(session, parent)
+                    if not recovered:
+                        self._enforce_graph_budget(session, parent)
 
                     old = session.get(Node, command.target_node_id)
                     scope = session.get(ControlScope, command.target_scope_id)
@@ -499,20 +647,34 @@ class SpawnService:
                         )
                     self._validate_capability_delegation(parent, request)
 
-                    created = self._create_spawn_locked(
-                        session,
-                        parent,
-                        request,
-                        supersedes_node_id=old.id,
-                        caused_by_command_id=command.id,
-                        instruction_version=old.instruction_version + 1,
-                        trace_context=carrier,
-                    )
-                    # The command's replacement FK points at the newly inserted
-                    # node. Flush the node/scope/intent first so SQLite can validate
-                    # the subsequent command update without relying on ORM ordering.
-                    session.flush()
-                    command.replacement_node_id = created.child_node_id
+                    if not recovered:
+                        created = self._create_spawn_locked(
+                            session,
+                            parent,
+                            request,
+                            supersedes_node_id=old.id,
+                            caused_by_command_id=command.id,
+                            instruction_version=old.instruction_version + 1,
+                            trace_context=carrier,
+                        )
+                        # The command's replacement FK points at the newly inserted
+                        # node. Flush the node/scope/intent first so SQLite can validate
+                        # the subsequent command update without relying on ORM ordering.
+                        session.flush()
+                        command.replacement_node_id = created.child_node_id
+                        command.replacement_status = ReplacementStatus.PENDING
+                        if request.operation_key is not None:
+                            seal_envelope(
+                                session,
+                                existing=None,
+                                run_id=parent.run_id,
+                                operation_type="REPLACEMENT",
+                                caller_node_id=parent.id,
+                                subject_node_id=created.child_node_id,
+                                operation_key=request.operation_key,
+                                request_digest=request_digest,
+                                response=created,
+                            )
                     session.commit()
                 except Exception:
                     session.rollback()
@@ -525,6 +687,55 @@ class SpawnService:
 
         self._record_spawn(parent_node_id, created.child_node_id, request.role)
         return created
+
+    @staticmethod
+    def _recover_spawn_response(
+        session: Session,
+        envelope: CredentialRecoveryEnvelope,
+    ) -> SpawnCreated:
+        now = utcnow()
+        node = session.get(Node, envelope.subject_node_id)
+        intent = session.execute(
+            select(SpawnIntent).where(
+                SpawnIntent.child_node_id == envelope.subject_node_id
+            )
+        ).scalar_one_or_none()
+        if (
+            node is None
+            or intent is None
+            or node.status != NodeStatus.PENDING
+            or intent.consumed_at is not None
+            or intent.expires_at <= now
+        ):
+            raise ConflictError(
+                "Spawn credential is no longer recoverable",
+                code="CREDENTIAL_RECOVERY_EXPIRED",
+            )
+        if envelope.expires_at > now:
+            recovered = open_envelope(envelope, SpawnCreated)
+            return SpawnCreated.model_validate(recovered)
+
+        activation_token = generate_token()
+        intent.activation_token_hash = hash_token(activation_token)
+        intent.expires_at = utcnow() + timedelta(seconds=60)
+        recovered = SpawnCreated(
+            child_node_id=node.id,
+            activation_token=activation_token,
+            expires_at=intent.expires_at,
+            trace_context=dict(intent.trace_context_json or {}),
+        )
+        seal_envelope(
+            session,
+            existing=envelope,
+            run_id=envelope.run_id,
+            operation_type=envelope.operation_type,
+            caller_node_id=envelope.caller_node_id,
+            subject_node_id=envelope.subject_node_id,
+            operation_key=envelope.operation_key,
+            request_digest=envelope.request_payload_digest,
+            response=recovered,
+        )
+        return recovered
 
     def _create_spawn_locked(
         self,
