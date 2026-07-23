@@ -6,7 +6,7 @@ import time
 from collections import Counter
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -19,7 +19,7 @@ from tracefence.db.models import (
     CommandAcknowledgement,
     ControlCommand,
     Node,
-    InvariantViolation,
+    Run,
     ServiceState,
 )
 from tracefence.domain.enums import (
@@ -36,13 +36,30 @@ from tracefence.services.action_gateway import STALE_REASONS
 from tracefence.services.common import descendants_including_self, evaluate_scopes, utcnow
 from tracefence.services.invariant_service import InvariantService
 from tracefence.telemetry.instruments import telemetry
-from tracefence.telemetry.setup import force_flush_telemetry
+from tracefence.telemetry.setup import force_flush_telemetry, telemetry_export_watermark
+
+
+_MAX_PROOF_STABILITY_ATTEMPTS = 3
+
+
+@dataclass(frozen=True, slots=True)
+class _ProofContext:
+    run_id: str
+    revision: int
+    nearest_lease_expiry: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CacheKey:
+    command_id: str
+    revision: int
+    export_watermark: str
+    nearest_lease_expiry: datetime | None
 
 
 @dataclass(slots=True)
 class _CacheEntry:
     expires_at: float
-    runtime_fingerprint: str
     response: ProofResponse
 
 
@@ -54,7 +71,7 @@ class ProofService:
     ) -> None:
         self.session_factory = session_factory
         self.mcp_client = mcp_client or SigNozMCPClient()
-        self._cache: dict[str, _CacheEntry] = {}
+        self._cache: dict[_CacheKey, _CacheEntry] = {}
         self._state_lock = threading.RLock()
         self._inflight: dict[str, Future[ProofResponse]] = {}
         self.invariants = InvariantService(session_factory)
@@ -67,14 +84,25 @@ class ProofService:
         safe to coordinate across those loops: one caller builds while all other
         callers await the identical immutable result.
         """
+        initial_context = self._current_context(command_id)
+        initial_watermark = telemetry_export_watermark()
+        initial_key = (
+            self._cache_key(command_id, initial_context, initial_watermark)
+            if initial_watermark is not None
+            else None
+        )
         now_mono = time.monotonic()
         with self._state_lock:
             self._prune_cache_locked(now_mono)
-            cached = self._cache.get(command_id)
+            for key in [
+                key
+                for key in self._cache
+                if key.command_id == command_id and key != initial_key
+            ]:
+                self._cache.pop(key, None)
+            cached = self._cache.get(initial_key) if initial_key is not None else None
             if cached is not None and cached.expires_at > now_mono:
-                if cached.runtime_fingerprint == self._runtime_fingerprint(command_id):
-                    return cached.response.model_copy(deep=True)
-                self._cache.pop(command_id, None)
+                return cached.response.model_copy(deep=True)
 
             inflight = self._inflight.get(command_id)
             if inflight is None:
@@ -89,18 +117,44 @@ class ProofService:
             return response.model_copy(deep=True)
 
         try:
-            response = await self._build_uncached(command_id)
-            fingerprint = self._runtime_fingerprint(command_id)
-            stored = response.model_copy(deep=True)
+            last_response: ProofResponse | None = None
+            for _attempt in range(_MAX_PROOF_STABILITY_ATTEMPTS):
+                response, context = await self._build_uncached(command_id)
+                last_response = response
+                if self._read_revision(context.run_id) != context.revision:
+                    continue
+
+                watermark = telemetry_export_watermark()
+                expires_at = self._cache_expiry(context.nearest_lease_expiry)
+                stored = response.model_copy(deep=True)
+                with self._state_lock:
+                    if watermark is not None and expires_at > time.monotonic():
+                        key = self._cache_key(command_id, context, watermark)
+                        self._cache[key] = _CacheEntry(
+                            expires_at=expires_at,
+                            response=stored,
+                        )
+                    self._inflight.pop(command_id, None)
+                    inflight.set_result(stored.model_copy(deep=True))
+                return response
+
+            if last_response is None:
+                raise RuntimeError("Proof stability loop did not execute")
+            unstable = last_response.model_copy(
+                update={
+                    "runtime_verdict": ProofVerdict.STATE_CHANGED_DURING_PROOF,
+                    "overall_verdict": ProofVerdict.STATE_CHANGED_DURING_PROOF,
+                    "discrepancies": [
+                        *last_response.discrepancies,
+                        "STATE_CHANGED_DURING_PROOF",
+                    ],
+                }
+            )
+            stored = unstable.model_copy(deep=True)
             with self._state_lock:
-                self._cache[command_id] = _CacheEntry(
-                    expires_at=time.monotonic() + settings.proof_cache_seconds,
-                    runtime_fingerprint=fingerprint,
-                    response=stored,
-                )
                 self._inflight.pop(command_id, None)
                 inflight.set_result(stored.model_copy(deep=True))
-            return response
+            return unstable
         except BaseException as exc:
             with self._state_lock:
                 self._inflight.pop(command_id, None)
@@ -114,102 +168,64 @@ class ProofService:
         ]:
             self._cache.pop(key, None)
 
-    def _runtime_fingerprint(self, command_id: str) -> str:
-        """Hash authoritative runtime inputs so cached proof cannot outlive state changes."""
+    def _current_context(self, command_id: str) -> _ProofContext:
         with self.session_factory() as session:
             command = session.get(ControlCommand, command_id)
             if command is None:
-                return "missing"
-            nodes = session.execute(
-                select(Node).where(Node.run_id == command.run_id).order_by(Node.id)
-            ).scalars().all()
-            actions = session.execute(
-                select(ActionAttempt)
-                .where(ActionAttempt.run_id == command.run_id)
-                .order_by(ActionAttempt.id)
-            ).scalars().all()
-            states = session.execute(
-                select(ServiceState)
-                .where(ServiceState.run_id == command.run_id)
-                .order_by(ServiceState.service_name)
-            ).scalars().all()
-            acknowledgements = session.execute(
-                select(CommandAcknowledgement)
-                .where(CommandAcknowledgement.run_id == command.run_id)
-                .order_by(CommandAcknowledgement.id)
-            ).scalars().all()
-            violations = session.execute(
-                select(InvariantViolation)
-                .where(InvariantViolation.run_id == command.run_id)
-                .order_by(InvariantViolation.id)
-            ).scalars().all()
-            return payload_digest(
-                {
-                    "command": {
-                        "id": command.id,
-                        "manifest_digest": command.replacement_manifest_digest,
-                        "replacement_node_id": command.replacement_node_id,
-                    },
-                    "nodes": [
-                        {
-                            "id": node.id,
-                            "status": node.status,
-                            "role": node.role,
-                            "behavior": node.behavior,
-                            "capabilities": node.capabilities_json,
-                            "instruction_version": node.instruction_version,
-                            "completed_at": node.completed_at,
-                            "lease_expires_at": node.lease_expires_at,
-                        }
-                        for node in nodes
-                    ],
-                    "actions": [
-                        {
-                            "id": action.id,
-                            "node_id": action.node_id,
-                            "tool": action.tool_name,
-                            "decision": action.decision,
-                            "arguments": action.arguments_json,
-                            "arguments_digest": action.arguments_digest,
-                            "result_digest": action.result_digest,
-                            "committed_at": action.committed_at,
-                        }
-                        for action in actions
-                    ],
-                    "states": [
-                        {
-                            "service": state.service_name,
-                            "status": state.status,
-                            "restart_count": state.restart_count,
-                            "pool_reset_count": state.pool_reset_count,
-                            "last_action_id": state.last_action_id,
-                            "updated_at": state.updated_at,
-                        }
-                        for state in states
-                    ],
-                    "acks": [
-                        {
-                            "command_id": ack.command_id,
-                            "node_id": ack.node_id,
-                            "ack_type": ack.ack_type,
-                            "observed_at": ack.observed_at,
-                        }
-                        for ack in acknowledgements
-                    ],
-                    "violations": [
-                        {
-                            "id": violation.id,
-                            "command_id": violation.command_id,
-                            "action_id": violation.action_id,
-                            "type": violation.violation_type,
-                            "detected_at": violation.detected_at,
-                        }
-                        for violation in violations
-                    ],
-                }
+                raise NotFoundError(f"Command {command_id} was not found")
+            run = session.get(Run, command.run_id)
+            if run is None:
+                raise NotFoundError(f"Run {command.run_id} was not found")
+            now = utcnow()
+            lease_expiries = session.execute(
+                select(Node.lease_expires_at).where(
+                    Node.run_id == run.id,
+                    Node.lease_expires_at.is_not(None),
+                    Node.lease_expires_at > now,
+                )
+            ).scalars()
+            return _ProofContext(
+                run_id=run.id,
+                revision=run.proof_revision,
+                nearest_lease_expiry=min(lease_expiries, default=None),
             )
 
-    async def _build_uncached(self, command_id: str) -> ProofResponse:
+    def _read_revision(self, run_id: str) -> int:
+        with self.session_factory() as session:
+            revision = session.scalar(
+                select(Run.proof_revision).where(Run.id == run_id)
+            )
+            if revision is None:
+                raise NotFoundError(f"Run {run_id} was not found")
+            return revision
+
+    @staticmethod
+    def _cache_key(
+        command_id: str,
+        context: _ProofContext,
+        watermark: str,
+    ) -> _CacheKey:
+        return _CacheKey(
+            command_id=command_id,
+            revision=context.revision,
+            export_watermark=watermark,
+            nearest_lease_expiry=context.nearest_lease_expiry,
+        )
+
+    @staticmethod
+    def _cache_expiry(nearest_lease_expiry: datetime | None) -> float:
+        ttl = float(settings.proof_cache_seconds)
+        if nearest_lease_expiry is not None:
+            ttl = min(
+                ttl,
+                max(0.0, (nearest_lease_expiry - utcnow()).total_seconds()),
+            )
+        return time.monotonic() + max(0.0, ttl)
+
+    async def _build_uncached(
+        self,
+        command_id: str,
+    ) -> tuple[ProofResponse, _ProofContext]:
         started = time.perf_counter()
         discrepancies: list[str] = []
 
@@ -217,6 +233,10 @@ class ProofService:
             command = session.get(ControlCommand, command_id)
             if command is None:
                 raise NotFoundError(f"Command {command_id} was not found")
+            run = session.get(Run, command.run_id)
+            if run is None:
+                raise NotFoundError(f"Run {command.run_id} was not found")
+            proof_revision = run.proof_revision
             target = session.get(Node, command.target_node_id)
             if target is None:
                 raise NotFoundError("Command target node was not found")
@@ -336,6 +356,15 @@ class ProofService:
             all_nodes = session.execute(
                 select(Node).where(Node.run_id == command.run_id)
             ).scalars().all()
+            nearest_lease_expiry = min(
+                (
+                    node.lease_expires_at
+                    for node in all_nodes
+                    if node.lease_expires_at is not None
+                    and node.lease_expires_at > now
+                ),
+                default=None,
+            )
             unrelated_interrupted = 0
             if command.command_type != CommandType.CANCEL_RUN:
                 for node in all_nodes:
@@ -418,25 +447,32 @@ class ProofService:
             span.set_attribute("tracefence.command.id", command.id)
             span.set_attribute("tracefence.proof.status", overall.value)
 
-        return ProofResponse(
-            command_id=command.id,
-            command_type=command.command_type,
-            affected_registered_nodes=len(affected),
-            classifications=dict(classifications),
-            stale_action_attempts=stale_attempts,
-            stale_actions_committed=stale_committed,
-            unrelated_branches_interrupted=unrelated_interrupted,
-            control_convergence_verdict=control_verdict,
-            replacement_lineage_verdict=replacement_verdict,
-            recovery_action_verdict=recovery_action_verdict,
-            recovery_postcondition_verdict=recovery_postcondition_verdict,
-            recovery_stability_verdict=recovery_stability_verdict,
-            recovery_outcome_verdict=recovery_verdict,
-            runtime_verdict=runtime_verdict,
-            telemetry_verdict=telemetry_proof.verdict,
-            overall_verdict=overall,
-            trace_ids=telemetry_proof.trace_ids,
-            discrepancies=discrepancies,
+        return (
+            ProofResponse(
+                command_id=command.id,
+                command_type=command.command_type,
+                affected_registered_nodes=len(affected),
+                classifications=dict(classifications),
+                stale_action_attempts=stale_attempts,
+                stale_actions_committed=stale_committed,
+                unrelated_branches_interrupted=unrelated_interrupted,
+                control_convergence_verdict=control_verdict,
+                replacement_lineage_verdict=replacement_verdict,
+                recovery_action_verdict=recovery_action_verdict,
+                recovery_postcondition_verdict=recovery_postcondition_verdict,
+                recovery_stability_verdict=recovery_stability_verdict,
+                recovery_outcome_verdict=recovery_verdict,
+                runtime_verdict=runtime_verdict,
+                telemetry_verdict=telemetry_proof.verdict,
+                overall_verdict=overall,
+                trace_ids=telemetry_proof.trace_ids,
+                discrepancies=discrepancies,
+            ),
+            _ProofContext(
+                run_id=command.run_id,
+                revision=proof_revision,
+                nearest_lease_expiry=nearest_lease_expiry,
+            ),
         )
 
     @staticmethod

@@ -18,6 +18,83 @@ from tracefence.config import settings
 from tracefence.db.models import Base, SchemaMetadata
 
 
+# SQLite triggers make the proof revision a database-owned consistency
+# boundary. Service code cannot accidentally omit a bump when it mutates an
+# existing proof input. Adding a new proof-relevant table still requires adding
+# it here and to the trigger-presence schema check.
+_PROOF_RELEVANT_RUN_TABLES = (
+    "nodes",
+    "control_scopes",
+    "spawn_intents",
+    "correction_proposals",
+    "control_commands",
+    "command_acknowledgements",
+    "action_attempts",
+    "action_command_matches",
+    "invariant_violations",
+    "telemetry_outbox",
+    "service_state",
+)
+
+
+def _proof_revision_trigger_names() -> set[str]:
+    return {
+        f"trg_{table}_{operation}_proof_revision"
+        for table in _PROOF_RELEVANT_RUN_TABLES
+        for operation in ("insert", "update", "delete")
+    } | {"trg_runs_update_proof_revision"}
+
+
+def _install_proof_revision_triggers(selected_engine: Engine) -> None:
+    if selected_engine.dialect.name != "sqlite":
+        return
+    with selected_engine.begin() as connection:
+        for table in _PROOF_RELEVANT_RUN_TABLES:
+            for operation in ("insert", "update", "delete"):
+                row = "OLD" if operation == "delete" else "NEW"
+                connection.exec_driver_sql(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS
+                        trg_{table}_{operation}_proof_revision
+                    AFTER {operation.upper()} ON {table}
+                    BEGIN
+                        UPDATE runs
+                        SET proof_revision = proof_revision + 1
+                        WHERE id = {row}.run_id;
+                    END
+                    """
+                )
+        connection.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_runs_update_proof_revision
+            AFTER UPDATE OF status, root_node_id, run_scope_id, finished_at ON runs
+            WHEN NEW.proof_revision = OLD.proof_revision
+            BEGIN
+                UPDATE runs
+                SET proof_revision = proof_revision + 1
+                WHERE id = NEW.id;
+            END
+            """
+        )
+
+
+def _validate_proof_revision_triggers(selected_engine: Engine) -> None:
+    if selected_engine.dialect.name != "sqlite":
+        return
+    with selected_engine.connect() as connection:
+        actual = set(
+            connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).scalars()
+        )
+    missing = sorted(_proof_revision_trigger_names() - actual)
+    if missing:
+        raise RuntimeError(
+            "SCHEMA_MIGRATION_REQUIRED: proof revision triggers are missing: "
+            + ", ".join(missing)
+        )
+
+
 def _normalize_url(database_url: str) -> str:
     return database_url.replace("sqlite+aiosqlite://", "sqlite+pysqlite://")
 
@@ -122,7 +199,7 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def init_db(target_engine: Engine | None = None) -> None:
@@ -131,9 +208,11 @@ def init_db(target_engine: Engine | None = None) -> None:
 
     if not existing_tables:
         Base.metadata.create_all(selected_engine)
+        _install_proof_revision_triggers(selected_engine)
         with Session(selected_engine) as session:
             session.add(SchemaMetadata(id=1, version=SCHEMA_VERSION))
             session.commit()
+        _validate_proof_revision_triggers(selected_engine)
         return
 
     if "schema_metadata" not in existing_tables:
@@ -153,6 +232,8 @@ def init_db(target_engine: Engine | None = None) -> None:
             )
 
     _validate_schema_shape(selected_engine)
+    _install_proof_revision_triggers(selected_engine)
+    _validate_proof_revision_triggers(selected_engine)
 
 
 def drop_db(target_engine: Engine | None = None) -> None:

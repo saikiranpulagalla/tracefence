@@ -288,12 +288,13 @@ def test_init_db_refuses_current_version_with_missing_constraints(tmp_path):
         connection.execute(text("ALTER TABLE runs RENAME TO runs_safe"))
         connection.execute(
             text(
-                "CREATE TABLE runs ("
-                "id VARCHAR(36) PRIMARY KEY, name VARCHAR(120), status VARCHAR(24), "
-                "root_node_id VARCHAR(36) NOT NULL, run_scope_id VARCHAR(36) NOT NULL, "
-                "created_at DATETIME, finished_at DATETIME)"
+                    "CREATE TABLE runs ("
+                    "id VARCHAR(36) PRIMARY KEY, name VARCHAR(120), status VARCHAR(24), "
+                    "root_node_id VARCHAR(36) NOT NULL, run_scope_id VARCHAR(36) NOT NULL, "
+                    "created_at DATETIME, finished_at DATETIME, "
+                    "proof_revision INTEGER NOT NULL DEFAULT 0)"
+                )
             )
-        )
         connection.execute(text("DROP TABLE runs_safe"))
         connection.execute(text("PRAGMA foreign_keys=ON"))
     with pytest.raises(RuntimeError, match="constraints or indexes are missing"):

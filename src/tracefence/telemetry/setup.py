@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+from datetime import UTC, datetime
 from threading import Lock
 
 from opentelemetry import metrics, trace
@@ -25,6 +26,8 @@ _instrumentation_errors: list[str] = []
 _otel_log_handler: logging.Handler | None = None
 _configured_service_name: str | None = None
 _shutdown_registered = False
+_successful_flush_sequence = 0
+_last_successful_flush_at: datetime | None = None
 
 
 def configure_telemetry(service_name: str = "tracefence-control-plane") -> None:
@@ -181,7 +184,25 @@ def force_flush_telemetry(timeout_millis: int | None = None) -> bool:
             results.append(False)
     if settings.otlp_endpoint and not results:
         return False
-    return all(results) if results else True
+    success = all(results) if results else True
+    if success and settings.otlp_endpoint and _telemetry_state == "READY":
+        global _successful_flush_sequence, _last_successful_flush_at
+        with _provider_lock:
+            _successful_flush_sequence += 1
+            _last_successful_flush_at = datetime.now(UTC)
+    return success
+
+
+def telemetry_export_watermark() -> str | None:
+    """Return the latest successful owned-export flush identity for cache binding."""
+
+    with _provider_lock:
+        if _last_successful_flush_at is None or _configured_service_name is None:
+            return None
+        return (
+            f"{_configured_service_name}:{_successful_flush_sequence}:"
+            f"{_last_successful_flush_at.isoformat()}"
+        )
 
 
 def telemetry_health() -> dict[str, object]:
