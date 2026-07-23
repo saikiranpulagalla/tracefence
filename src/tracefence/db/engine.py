@@ -13,6 +13,7 @@ from sqlalchemy import (
     inspect,
     select,
 )
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from tracefence.config import settings
@@ -105,7 +106,18 @@ def _validate_proof_revision_triggers(selected_engine: Engine) -> None:
 
 
 def _normalize_url(database_url: str) -> str:
-    return database_url.replace("sqlite+aiosqlite://", "sqlite+pysqlite://")
+    parsed = make_url(database_url)
+    if parsed.get_backend_name() != "sqlite":
+        raise RuntimeError(
+            "UNSUPPORTED_DATABASE_DIALECT: TraceFence currently supports only SQLite"
+        )
+    if parsed.drivername == "sqlite+aiosqlite":
+        parsed = parsed.set(drivername="sqlite+pysqlite")
+    if parsed.drivername not in {"sqlite", "sqlite+pysqlite"}:
+        raise RuntimeError(
+            "UNSUPPORTED_DATABASE_DRIVER: TraceFence requires SQLite with pysqlite"
+        )
+    return parsed.render_as_string(hide_password=False)
 
 
 def _ensure_sqlite_parent(database_url: str) -> None:
@@ -122,18 +134,22 @@ def build_engine(database_url: str | None = None) -> Engine:
     engine = create_engine(
         url,
         future=True,
-        connect_args={"check_same_thread": False} if url.startswith("sqlite") else {},
+        connect_args={"check_same_thread": False},
     )
 
-    if url.startswith("sqlite"):
-        @event.listens_for(engine, "connect")
-        def _set_sqlite_pragmas(dbapi_connection: object, _connection_record: object) -> None:
-            cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA busy_timeout=5000")
-            cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.close()
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(
+        dbapi_connection: object,
+        _connection_record: object,
+    ) -> None:
+        # SQLAlchemy's connect hook intentionally receives the DBAPI protocol,
+        # which has no public common type exposing cursor().
+        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute("PRAGMA synchronous=FULL")
+        cursor.close()
 
     return engine
 
@@ -167,36 +183,91 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
     # the foreign keys and checks that enforce tenant and lineage isolation.
     constraint_mismatches: list[str] = []
     for table_name, table in Base.metadata.tables.items():
+        expected_pk = tuple(column.name for column in table.primary_key.columns)
+        actual_pk = tuple(
+            inspector.get_pk_constraint(table_name).get(
+                "constrained_columns",
+                (),
+            )
+            or ()
+        )
+        if expected_pk != actual_pk:
+            constraint_mismatches.append(
+                f"{table_name}(primary key {expected_pk!r})"
+            )
+
         expected_fk = {
-            constraint.name
+            (
+                tuple(element.parent.name for element in constraint.elements),
+                constraint.elements[0].column.table.name,
+                tuple(element.column.name for element in constraint.elements),
+            )
             for constraint in table.constraints
-            if isinstance(constraint, ForeignKeyConstraint) and constraint.name
+            if isinstance(constraint, ForeignKeyConstraint)
         }
+        actual_fk = {
+            (
+                tuple(item.get("constrained_columns") or ()),
+                str(item.get("referred_table")),
+                tuple(item.get("referred_columns") or ()),
+            )
+            for item in inspector.get_foreign_keys(table_name)
+        }
+        missing_fk = sorted(expected_fk - actual_fk)
+        if missing_fk:
+            constraint_mismatches.append(
+                f"{table_name}(foreign key {missing_fk!r})"
+            )
+
         expected_uq = {
-            constraint.name
+            tuple(column.name for column in constraint.columns)
             for constraint in table.constraints
-            if isinstance(constraint, UniqueConstraint) and constraint.name
+            if isinstance(constraint, UniqueConstraint)
         }
-        expected_ck = {
+        actual_uq = {
+            tuple(item.get("column_names") or ())
+            for item in inspector.get_unique_constraints(table_name)
+        }
+        missing_uq = sorted(expected_uq - actual_uq)
+        if missing_uq:
+            constraint_mismatches.append(
+                f"{table_name}(unique constraint {missing_uq!r})"
+            )
+
+        expected_ck_names = {
             constraint.name
             for constraint in table.constraints
             if isinstance(constraint, CheckConstraint) and constraint.name
         }
-        expected_ix = {index.name for index in table.indexes if index.name}
+        actual_ck_names = {
+            item.get("name")
+            for item in inspector.get_check_constraints(table_name)
+        }
+        missing_ck = sorted(expected_ck_names - actual_ck_names)
+        if missing_ck:
+            constraint_mismatches.append(
+                f"{table_name}(check constraint {missing_ck!r})"
+            )
 
-        actual_fk = {item.get("name") for item in inspector.get_foreign_keys(table_name)}
-        actual_uq = {item.get("name") for item in inspector.get_unique_constraints(table_name)}
-        actual_ck = {item.get("name") for item in inspector.get_check_constraints(table_name)}
-        actual_ix = {item.get("name") for item in inspector.get_indexes(table_name)}
-
-        missing = sorted(
-            (expected_fk - actual_fk)
-            | (expected_uq - actual_uq)
-            | (expected_ck - actual_ck)
-            | (expected_ix - actual_ix)
-        )
-        if missing:
-            constraint_mismatches.append(f"{table_name}({', '.join(missing)})")
+        expected_ix = {
+            (
+                bool(index.unique),
+                tuple(column.name for column in index.columns),
+            )
+            for index in table.indexes
+        }
+        actual_ix = {
+            (
+                bool(item.get("unique")),
+                tuple(item.get("column_names") or ()),
+            )
+            for item in inspector.get_indexes(table_name)
+        }
+        missing_ix = sorted(expected_ix - actual_ix)
+        if missing_ix:
+            constraint_mismatches.append(
+                f"{table_name}(index {missing_ix!r})"
+            )
     if constraint_mismatches:
         raise RuntimeError(
             "SCHEMA_MIGRATION_REQUIRED: schema version is current but constraints or "
@@ -209,19 +280,78 @@ SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
 SCHEMA_VERSION = 17
+ALEMBIC_HEAD = "001_schema_v17"
+
+
+def _stamp_alembic_head(selected_engine: Engine) -> None:
+    with selected_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS alembic_version "
+            "(version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+        )
+        versions = list(
+            connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalars()
+        )
+        if not versions:
+            connection.exec_driver_sql(
+                "INSERT INTO alembic_version (version_num) VALUES (?)",
+                (ALEMBIC_HEAD,),
+            )
+        elif versions != [ALEMBIC_HEAD]:
+            raise RuntimeError(
+                "SCHEMA_MIGRATION_REQUIRED: Alembic revision "
+                f"{versions!r}; application requires {ALEMBIC_HEAD}."
+            )
+
+
+def _reset_failed_empty_bootstrap(selected_engine: Engine) -> None:
+    with selected_engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        table_names = list(
+            connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).scalars()
+        )
+        for table_name in table_names:
+            escaped = str(table_name).replace('"', '""')
+            connection.exec_driver_sql(
+                f'DROP TABLE IF EXISTS "{escaped}"'
+            )
+        connection.commit()
 
 
 def init_db(target_engine: Engine | None = None) -> None:
     selected_engine = target_engine or engine
+    if selected_engine.dialect.name != "sqlite":
+        raise RuntimeError(
+            "UNSUPPORTED_DATABASE_DIALECT: TraceFence currently supports only SQLite"
+        )
     existing_tables = set(inspect(selected_engine).get_table_names())
 
     if not existing_tables:
-        Base.metadata.create_all(selected_engine)
-        _install_proof_revision_triggers(selected_engine)
-        with Session(selected_engine) as session:
-            session.add(SchemaMetadata(id=1, version=SCHEMA_VERSION))
-            session.commit()
-        _validate_proof_revision_triggers(selected_engine)
+        try:
+            Base.metadata.create_all(selected_engine)
+            _install_proof_revision_triggers(selected_engine)
+            with Session(selected_engine) as session:
+                session.add(SchemaMetadata(id=1, version=SCHEMA_VERSION))
+                session.commit()
+            _stamp_alembic_head(selected_engine)
+            _validate_proof_revision_triggers(selected_engine)
+        except BaseException as bootstrap_error:
+            # This path started from a confirmed empty database. Removing the
+            # newly created SQLite tables restores a retryable bootstrap without
+            # risking pre-existing user data.
+            try:
+                _reset_failed_empty_bootstrap(selected_engine)
+            except BaseException as cleanup_error:
+                bootstrap_error.add_note(
+                    "Failed to restore empty database after bootstrap error: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
         return
 
     if "schema_metadata" not in existing_tables:
@@ -241,6 +371,7 @@ def init_db(target_engine: Engine | None = None) -> None:
             )
 
     _validate_schema_shape(selected_engine)
+    _stamp_alembic_head(selected_engine)
     _install_proof_revision_triggers(selected_engine)
     _validate_proof_revision_triggers(selected_engine)
 

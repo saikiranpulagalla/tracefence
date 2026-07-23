@@ -3,7 +3,105 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import create_engine, text
 
-from tracefence.db.engine import SCHEMA_VERSION, build_engine, init_db
+from tracefence.db.engine import (
+    ALEMBIC_HEAD,
+    SCHEMA_VERSION,
+    _validate_schema_shape,
+    build_engine,
+    init_db,
+)
+
+
+def test_database_engine_rejects_non_sqlite_urls_before_driver_loading():
+    with pytest.raises(RuntimeError, match="only SQLite"):
+        build_engine("postgresql+psycopg://tracefence@db/tracefence")
+
+
+def test_schema_validation_includes_unnamed_foreign_keys(
+    tmp_path,
+    monkeypatch,
+):
+    import tracefence.db.engine as engine_module
+
+    selected_engine = build_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'unnamed-fk.db'}"
+    )
+    init_db(selected_engine)
+    real_inspector = engine_module.inspect(selected_engine)
+
+    class MissingUnnamedForeignKey:
+        def __getattr__(self, name):
+            return getattr(real_inspector, name)
+
+        def get_foreign_keys(self, table_name):
+            rows = real_inspector.get_foreign_keys(table_name)
+            if table_name == "nodes":
+                for index, row in enumerate(rows):
+                    if row.get("name") is None:
+                        return [*rows[:index], *rows[index + 1 :]]
+            return rows
+
+    monkeypatch.setattr(
+        engine_module,
+        "inspect",
+        lambda _engine: MissingUnnamedForeignKey(),
+    )
+    with pytest.raises(RuntimeError, match="foreign key"):
+        _validate_schema_shape(selected_engine)
+    selected_engine.dispose()
+
+
+def test_schema_validation_rejects_missing_primary_key(tmp_path):
+    selected_engine = build_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'missing-pk.db'}"
+    )
+    init_db(selected_engine)
+    with selected_engine.begin() as connection:
+        connection.execute(text("ALTER TABLE schema_metadata RENAME TO metadata_safe"))
+        connection.execute(
+            text(
+                "CREATE TABLE schema_metadata "
+                "(id INTEGER, version INTEGER NOT NULL, updated_at DATETIME)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO schema_metadata (id, version, updated_at) "
+                "SELECT id, version, updated_at FROM metadata_safe"
+            )
+        )
+        connection.execute(text("DROP TABLE metadata_safe"))
+    with pytest.raises(RuntimeError, match="primary key"):
+        init_db(selected_engine)
+    selected_engine.dispose()
+
+
+def test_failed_first_bootstrap_can_be_retried(tmp_path, monkeypatch):
+    import tracefence.db.engine as engine_module
+
+    selected_engine = build_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'retry-bootstrap.db'}"
+    )
+    original = engine_module._install_proof_revision_triggers
+    attempts = 0
+
+    def fail_once(engine):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("simulated bootstrap interruption")
+        original(engine)
+
+    monkeypatch.setattr(
+        engine_module,
+        "_install_proof_revision_triggers",
+        fail_once,
+    )
+    with pytest.raises(RuntimeError, match="simulated bootstrap"):
+        init_db(selected_engine)
+
+    init_db(selected_engine)
+    selected_engine.dispose()
 
 
 def test_init_db_records_current_schema_version(tmp_path):
@@ -13,8 +111,27 @@ def test_init_db_records_current_schema_version(tmp_path):
         version = connection.execute(
             text("SELECT version FROM schema_metadata WHERE id = 1")
         ).scalar_one()
+        migration = connection.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one()
     assert version == SCHEMA_VERSION
+    assert migration == ALEMBIC_HEAD
     engine.dispose()
+
+
+def test_alembic_initial_revision_is_checked_in():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    assert (root / "alembic.ini").is_file()
+    revision = (
+        root
+        / "migrations"
+        / "versions"
+        / "001_schema_v17.py"
+    ).read_text(encoding="utf-8")
+    assert f'revision = "{ALEMBIC_HEAD}"' in revision
+    assert f"SCHEMA_VERSION = {SCHEMA_VERSION}" in revision
 
 
 def test_init_db_refuses_legacy_unversioned_database(tmp_path):
@@ -62,10 +179,10 @@ def test_init_db_refuses_current_version_with_incomplete_shape(tmp_path):
 async def test_database_rejects_cross_run_owned_scope_and_invalid_status(session_factory):
     from sqlalchemy.exc import IntegrityError
 
+    from tests.helpers import activate, create_seeded_run
     from tracefence.db.models import Node
     from tracefence.domain.schemas import SpawnCreate
     from tracefence.services.spawn_service import SpawnService
-    from tests.helpers import activate, create_seeded_run
 
     spawns = SpawnService(session_factory)
     run_a = await create_seeded_run(session_factory, "constraint-a")
@@ -125,11 +242,11 @@ async def test_database_rejects_cross_run_owned_scope_and_invalid_status(session
 async def test_database_rejects_cross_run_replacement_reference(session_factory):
     from sqlalchemy.exc import IntegrityError
 
+    from tests.helpers import activate, create_seeded_run
     from tracefence.domain.enums import CommandType, IssuerType
     from tracefence.domain.schemas import CommandCreate, Principal, SpawnCreate
     from tracefence.services.control_service import ControlService
     from tracefence.services.spawn_service import SpawnService
-    from tests.helpers import activate, create_seeded_run
 
     spawns = SpawnService(session_factory)
     controls = ControlService(session_factory)
@@ -181,6 +298,7 @@ async def test_database_rejects_cross_run_replacement_reference(session_factory)
 async def test_database_rejects_cross_run_ack_and_action_command_attribution(session_factory):
     from sqlalchemy.exc import IntegrityError
 
+    from tests.helpers import activate, create_seeded_run
     from tracefence.domain.enums import CommandType, IssuerType
     from tracefence.domain.schemas import (
         ActionExecute,
@@ -191,7 +309,6 @@ async def test_database_rejects_cross_run_ack_and_action_command_attribution(ses
     from tracefence.services.action_gateway import ActionGateway
     from tracefence.services.control_service import ControlService
     from tracefence.services.spawn_service import SpawnService
-    from tests.helpers import activate, create_seeded_run
 
     spawns = SpawnService(session_factory)
     controls = ControlService(session_factory)
@@ -305,12 +422,12 @@ def test_init_db_refuses_current_version_with_missing_constraints(tmp_path):
 async def test_database_rejects_cross_run_root_scope_owner_and_correction_links(session_factory):
     from sqlalchemy.exc import IntegrityError
 
+    from tests.helpers import activate, create_seeded_run
     from tracefence.db.models import Node
     from tracefence.domain.enums import CommandType, IssuerType
     from tracefence.domain.schemas import CommandCreate, Principal, SpawnCreate
     from tracefence.services.control_service import ControlService
     from tracefence.services.spawn_service import SpawnService
-    from tests.helpers import activate, create_seeded_run
 
     spawns = SpawnService(session_factory)
     controls = ControlService(session_factory)
@@ -375,9 +492,9 @@ async def test_database_rejects_cross_run_root_scope_owner_and_correction_links(
 async def test_database_enforces_action_decision_shape(session_factory):
     from sqlalchemy.exc import IntegrityError
 
+    from tests.helpers import create_seeded_run
     from tracefence.domain.schemas import ActionExecute
     from tracefence.services.action_gateway import ActionGateway
-    from tests.helpers import create_seeded_run
 
     run = await create_seeded_run(session_factory, "action-shape")
     action = await ActionGateway(session_factory).execute(
@@ -396,11 +513,11 @@ async def test_database_enforces_action_decision_shape(session_factory):
 async def test_database_binds_acknowledgements_to_exact_command_version(session_factory):
     from sqlalchemy.exc import IntegrityError
 
+    from tests.helpers import activate, create_seeded_run
     from tracefence.domain.enums import CommandType, IssuerType
     from tracefence.domain.schemas import CommandCreate, Principal, SpawnCreate
     from tracefence.services.control_service import ControlService
     from tracefence.services.spawn_service import SpawnService
-    from tests.helpers import activate, create_seeded_run
 
     run = await create_seeded_run(session_factory, "ack-exact-version")
     spawns = SpawnService(session_factory)
@@ -443,12 +560,12 @@ async def test_database_binds_acknowledgements_to_exact_command_version(session_
 async def test_database_binds_action_match_to_exact_command_scope(session_factory):
     from sqlalchemy.exc import IntegrityError
 
+    from tests.helpers import activate, create_seeded_run
     from tracefence.domain.enums import CommandType, IssuerType
     from tracefence.domain.schemas import ActionExecute, CommandCreate, Principal, SpawnCreate
     from tracefence.services.action_gateway import ActionGateway
     from tracefence.services.control_service import ControlService
     from tracefence.services.spawn_service import SpawnService
-    from tests.helpers import activate, create_seeded_run
 
     run = await create_seeded_run(session_factory, "action-exact-scope")
     spawns = SpawnService(session_factory)
@@ -519,10 +636,10 @@ async def test_database_rejects_incomplete_allowed_actions_and_invalid_node_shap
 ):
     from sqlalchemy.exc import IntegrityError
 
+    from tests.helpers import activate, create_seeded_run
     from tracefence.domain.schemas import ActionExecute, SpawnCreate
     from tracefence.services.action_gateway import ActionGateway
     from tracefence.services.spawn_service import SpawnService
-    from tests.helpers import activate, create_seeded_run
 
     run = await create_seeded_run(session_factory, "lifecycle-constraints")
     action = await ActionGateway(session_factory).execute(

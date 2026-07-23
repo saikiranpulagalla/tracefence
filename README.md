@@ -282,14 +282,43 @@ metrics. The overall verdict is:
   provider idempotency key, durable execution outbox and reconciliation workflow.
 - The invariant telemetry outbox is implemented for durable safety-event delivery; it is not a
   full external-tool execution outbox.
-- SQLite is suitable for this bounded single-process hackathon MVP. Production should use
-  PostgreSQL, formal migrations and explicit row/advisory locking.
+- Persistence is intentionally SQLite-only. Any non-SQLite URL is rejected before a driver is
+  loaded; PostgreSQL and high-availability operation remain production backlog items.
 - The process-local rate limiter must be replaced by a shared limiter in multi-replica use.
 - TraceFence controls registered nodes only while protected side effects remain behind the
   gateway. It cannot revoke independent external credentials held by an arbitrary process.
 - The MVP uses a single operator credential with fingerprinted audit records, not an identity
   provider or per-user RBAC.
 - Live SigNoz/Foundry verification remains an external environmental gate.
+
+## SQLite migrations and durability
+
+TraceFence ships an Alembic baseline at `001_schema_v17`. New installations can be initialized
+explicitly with:
+
+```bash
+TRACEFENCE_DATABASE_URL=sqlite+pysqlite:///./data/tracefence.db \
+  python -m alembic upgrade head
+```
+
+Application bootstrap records both schema version 17 and the Alembic head, validates columns,
+primary keys, named and unnamed foreign keys, unique/check constraints, indexes and mandatory
+proof-revision triggers. A failed first bootstrap that began from an empty database is returned
+to an empty retryable state. Existing unknown or structurally incomplete databases fail closed
+with `SCHEMA_MIGRATION_REQUIRED`; back them up before migration.
+
+Every connection enables foreign keys, WAL mode, a five-second busy timeout and
+`synchronous=FULL`. WAL improves reader/writer concurrency but the `-wal` file can grow while
+long-lived readers prevent checkpoints. Monitor free disk and WAL size, reserve at least twice
+the combined database/WAL working set, and investigate readers before issuing a controlled
+`PRAGMA wal_checkpoint(TRUNCATE)`.
+
+For backups, use SQLite's online backup API or the `sqlite3 .backup` command against a quiesced
+or coordinated writer. Do not copy only the main database file while WAL writes are active.
+Restore into a separate path, run `PRAGMA integrity_check`, apply `alembic upgrade head`, start
+TraceFence, and validate `/readyz` before replacing the original. Keep at least one tested,
+offline backup and rehearse restoration; TraceFence does not provide automated disaster
+recovery.
 
 ## Provenance
 
