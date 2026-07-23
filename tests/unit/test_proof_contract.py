@@ -94,9 +94,9 @@ async def test_recovery_proof_rechecks_current_authoritative_postconditions(sess
 
     second = await proofs.build(command.command_id)
     assert second.recovery_action_verdict == ProofVerdict.VERIFIED
-    assert second.recovery_postcondition_verdict == ProofVerdict.INCOMPLETE
-    assert second.recovery_outcome_verdict == ProofVerdict.INCOMPLETE
-    assert second.runtime_verdict == ProofVerdict.INCOMPLETE
+    assert second.recovery_postcondition_verdict == ProofVerdict.INCONSISTENT
+    assert second.recovery_outcome_verdict == ProofVerdict.INCONSISTENT
+    assert second.runtime_verdict == ProofVerdict.INCONSISTENT
     assert any("Recovery postcondition failed" in item for item in second.discrepancies)
 
 

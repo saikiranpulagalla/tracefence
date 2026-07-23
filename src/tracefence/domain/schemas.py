@@ -235,16 +235,27 @@ class RecoveryContract(StrictModel):
     schema_version: Literal[1] = 1
     expected_tool: str | None = Field(default=None, max_length=100)
     expected_arguments_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    allowed_environment: str = Field(min_length=1, max_length=80)
+    allowed_resources: list[str] = Field(default_factory=list, max_length=32)
     max_committed_invocations: int = Field(ge=0, le=16)
     stability_window_seconds: int = Field(ge=0, le=300)
     postconditions: list[RecoveryPostcondition] = Field(default_factory=list, max_length=32)
 
     @model_validator(mode="after")
     def validate_tool_shape(self) -> "RecoveryContract":
+        if len(self.allowed_resources) != len(set(self.allowed_resources)):
+            raise ValueError("Recovery resources must be unique")
+        if self.allowed_resources != sorted(self.allowed_resources):
+            raise ValueError("Recovery resources must be canonically sorted")
         if self.expected_tool is None:
-            if self.max_committed_invocations != 0 or self.postconditions:
+            if (
+                self.max_committed_invocations != 0
+                or self.postconditions
+                or self.allowed_resources
+            ):
                 raise ValueError(
-                    "A recovery contract without a tool cannot require invocations or postconditions"
+                    "A recovery contract without a tool cannot require resources, "
+                    "invocations or postconditions"
                 )
         elif self.max_committed_invocations < 1:
             raise ValueError("A recovery tool requires at least one allowed committed invocation")

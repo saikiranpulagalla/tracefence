@@ -238,6 +238,8 @@ class ControlService:
                             "schema_version": 1,
                             "expected_tool": None,
                             "expected_arguments_digest": payload_digest({}),
+                            "allowed_environment": settings.environment,
+                            "allowed_resources": [],
                             "max_committed_invocations": 0,
                             "stability_window_seconds": request.recovery_stability_seconds,
                             "postconditions": [],

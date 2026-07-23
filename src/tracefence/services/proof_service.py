@@ -20,7 +20,6 @@ from tracefence.db.models import (
     ControlCommand,
     Node,
     Run,
-    ServiceState,
 )
 from tracefence.domain.enums import (
     ActionDecision,
@@ -34,6 +33,7 @@ from tracefence.security import payload_digest
 from tracefence.services.action_gateway import STALE_REASONS
 from tracefence.services.common import descendants_including_self, evaluate_scopes, utcnow
 from tracefence.services.invariant_service import InvariantService
+from tracefence.services.tool_registry import get_tool_spec
 from tracefence.signoz.mcp_client import (
     RuntimeBlockedAction,
     SigNozMCPClient,
@@ -645,8 +645,8 @@ class ProofService:
             )
 
         replacement_verdict = ProofVerdict.VERIFIED
-        contract = manifest_model.recovery_contract.model_dump(mode="json")
-        expected_tool = contract.get("expected_tool")
+        contract = manifest_model.recovery_contract
+        expected_tool = contract.expected_tool
         if expected_tool is None:
             return (
                 replacement_verdict,
@@ -661,13 +661,13 @@ class ProofService:
                 ActionAttempt.run_id == command.run_id,
                 ActionAttempt.node_id.in_(replacement_ids),
                 ActionAttempt.tool_name == expected_tool,
-                ActionAttempt.arguments_digest == contract.get("expected_arguments_digest"),
+                ActionAttempt.arguments_digest == contract.expected_arguments_digest,
                 ActionAttempt.decision == ActionDecision.ALLOW,
                 ActionAttempt.committed_at.is_not(None),
                 ActionAttempt.attempted_at >= command.created_at,
             ).order_by(ActionAttempt.committed_at.asc(), ActionAttempt.id.asc())
         ).scalars().all()
-        max_invocations = int(contract.get("max_committed_invocations", 1))
+        max_invocations = contract.max_committed_invocations
         if not committed_actions:
             discrepancies.append(f"Expected recovery tool {expected_tool} has not committed")
             return (
@@ -720,58 +720,28 @@ class ProofService:
         action_verdict = ProofVerdict.VERIFIED
         postcondition_verdict = ProofVerdict.VERIFIED
         stability_verdict = ProofVerdict.VERIFIED
-        stability_seconds = int(contract.get("stability_window_seconds", 0))
+        stability_seconds = contract.stability_window_seconds
         stable_before = utcnow() - timedelta(seconds=stability_seconds)
-        for postcondition in contract.get("postconditions", []):
-            service_name = postcondition.get("service_name")
-            field = postcondition.get("field")
-            if field not in {"status", "restart_count", "pool_reset_count"}:
-                discrepancies.append(f"Unsupported recovery postcondition field: {field}")
-                return (
-                    replacement_verdict,
-                    action_verdict,
-                    ProofVerdict.INCONSISTENT,
-                    ProofVerdict.INCONSISTENT,
-                )
-            state = session.get(ServiceState, (command.run_id, service_name))
-            if state is None:
-                discrepancies.append(f"Recovery postcondition service is missing: {service_name}")
-                postcondition_verdict = ProofVerdict.INCOMPLETE
-                stability_verdict = ProofVerdict.INCOMPLETE
-                continue
-            actual = getattr(state, field)
-            operator = postcondition.get("operator")
-            expected = postcondition.get("expected")
-            if operator != "equals":
-                discrepancies.append(f"Unsupported recovery postcondition operator: {operator}")
-                return (
-                    replacement_verdict,
-                    action_verdict,
-                    ProofVerdict.INCONSISTENT,
-                    ProofVerdict.INCONSISTENT,
-                )
-            if actual != expected:
-                discrepancies.append(
-                    f"Recovery postcondition failed: {service_name}.{field} "
-                    f"expected {expected!r}, found {actual!r}"
-                )
-                postcondition_verdict = ProofVerdict.INCOMPLETE
-                stability_verdict = ProofVerdict.INCOMPLETE
-                continue
-            if postcondition.get("require_recovery_action") and state.last_action_id != recovery_action.id:
-                discrepancies.append(
-                    f"Recovery postcondition {service_name}.{field} is not causally bound "
-                    "to the authorized recovery action"
-                )
-                postcondition_verdict = ProofVerdict.INCONSISTENT
-                stability_verdict = ProofVerdict.INCONSISTENT
-                continue
-            if stability_seconds > 0 and state.updated_at > stable_before:
-                discrepancies.append(
-                    f"Recovery postcondition {service_name}.{field} has not remained stable "
-                    f"for {stability_seconds} seconds"
-                )
-                stability_verdict = ProofVerdict.INCOMPLETE
+        spec = get_tool_spec(expected_tool)
+        postconditions = spec.verify_postconditions(
+            session,
+            command.run_id,
+            recovery_action.id,
+            contract,
+            stable_before,
+        )
+        discrepancies.extend(postconditions.discrepancies)
+        if postconditions.postconditions_inconsistent:
+            postcondition_verdict = ProofVerdict.INCONSISTENT
+            stability_verdict = ProofVerdict.INCONSISTENT
+        elif postconditions.postconditions_incomplete:
+            postcondition_verdict = ProofVerdict.INCOMPLETE
+            stability_verdict = ProofVerdict.INCOMPLETE
+        if (
+            postconditions.stability_incomplete
+            and stability_verdict != ProofVerdict.INCONSISTENT
+        ):
+            stability_verdict = ProofVerdict.INCOMPLETE
 
         return (
             replacement_verdict,
