@@ -42,7 +42,7 @@ verify:
 	PYTHONPATH=src TRACEFENCE_EXPECTED_EVIDENCE_COMMIT=$(EXPECTED_COMMIT) TRACEFENCE_EVIDENCE_MAX_AGE_SECONDS=$(EVIDENCE_MAX_AGE_SECONDS) $(PYTHON) scripts/verify_end_to_end.py --bundle evidence/latest.json --api-url $(API_URL)
 
 reset:
-	PYTHONPATH=src $(PYTHON) scripts/reset_state.py --yes
+	PYTHONPATH=src $(PYTHON) scripts/reset_state.py --yes --data-dir ./data --expected-path ./data/tracefence.db
 
 signoz:
 	./scripts/bootstrap_signoz.sh
