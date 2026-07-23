@@ -1,0 +1,60 @@
+name: TraceFence CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tracefence-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install complete development environment
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev,mcp,otel-instrumentation]'
+      - name: Compile Python
+        run: python -m compileall -q src scripts tests
+      - name: Check frontend JavaScript
+        run: node --check src/tracefence/frontend/app.js
+      - name: Ruff
+        run: ruff check src scripts tests
+      - name: Type check
+        run: mypy src/tracefence
+      - name: Security lint
+        run: bandit -q -r src scripts -x tests
+      - name: Dependency consistency
+        run: python -m pip check
+      - name: Dependency audit
+        run: pip-audit
+      - name: Test with branch coverage
+        env:
+          TRACEFENCE_ENV: test
+          PYTHONPATH: src
+        run: pytest -q --cov=tracefence --cov-branch --cov-report=term-missing --cov-fail-under=70
+      - name: Build wheel and source archive
+        run: python -m build
+      - name: Verify built wheel in a clean environment
+        run: |
+          python -m venv /tmp/tracefence-wheel
+          /tmp/tracefence-wheel/bin/python -m pip install dist/*.whl
+          /tmp/tracefence-wheel/bin/tracefence --help
+          /tmp/tracefence-wheel/bin/python - <<'PY'
+          from importlib.resources import files
+          root = files('tracefence').joinpath('frontend')
+          assert root.joinpath('index.html').is_file()
+          assert root.joinpath('app.js').is_file()
+          PY

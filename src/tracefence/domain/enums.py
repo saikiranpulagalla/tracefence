@@ -1,0 +1,67 @@
+from enum import StrEnum
+
+
+class RunStatus(StrEnum):
+    CREATED = "CREATED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
+
+
+class NodeStatus(StrEnum):
+    PENDING = "PENDING"
+    ACTIVE = "ACTIVE"
+    WAITING = "WAITING"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    SUPERSEDED = "SUPERSEDED"
+    LEASE_EXPIRED = "LEASE_EXPIRED"
+
+
+class ScopeStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    CANCELLED = "CANCELLED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class CommandType(StrEnum):
+    CANCEL_RUN = "CANCEL_RUN"
+    CANCEL_SUBTREE = "CANCEL_SUBTREE"
+    CORRECT_SUBTREE = "CORRECT_SUBTREE"
+
+
+class ProposalType(StrEnum):
+    CANCEL = "CANCEL"
+    CORRECT = "CORRECT"
+
+
+class ProposalStatus(StrEnum):
+    PENDING = "PENDING"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+
+
+class IssuerType(StrEnum):
+    HUMAN = "HUMAN"
+    AGENT = "AGENT"
+
+
+class ActionDecision(StrEnum):
+    ALLOW = "ALLOW"
+    DENY = "DENY"
+
+
+class AckType(StrEnum):
+    COOPERATIVE = "COOPERATIVE"
+    GATEWAY_BLOCK = "GATEWAY_BLOCK"
+    LEASE_EXPIRED = "LEASE_EXPIRED"
+
+
+class ProofVerdict(StrEnum):
+    VERIFIED = "VERIFIED"
+    INCOMPLETE = "INCOMPLETE"
+    PARTIAL = "PARTIAL"
+    INCONSISTENT = "INCONSISTENT"
+    UNAVAILABLE = "UNAVAILABLE"
+    NOT_APPLICABLE = "NOT_APPLICABLE"

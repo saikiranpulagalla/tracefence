@@ -1,0 +1,718 @@
+from __future__ import annotations
+
+import asyncio
+import threading
+import time
+from collections import Counter
+from concurrent.futures import Future
+from dataclasses import dataclass
+from datetime import UTC, timedelta
+
+from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
+
+from tracefence.config import settings
+from tracefence.db.models import (
+    ActionAttempt,
+    ActionCommandMatch,
+    CommandAcknowledgement,
+    ControlCommand,
+    Node,
+    InvariantViolation,
+    ServiceState,
+)
+from tracefence.domain.enums import (
+    ActionDecision,
+    CommandType,
+    NodeStatus,
+    ProofVerdict,
+)
+from tracefence.domain.errors import NotFoundError
+from tracefence.domain.schemas import ProofResponse, ReplacementManifest
+from tracefence.security import payload_digest
+from tracefence.signoz.mcp_client import SigNozMCPClient
+from tracefence.services.action_gateway import STALE_REASONS
+from tracefence.services.common import descendants_including_self, evaluate_scopes, utcnow
+from tracefence.services.invariant_service import InvariantService
+from tracefence.telemetry.instruments import telemetry
+from tracefence.telemetry.setup import force_flush_telemetry
+
+
+@dataclass(slots=True)
+class _CacheEntry:
+    expires_at: float
+    runtime_fingerprint: str
+    response: ProofResponse
+
+
+class ProofService:
+    def __init__(
+        self,
+        session_factory: sessionmaker,
+        mcp_client: SigNozMCPClient | None = None,
+    ) -> None:
+        self.session_factory = session_factory
+        self.mcp_client = mcp_client or SigNozMCPClient()
+        self._cache: dict[str, _CacheEntry] = {}
+        self._state_lock = threading.RLock()
+        self._inflight: dict[str, Future[ProofResponse]] = {}
+        self.invariants = InvariantService(session_factory)
+
+    async def build(self, command_id: str) -> ProofResponse:
+        """Build a loop-independent, single-flight proof for one command.
+
+        API requests execute on a bounded worker pool, so the same singleton
+        service may be called from different event loops. A concurrent Future is
+        safe to coordinate across those loops: one caller builds while all other
+        callers await the identical immutable result.
+        """
+        now_mono = time.monotonic()
+        with self._state_lock:
+            self._prune_cache_locked(now_mono)
+            cached = self._cache.get(command_id)
+            if cached is not None and cached.expires_at > now_mono:
+                if cached.runtime_fingerprint == self._runtime_fingerprint(command_id):
+                    return cached.response.model_copy(deep=True)
+                self._cache.pop(command_id, None)
+
+            inflight = self._inflight.get(command_id)
+            if inflight is None:
+                inflight = Future()
+                self._inflight[command_id] = inflight
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            response = await asyncio.wrap_future(inflight)
+            return response.model_copy(deep=True)
+
+        try:
+            response = await self._build_uncached(command_id)
+            fingerprint = self._runtime_fingerprint(command_id)
+            stored = response.model_copy(deep=True)
+            with self._state_lock:
+                self._cache[command_id] = _CacheEntry(
+                    expires_at=time.monotonic() + settings.proof_cache_seconds,
+                    runtime_fingerprint=fingerprint,
+                    response=stored,
+                )
+                self._inflight.pop(command_id, None)
+                inflight.set_result(stored.model_copy(deep=True))
+            return response
+        except BaseException as exc:
+            with self._state_lock:
+                self._inflight.pop(command_id, None)
+                if not inflight.done():
+                    inflight.set_exception(exc)
+            raise
+
+    def _prune_cache_locked(self, now_mono: float) -> None:
+        for key in [
+            key for key, entry in self._cache.items() if entry.expires_at <= now_mono
+        ]:
+            self._cache.pop(key, None)
+
+    def _runtime_fingerprint(self, command_id: str) -> str:
+        """Hash authoritative runtime inputs so cached proof cannot outlive state changes."""
+        with self.session_factory() as session:
+            command = session.get(ControlCommand, command_id)
+            if command is None:
+                return "missing"
+            nodes = session.execute(
+                select(Node).where(Node.run_id == command.run_id).order_by(Node.id)
+            ).scalars().all()
+            actions = session.execute(
+                select(ActionAttempt)
+                .where(ActionAttempt.run_id == command.run_id)
+                .order_by(ActionAttempt.id)
+            ).scalars().all()
+            states = session.execute(
+                select(ServiceState)
+                .where(ServiceState.run_id == command.run_id)
+                .order_by(ServiceState.service_name)
+            ).scalars().all()
+            acknowledgements = session.execute(
+                select(CommandAcknowledgement)
+                .where(CommandAcknowledgement.run_id == command.run_id)
+                .order_by(CommandAcknowledgement.id)
+            ).scalars().all()
+            violations = session.execute(
+                select(InvariantViolation)
+                .where(InvariantViolation.run_id == command.run_id)
+                .order_by(InvariantViolation.id)
+            ).scalars().all()
+            return payload_digest(
+                {
+                    "command": {
+                        "id": command.id,
+                        "manifest_digest": command.replacement_manifest_digest,
+                        "replacement_node_id": command.replacement_node_id,
+                    },
+                    "nodes": [
+                        {
+                            "id": node.id,
+                            "status": node.status,
+                            "role": node.role,
+                            "behavior": node.behavior,
+                            "capabilities": node.capabilities_json,
+                            "instruction_version": node.instruction_version,
+                            "completed_at": node.completed_at,
+                            "lease_expires_at": node.lease_expires_at,
+                        }
+                        for node in nodes
+                    ],
+                    "actions": [
+                        {
+                            "id": action.id,
+                            "node_id": action.node_id,
+                            "tool": action.tool_name,
+                            "decision": action.decision,
+                            "arguments": action.arguments_json,
+                            "arguments_digest": action.arguments_digest,
+                            "result_digest": action.result_digest,
+                            "committed_at": action.committed_at,
+                        }
+                        for action in actions
+                    ],
+                    "states": [
+                        {
+                            "service": state.service_name,
+                            "status": state.status,
+                            "restart_count": state.restart_count,
+                            "pool_reset_count": state.pool_reset_count,
+                            "last_action_id": state.last_action_id,
+                            "updated_at": state.updated_at,
+                        }
+                        for state in states
+                    ],
+                    "acks": [
+                        {
+                            "command_id": ack.command_id,
+                            "node_id": ack.node_id,
+                            "ack_type": ack.ack_type,
+                            "observed_at": ack.observed_at,
+                        }
+                        for ack in acknowledgements
+                    ],
+                    "violations": [
+                        {
+                            "id": violation.id,
+                            "command_id": violation.command_id,
+                            "action_id": violation.action_id,
+                            "type": violation.violation_type,
+                            "detected_at": violation.detected_at,
+                        }
+                        for violation in violations
+                    ],
+                }
+            )
+
+    async def _build_uncached(self, command_id: str) -> ProofResponse:
+        started = time.perf_counter()
+        discrepancies: list[str] = []
+
+        with self.session_factory() as session:
+            command = session.get(ControlCommand, command_id)
+            if command is None:
+                raise NotFoundError(f"Command {command_id} was not found")
+            target = session.get(Node, command.target_node_id)
+            if target is None:
+                raise NotFoundError("Command target node was not found")
+
+            if command.command_type == CommandType.CANCEL_RUN:
+                affected = session.execute(
+                    select(Node).where(
+                        Node.run_id == command.run_id,
+                        Node.registered_at <= command.created_at,
+                    )
+                ).scalars().all()
+            else:
+                affected = await descendants_including_self(
+                    session,
+                    run_id=command.run_id,
+                    root_node_id=target.id,
+                    registered_before=command.created_at,
+                )
+            affected_ids = {node.id for node in affected}
+
+            acknowledgements = session.execute(
+                select(CommandAcknowledgement).where(
+                    CommandAcknowledgement.command_id == command.id
+                )
+            ).scalars().all()
+            ack_by_node: dict[str, list[str]] = {}
+            for ack in acknowledgements:
+                ack_by_node.setdefault(ack.node_id, []).append(ack.ack_type)
+
+            prior_ack_nodes = set(
+                session.execute(
+                    select(CommandAcknowledgement.node_id).where(
+                        CommandAcknowledgement.run_id == command.run_id,
+                        CommandAcknowledgement.node_id.in_(affected_ids),
+                        CommandAcknowledgement.observed_at <= command.created_at,
+                        CommandAcknowledgement.command_id != command.id,
+                    )
+                ).scalars().all()
+            ) if affected_ids else set()
+            matched_action_ids = set(
+                session.execute(
+                    select(ActionCommandMatch.action_id).where(
+                        ActionCommandMatch.run_id == command.run_id,
+                        ActionCommandMatch.command_id == command.id,
+                    )
+                ).scalars().all()
+            )
+
+            actions = []
+            if affected_ids:
+                actions = session.execute(
+                    select(ActionAttempt).where(
+                        ActionAttempt.node_id.in_(affected_ids),
+                        ActionAttempt.attempted_at >= command.created_at,
+                    )
+                ).scalars().all()
+            actions_by_node: dict[str, list[ActionAttempt]] = {}
+            for action in actions:
+                actions_by_node.setdefault(action.node_id, []).append(action)
+
+            classifications: Counter[str] = Counter()
+            unclassified: list[str] = []
+            now = utcnow()
+            for node in affected:
+                node_acks = ack_by_node.get(node.id, [])
+                node_actions = actions_by_node.get(node.id, [])
+                if node.completed_at is not None and node.completed_at <= command.created_at:
+                    classifications["COMPLETED_BEFORE_COMMAND"] += 1
+                elif node.id in prior_ack_nodes and node.status in {
+                    NodeStatus.CANCELLED,
+                    NodeStatus.SUPERSEDED,
+                    NodeStatus.LEASE_EXPIRED,
+                    NodeStatus.COMPLETED,
+                }:
+                    classifications["CONVERGED_BEFORE_COMMAND"] += 1
+                elif "COOPERATIVE" in node_acks:
+                    classifications["ACKNOWLEDGED"] += 1
+                elif "GATEWAY_BLOCK" in node_acks or any(
+                    action.decision == ActionDecision.DENY
+                    and action.denial_reason in STALE_REASONS
+                    and action.id in matched_action_ids
+                    for action in node_actions
+                ):
+                    classifications["BLOCKED_AT_GATEWAY"] += 1
+                elif "LEASE_EXPIRED" in node_acks or node.status == NodeStatus.LEASE_EXPIRED or (
+                    node.lease_expires_at is not None and node.lease_expires_at <= now
+                ):
+                    classifications["LEASE_EXPIRED"] += 1
+                else:
+                    evaluation = await evaluate_scopes(session, node)
+                    # An affected node cannot legitimately remain scope-valid after
+                    # the command. Treat that impossible state as unclassified so a
+                    # corrupted registry can never yield a VERIFIED proof.
+                    if evaluation.allowed:
+                        discrepancies.append(
+                            f"Affected node {node.id} remained scope-valid after command"
+                        )
+                    unclassified.append(node.id)
+
+            stale_attempts = sum(
+                1
+                for action in actions
+                if action.side_effecting
+                and action.decision == ActionDecision.DENY
+                and action.denial_reason in STALE_REASONS
+                and action.id in matched_action_ids
+            )
+            stale_committed_actions = [
+                action
+                for action in actions
+                if action.side_effecting
+                and action.decision == ActionDecision.ALLOW
+                and action.committed_at is not None
+            ]
+            stale_committed = len(stale_committed_actions)
+
+            all_nodes = session.execute(
+                select(Node).where(Node.run_id == command.run_id)
+            ).scalars().all()
+            unrelated_interrupted = 0
+            if command.command_type != CommandType.CANCEL_RUN:
+                for node in all_nodes:
+                    if node.id in affected_ids:
+                        continue
+                    evaluation = await evaluate_scopes(session, node)
+                    if not evaluation.allowed and any(
+                        mismatch.scope_id == command.target_scope_id
+                        for mismatch in evaluation.mismatches
+                    ):
+                        unrelated_interrupted += 1
+
+            (
+                replacement_verdict,
+                recovery_action_verdict,
+                recovery_postcondition_verdict,
+                recovery_stability_verdict,
+            ) = await self._replacement_verdicts(
+                session, command, target, discrepancies
+            )
+            recovery_verdict = self._combine_recovery_verdicts(
+                recovery_action_verdict,
+                recovery_postcondition_verdict,
+                recovery_stability_verdict,
+            )
+
+        await self.invariants.scan(command.run_id)
+
+        control_verdict = (
+            ProofVerdict.VERIFIED
+            if stale_committed == 0 and not unclassified and unrelated_interrupted == 0
+            else ProofVerdict.INCOMPLETE
+        )
+        runtime_verdict = self._combine_runtime_verdicts(
+            control_verdict, replacement_verdict, recovery_verdict
+        )
+
+        command_started_ms = int(
+            command.created_at.replace(tzinfo=UTC).timestamp() * 1000
+        )
+        # Flush the batch exporters before querying SigNoz so proof generation
+        # cannot race the SDK export timers. Failure is surfaced through MCP
+        # reconciliation rather than silently upgrading evidence.
+        flush_ok = await asyncio.to_thread(force_flush_telemetry)
+        telemetry_proof = await self.mcp_client.verify_command(
+            command_id=command.id,
+            expected_stale_attempts=stale_attempts,
+            expected_stale_committed=stale_committed,
+            start_ms=max(0, command_started_ms - 5_000),
+            end_ms=int(utcnow().replace(tzinfo=UTC).timestamp() * 1000) + 5_000,
+        )
+        if not flush_ok:
+            flush_message = "OpenTelemetry exporters did not flush successfully before MCP queries"
+            telemetry_proof = type(telemetry_proof)(
+                verdict=(
+                    ProofVerdict.PARTIAL
+                    if telemetry_proof.verdict == ProofVerdict.VERIFIED
+                    else telemetry_proof.verdict
+                ),
+                trace_ids=telemetry_proof.trace_ids,
+                discrepancies=[*telemetry_proof.discrepancies, flush_message],
+                evidence=telemetry_proof.evidence,
+            )
+
+        if runtime_verdict != ProofVerdict.VERIFIED:
+            overall = runtime_verdict
+        elif telemetry_proof.verdict == ProofVerdict.VERIFIED:
+            overall = ProofVerdict.VERIFIED
+        elif telemetry_proof.verdict == ProofVerdict.INCONSISTENT:
+            overall = ProofVerdict.INCONSISTENT
+        else:
+            overall = ProofVerdict.PARTIAL
+
+        discrepancies.extend(telemetry_proof.discrepancies)
+        if unclassified:
+            discrepancies.append(f"Unclassified live affected nodes: {', '.join(unclassified)}")
+
+        telemetry.proof_duration_ms.record((time.perf_counter() - started) * 1000)
+        with telemetry.tracer.start_as_current_span("tracefence.proof.finalize") as span:
+            span.set_attribute("tracefence.command.id", command.id)
+            span.set_attribute("tracefence.proof.status", overall.value)
+
+        return ProofResponse(
+            command_id=command.id,
+            command_type=command.command_type,
+            affected_registered_nodes=len(affected),
+            classifications=dict(classifications),
+            stale_action_attempts=stale_attempts,
+            stale_actions_committed=stale_committed,
+            unrelated_branches_interrupted=unrelated_interrupted,
+            control_convergence_verdict=control_verdict,
+            replacement_lineage_verdict=replacement_verdict,
+            recovery_action_verdict=recovery_action_verdict,
+            recovery_postcondition_verdict=recovery_postcondition_verdict,
+            recovery_stability_verdict=recovery_stability_verdict,
+            recovery_outcome_verdict=recovery_verdict,
+            runtime_verdict=runtime_verdict,
+            telemetry_verdict=telemetry_proof.verdict,
+            overall_verdict=overall,
+            trace_ids=telemetry_proof.trace_ids,
+            discrepancies=discrepancies,
+        )
+
+    @staticmethod
+    async def _replacement_verdicts(
+        session: Session,
+        command: ControlCommand,
+        target: Node,
+        discrepancies: list[str],
+    ) -> tuple[ProofVerdict, ProofVerdict, ProofVerdict, ProofVerdict]:
+        not_applicable = (
+            ProofVerdict.NOT_APPLICABLE,
+            ProofVerdict.NOT_APPLICABLE,
+            ProofVerdict.NOT_APPLICABLE,
+            ProofVerdict.NOT_APPLICABLE,
+        )
+        if command.command_type != CommandType.CORRECT_SUBTREE:
+            return not_applicable
+
+        manifest = command.replacement_manifest_json
+        if (
+            manifest is None
+            or command.replacement_manifest_digest is None
+            or command.replacement_manifest_digest != payload_digest(manifest)
+        ):
+            discrepancies.append("Correction replacement manifest is missing or corrupted")
+            return (
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+        try:
+            manifest_model = ReplacementManifest.model_validate(manifest)
+        except ValidationError as exc:
+            discrepancies.append(
+                f"Correction replacement manifest violates its schema: {exc.errors()[0]['msg']}"
+            )
+            return (
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+        manifest = manifest_model.model_dump(mode="json")
+        if command.replacement_node_id is None:
+            discrepancies.append("Correction has no registered replacement node")
+            return (
+                ProofVerdict.INCOMPLETE,
+                ProofVerdict.INCOMPLETE,
+                ProofVerdict.INCOMPLETE,
+                ProofVerdict.INCOMPLETE,
+            )
+
+        replacement = session.get(Node, command.replacement_node_id)
+        if replacement is None:
+            discrepancies.append("Correction references a missing replacement node")
+            return (
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+
+        expected_capabilities = manifest_model.capabilities_exact
+        lineage_ok = (
+            replacement.run_id == command.run_id
+            and replacement.parent_id == command.replacement_parent_id
+            and replacement.supersedes_node_id == target.id
+            and replacement.caused_by_command_id == command.id
+            and replacement.role == manifest.get("role")
+            and replacement.behavior == manifest.get("behavior")
+            and sorted(set(replacement.capabilities_json or [])) == expected_capabilities
+            and payload_digest(replacement.instruction_json)
+            == manifest.get("instruction_digest")
+            and replacement.instruction_version == manifest.get("instruction_version")
+            and replacement.registered_at >= command.created_at
+            and replacement.activated_at is not None
+            and replacement.activated_at >= command.created_at
+        )
+        if not lineage_ok:
+            discrepancies.append(
+                "Replacement lineage, identity, capabilities, behavior or instruction "
+                "does not match the authorized manifest"
+            )
+            return (
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+
+        replacement_nodes = await descendants_including_self(
+            session,
+            run_id=command.run_id,
+            root_node_id=replacement.id,
+        )
+        direct_children = [node for node in replacement_nodes if node.parent_id == replacement.id]
+        if len(direct_children) > manifest_model.max_children:
+            discrepancies.append("Replacement exceeded its authorized child budget")
+            return (
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+
+        replacement_verdict = ProofVerdict.VERIFIED
+        contract = manifest_model.recovery_contract.model_dump(mode="json")
+        expected_tool = contract.get("expected_tool")
+        if expected_tool is None:
+            return (
+                replacement_verdict,
+                ProofVerdict.NOT_APPLICABLE,
+                ProofVerdict.NOT_APPLICABLE,
+                ProofVerdict.NOT_APPLICABLE,
+            )
+
+        replacement_ids = {node.id for node in replacement_nodes}
+        committed_actions = session.execute(
+            select(ActionAttempt).where(
+                ActionAttempt.run_id == command.run_id,
+                ActionAttempt.node_id.in_(replacement_ids),
+                ActionAttempt.tool_name == expected_tool,
+                ActionAttempt.arguments_digest == contract.get("expected_arguments_digest"),
+                ActionAttempt.decision == ActionDecision.ALLOW,
+                ActionAttempt.committed_at.is_not(None),
+                ActionAttempt.attempted_at >= command.created_at,
+            ).order_by(ActionAttempt.committed_at.asc(), ActionAttempt.id.asc())
+        ).scalars().all()
+        max_invocations = int(contract.get("max_committed_invocations", 1))
+        if not committed_actions:
+            discrepancies.append(f"Expected recovery tool {expected_tool} has not committed")
+            return (
+                replacement_verdict,
+                ProofVerdict.INCOMPLETE,
+                ProofVerdict.INCOMPLETE,
+                ProofVerdict.INCOMPLETE,
+            )
+        if len(committed_actions) > max_invocations:
+            discrepancies.append(
+                f"Recovery tool {expected_tool} committed {len(committed_actions)} times; "
+                f"manifest allows {max_invocations}"
+            )
+            return (
+                replacement_verdict,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+
+        recovery_action = committed_actions[-1]
+        if (
+            recovery_action.result_json is None
+            or recovery_action.result_digest != payload_digest(recovery_action.result_json)
+        ):
+            discrepancies.append("Recovery action result digest is missing or inconsistent")
+            return (
+                replacement_verdict,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+        if replacement.status != NodeStatus.COMPLETED or replacement.completed_at is None:
+            discrepancies.append("Replacement recovery action committed but replacement is not complete")
+            return (
+                replacement_verdict,
+                ProofVerdict.INCOMPLETE,
+                ProofVerdict.INCOMPLETE,
+                ProofVerdict.INCOMPLETE,
+            )
+        if recovery_action.committed_at is None or replacement.completed_at < recovery_action.committed_at:
+            discrepancies.append("Replacement completed before its recovery action committed")
+            return (
+                replacement_verdict,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+
+        action_verdict = ProofVerdict.VERIFIED
+        postcondition_verdict = ProofVerdict.VERIFIED
+        stability_verdict = ProofVerdict.VERIFIED
+        stability_seconds = int(contract.get("stability_window_seconds", 0))
+        stable_before = utcnow() - timedelta(seconds=stability_seconds)
+        for postcondition in contract.get("postconditions", []):
+            service_name = postcondition.get("service_name")
+            field = postcondition.get("field")
+            if field not in {"status", "restart_count", "pool_reset_count"}:
+                discrepancies.append(f"Unsupported recovery postcondition field: {field}")
+                return (
+                    replacement_verdict,
+                    action_verdict,
+                    ProofVerdict.INCONSISTENT,
+                    ProofVerdict.INCONSISTENT,
+                )
+            state = session.get(ServiceState, (command.run_id, service_name))
+            if state is None:
+                discrepancies.append(f"Recovery postcondition service is missing: {service_name}")
+                postcondition_verdict = ProofVerdict.INCOMPLETE
+                stability_verdict = ProofVerdict.INCOMPLETE
+                continue
+            actual = getattr(state, field)
+            operator = postcondition.get("operator")
+            expected = postcondition.get("expected")
+            if operator != "equals":
+                discrepancies.append(f"Unsupported recovery postcondition operator: {operator}")
+                return (
+                    replacement_verdict,
+                    action_verdict,
+                    ProofVerdict.INCONSISTENT,
+                    ProofVerdict.INCONSISTENT,
+                )
+            if actual != expected:
+                discrepancies.append(
+                    f"Recovery postcondition failed: {service_name}.{field} "
+                    f"expected {expected!r}, found {actual!r}"
+                )
+                postcondition_verdict = ProofVerdict.INCOMPLETE
+                stability_verdict = ProofVerdict.INCOMPLETE
+                continue
+            if postcondition.get("require_recovery_action") and state.last_action_id != recovery_action.id:
+                discrepancies.append(
+                    f"Recovery postcondition {service_name}.{field} is not causally bound "
+                    "to the authorized recovery action"
+                )
+                postcondition_verdict = ProofVerdict.INCONSISTENT
+                stability_verdict = ProofVerdict.INCONSISTENT
+                continue
+            if stability_seconds > 0 and state.updated_at > stable_before:
+                discrepancies.append(
+                    f"Recovery postcondition {service_name}.{field} has not remained stable "
+                    f"for {stability_seconds} seconds"
+                )
+                stability_verdict = ProofVerdict.INCOMPLETE
+
+        return (
+            replacement_verdict,
+            action_verdict,
+            postcondition_verdict,
+            stability_verdict,
+        )
+
+    @staticmethod
+    def _combine_recovery_verdicts(
+        action: ProofVerdict,
+        postcondition: ProofVerdict,
+        stability: ProofVerdict,
+    ) -> ProofVerdict:
+        verdicts = (action, postcondition, stability)
+        if all(verdict == ProofVerdict.NOT_APPLICABLE for verdict in verdicts):
+            return ProofVerdict.NOT_APPLICABLE
+        if ProofVerdict.INCONSISTENT in verdicts:
+            return ProofVerdict.INCONSISTENT
+        if any(verdict == ProofVerdict.INCOMPLETE for verdict in verdicts):
+            return ProofVerdict.INCOMPLETE
+        if all(
+            verdict in {ProofVerdict.VERIFIED, ProofVerdict.NOT_APPLICABLE}
+            for verdict in verdicts
+        ):
+            return ProofVerdict.VERIFIED
+        return ProofVerdict.INCOMPLETE
+
+    @staticmethod
+    def _combine_runtime_verdicts(
+        control: ProofVerdict,
+        replacement: ProofVerdict,
+        recovery: ProofVerdict,
+    ) -> ProofVerdict:
+        verdicts = (control, replacement, recovery)
+        if ProofVerdict.INCONSISTENT in verdicts:
+            return ProofVerdict.INCONSISTENT
+        if any(v == ProofVerdict.INCOMPLETE for v in verdicts):
+            return ProofVerdict.INCOMPLETE
+        if control == ProofVerdict.VERIFIED and all(
+            v in {ProofVerdict.VERIFIED, ProofVerdict.NOT_APPLICABLE}
+            for v in (replacement, recovery)
+        ):
+            return ProofVerdict.VERIFIED
+        return ProofVerdict.INCOMPLETE

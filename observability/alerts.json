@@ -1,0 +1,266 @@
+[
+  {
+    "alert": "TraceFence Stale Action Committed",
+    "alertType": "METRIC_BASED_ALERT",
+    "description": "A side effect committed under invalid control state.",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "none",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "tracefence_stale_actions_committed_total",
+                  "timeAggregation": "increase",
+                  "spaceAggregation": "sum"
+                }
+              ],
+              "limit": 100,
+              "order": [
+                {
+                  "key": {
+                    "name": "__result"
+                  },
+                  "direction": "desc"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "groupBy": [],
+              "legend": "TraceFence Stale Action Committed"
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 0,
+            "channels": [
+              "${TRACEFENCE_NOTIFICATION_CHANNEL}"
+            ]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": {
+        "evalWindow": "5m",
+        "frequency": "1m"
+      }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "renotify": {
+        "enabled": false,
+        "interval": "30m",
+        "alertStates": [
+          "firing"
+        ]
+      },
+      "usePolicy": false
+    },
+    "labels": {
+      "severity": "critical",
+      "team": "tracefence",
+      "component": "control-plane"
+    },
+    "annotations": {
+      "description": "A side effect committed under invalid control state. Current value: {{$value}}.",
+      "summary": "TraceFence Stale Action Committed crossed {{$threshold}}"
+    }
+  },
+  {
+    "alert": "TraceFence Live Agent Has Not Converged",
+    "alertType": "METRIC_BASED_ALERT",
+    "description": "At least one live affected agent remains without acknowledgement, gateway block, or lease expiry.",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "none",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "tracefence_unacknowledged_live_nodes",
+                  "timeAggregation": "latest",
+                  "spaceAggregation": "max"
+                }
+              ],
+              "limit": 100,
+              "order": [
+                {
+                  "key": {
+                    "name": "__result"
+                  },
+                  "direction": "desc"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "groupBy": [],
+              "legend": "TraceFence Live Agent Has Not Converged"
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "warning",
+            "op": "above",
+            "matchType": "all_the_times",
+            "target": 0,
+            "channels": [
+              "${TRACEFENCE_NOTIFICATION_CHANNEL}"
+            ]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": {
+        "evalWindow": "1m",
+        "frequency": "1m"
+      }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "renotify": {
+        "enabled": false,
+        "interval": "30m",
+        "alertStates": [
+          "firing"
+        ]
+      },
+      "usePolicy": false
+    },
+    "labels": {
+      "severity": "warning",
+      "team": "tracefence",
+      "component": "control-plane"
+    },
+    "annotations": {
+      "description": "At least one live affected agent remains without acknowledgement, gateway block, or lease expiry. Current value: {{$value}}.",
+      "summary": "TraceFence Live Agent Has Not Converged crossed {{$threshold}}"
+    }
+  },
+  {
+    "alert": "TraceFence Safety Telemetry Outbox Backlog",
+    "alertType": "METRIC_BASED_ALERT",
+    "description": "Durable safety telemetry events remain pending and SigNoz evidence may be incomplete.",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "none",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "tracefence_telemetry_outbox_pending",
+                  "timeAggregation": "latest",
+                  "spaceAggregation": "max"
+                }
+              ],
+              "limit": 100,
+              "order": [
+                {
+                  "key": {
+                    "name": "__result"
+                  },
+                  "direction": "desc"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "groupBy": [],
+              "legend": "TraceFence Safety Telemetry Outbox Backlog"
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "warning",
+            "op": "above",
+            "matchType": "all_the_times",
+            "target": 0,
+            "channels": [
+              "${TRACEFENCE_NOTIFICATION_CHANNEL}"
+            ]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": {
+        "evalWindow": "5m",
+        "frequency": "1m"
+      }
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "renotify": {
+        "enabled": false,
+        "interval": "30m",
+        "alertStates": [
+          "firing"
+        ]
+      },
+      "usePolicy": false
+    },
+    "labels": {
+      "severity": "warning",
+      "team": "tracefence",
+      "component": "control-plane"
+    },
+    "annotations": {
+      "description": "Durable TraceFence safety telemetry has remained pending. Current value: {{$value}}.",
+      "summary": "TraceFence telemetry outbox backlog crossed {{$threshold}}"
+    }
+  }
+]

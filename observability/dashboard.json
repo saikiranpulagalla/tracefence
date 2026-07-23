@@ -1,0 +1,1207 @@
+{
+  "title": "TraceFence Control Integrity",
+  "description": "Runtime control convergence, stale-action enforcement and safety invariants for dynamic AI-agent graphs.",
+  "tags": [
+    "tracefence",
+    "agent-observability",
+    "control-plane",
+    "managed-by-code"
+  ],
+  "layout": [
+    {
+      "x": 0,
+      "y": 0,
+      "w": 3,
+      "h": 7,
+      "i": "active-nodes",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 3,
+      "y": 0,
+      "w": 3,
+      "h": 7,
+      "i": "unacknowledged-nodes",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 6,
+      "y": 0,
+      "w": 3,
+      "h": 7,
+      "i": "orphan-nodes",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 9,
+      "y": 0,
+      "w": 3,
+      "h": 7,
+      "i": "stale-attempts",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 0,
+      "y": 7,
+      "w": 3,
+      "h": 7,
+      "i": "stale-commits",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 3,
+      "y": 7,
+      "w": 3,
+      "h": 7,
+      "i": "control-commands",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 6,
+      "y": 7,
+      "w": 3,
+      "h": 7,
+      "i": "denied-actions",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 9,
+      "y": 7,
+      "w": 3,
+      "h": 7,
+      "i": "gateway-latency",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 0,
+      "y": 14,
+      "w": 4,
+      "h": 8,
+      "i": "command-traces",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 4,
+      "y": 14,
+      "w": 4,
+      "h": 8,
+      "i": "blocked-action-traces",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 8,
+      "y": 14,
+      "w": 4,
+      "h": 8,
+      "i": "denied-action-logs",
+      "moved": false,
+      "static": false
+    },
+    {
+      "x": 0,
+      "y": 22,
+      "w": 3,
+      "h": 7,
+      "i": "outbox-pending",
+      "moved": false,
+      "static": false
+    }
+  ],
+  "variables": {},
+  "widgets": [
+    {
+      "id": "active-nodes",
+      "description": "Registered nodes with live leases and valid inherited scopes.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "value",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Active registered nodes",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "metrics",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "",
+                "type": "",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "",
+                "fieldDataType": "",
+                "signal": ""
+              },
+              "groupBy": [],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "Active nodes",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [],
+              "reduceTo": "last",
+              "timeAggregation": "latest",
+              "spaceAggregation": "max",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "",
+                  "metricName": "tracefence_active_nodes",
+                  "reduceTo": "last",
+                  "spaceAggregation": "max",
+                  "timeAggregation": "latest"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "unacknowledged-nodes",
+      "description": "Live affected descendants still lacking a convergence classification.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "value",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Unacknowledged live affected nodes",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "metrics",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "",
+                "type": "",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "",
+                "fieldDataType": "",
+                "signal": ""
+              },
+              "groupBy": [],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "Unacknowledged",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [],
+              "reduceTo": "last",
+              "timeAggregation": "latest",
+              "spaceAggregation": "max",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "",
+                  "metricName": "tracefence_unacknowledged_live_nodes",
+                  "reduceTo": "last",
+                  "spaceAggregation": "max",
+                  "timeAggregation": "latest"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "orphan-nodes",
+      "description": "Live stale nodes that have neither acknowledged nor been blocked.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "value",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Orphan nodes",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "metrics",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "",
+                "type": "",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "",
+                "fieldDataType": "",
+                "signal": ""
+              },
+              "groupBy": [],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "Orphans",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [],
+              "reduceTo": "last",
+              "timeAggregation": "latest",
+              "spaceAggregation": "max",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "",
+                  "metricName": "tracefence_orphan_nodes",
+                  "reduceTo": "last",
+                  "spaceAggregation": "max",
+                  "timeAggregation": "latest"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "stale-attempts",
+      "description": "Side-effect attempts denied because inherited control state was stale.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "value",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Stale action attempts blocked",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "metrics",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "",
+                "type": "",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "",
+                "fieldDataType": "",
+                "signal": ""
+              },
+              "groupBy": [],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "Blocked stale attempts",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [],
+              "reduceTo": "sum",
+              "timeAggregation": "increase",
+              "spaceAggregation": "sum",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "",
+                  "metricName": "tracefence_stale_action_attempts_total",
+                  "reduceTo": "sum",
+                  "spaceAggregation": "sum",
+                  "timeAggregation": "increase",
+                  "temporality": "Cumulative"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "stale-commits",
+      "description": "Hard safety invariant. This value must remain zero.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "value",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Stale actions committed",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "metrics",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "",
+                "type": "",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "",
+                "fieldDataType": "",
+                "signal": ""
+              },
+              "groupBy": [],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "Stale commits",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [],
+              "reduceTo": "sum",
+              "timeAggregation": "increase",
+              "spaceAggregation": "sum",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "",
+                  "metricName": "tracefence_stale_actions_committed_total",
+                  "reduceTo": "sum",
+                  "spaceAggregation": "sum",
+                  "timeAggregation": "increase",
+                  "temporality": "Cumulative"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [
+        {
+          "index": "critical",
+          "thresholdColor": "#ef4444",
+          "thresholdFormat": "Background",
+          "thresholdLabel": "Safety violation",
+          "thresholdOperator": ">",
+          "thresholdUnit": "none",
+          "thresholdValue": 0
+        }
+      ],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "control-commands",
+      "description": "Cancellation and correction commands issued by the control plane.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "graph",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Control commands by type",
+      "yAxisUnit": "ops",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "metrics",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "",
+                "type": "",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "",
+                "fieldDataType": "",
+                "signal": ""
+              },
+              "groupBy": [
+                {
+                  "key": "command_type",
+                  "name": "",
+                  "dataType": "string",
+                  "type": "tag",
+                  "isColumn": false,
+                  "isJSON": false,
+                  "id": "",
+                  "fieldContext": "attribute",
+                  "fieldDataType": "string",
+                  "signal": "metrics"
+                }
+              ],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "{{command_type}}",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [],
+              "reduceTo": "sum",
+              "timeAggregation": "increase",
+              "spaceAggregation": "sum",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "",
+                  "metricName": "tracefence_control_commands_total",
+                  "reduceTo": "sum",
+                  "spaceAggregation": "sum",
+                  "timeAggregation": "increase",
+                  "temporality": "Cumulative"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "denied-actions",
+      "description": "Gateway denials grouped by deterministic reason code.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "bar",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Denied actions by reason",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "metrics",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "",
+                "type": "",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "",
+                "fieldDataType": "",
+                "signal": ""
+              },
+              "groupBy": [
+                {
+                  "key": "denial_reason",
+                  "name": "",
+                  "dataType": "string",
+                  "type": "tag",
+                  "isColumn": false,
+                  "isJSON": false,
+                  "id": "",
+                  "fieldContext": "attribute",
+                  "fieldDataType": "string",
+                  "signal": "metrics"
+                }
+              ],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "{{denial_reason}}",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [],
+              "reduceTo": "sum",
+              "timeAggregation": "increase",
+              "spaceAggregation": "sum",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "",
+                  "metricName": "tracefence_actions_denied_total",
+                  "reduceTo": "sum",
+                  "spaceAggregation": "sum",
+                  "timeAggregation": "increase",
+                  "temporality": "Cumulative"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "gateway-latency",
+      "description": "Latency of identity, lease, scope, permission and idempotency validation.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "graph",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Action gateway p95 latency",
+      "yAxisUnit": "ms",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "metrics",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "",
+                "type": "",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "",
+                "fieldDataType": "",
+                "signal": ""
+              },
+              "groupBy": [],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "p95 gateway latency",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [],
+              "reduceTo": "avg",
+              "timeAggregation": "avg",
+              "spaceAggregation": "p95",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "",
+                  "metricName": "tracefence_action_gateway_duration_ms",
+                  "reduceTo": "avg",
+                  "spaceAggregation": "p95",
+                  "timeAggregation": "avg"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "command-traces",
+      "description": "Control commands grouped by deterministic type and reason attributes.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "bar",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Control command traces",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "traces",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "string",
+                "type": "tag",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "span",
+                "fieldDataType": "string",
+                "signal": "traces"
+              },
+              "groupBy": [
+                {
+                  "key": "tracefence.command.type",
+                  "name": "tracefence.command.type",
+                  "dataType": "string",
+                  "type": "tag",
+                  "isColumn": false,
+                  "isJSON": false,
+                  "id": "",
+                  "fieldContext": "span",
+                  "fieldDataType": "string",
+                  "signal": "traces"
+                },
+                {
+                  "key": "tracefence.command.reason_code",
+                  "name": "tracefence.command.reason_code",
+                  "dataType": "string",
+                  "type": "tag",
+                  "isColumn": false,
+                  "isJSON": false,
+                  "id": "",
+                  "fieldContext": "span",
+                  "fieldDataType": "string",
+                  "signal": "traces"
+                }
+              ],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "{{tracefence.command.type}} \u00b7 {{tracefence.command.reason_code}}",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [
+                {
+                  "columnName": "count()",
+                  "order": "desc"
+                }
+              ],
+              "reduceTo": "sum",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "filter": {
+                "expression": "name = 'tracefence.control.command_issue'"
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "blocked-action-traces",
+      "description": "Stale action blocks grouped by agent role, tool and denial reason.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "bar",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Blocked stale-action traces",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "traces",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "string",
+                "type": "tag",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "span",
+                "fieldDataType": "string",
+                "signal": "traces"
+              },
+              "groupBy": [
+                {
+                  "key": "tracefence.node.role",
+                  "name": "tracefence.node.role",
+                  "dataType": "string",
+                  "type": "tag",
+                  "isColumn": false,
+                  "isJSON": false,
+                  "id": "",
+                  "fieldContext": "span",
+                  "fieldDataType": "string",
+                  "signal": "traces"
+                },
+                {
+                  "key": "tracefence.action.tool",
+                  "name": "tracefence.action.tool",
+                  "dataType": "string",
+                  "type": "tag",
+                  "isColumn": false,
+                  "isJSON": false,
+                  "id": "",
+                  "fieldContext": "span",
+                  "fieldDataType": "string",
+                  "signal": "traces"
+                },
+                {
+                  "key": "tracefence.action.denial_reason",
+                  "name": "tracefence.action.denial_reason",
+                  "dataType": "string",
+                  "type": "tag",
+                  "isColumn": false,
+                  "isJSON": false,
+                  "id": "",
+                  "fieldContext": "span",
+                  "fieldDataType": "string",
+                  "signal": "traces"
+                }
+              ],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "{{tracefence.node.role}} \u00b7 {{tracefence.action.tool}} \u00b7 {{tracefence.action.denial_reason}}",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [
+                {
+                  "columnName": "count()",
+                  "order": "desc"
+                }
+              ],
+              "reduceTo": "sum",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "filter": {
+                "expression": "name = 'tracefence.action.block' AND tracefence.action.decision = 'DENY'"
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "denied-action-logs",
+      "description": "Structured denial logs grouped by reason code and tool.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "bar",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Correlated action-denied logs",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "logs",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "string",
+                "type": "tag",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "log",
+                "fieldDataType": "string",
+                "signal": "logs"
+              },
+              "groupBy": [
+                {
+                  "key": "reason_code",
+                  "name": "reason_code",
+                  "dataType": "string",
+                  "type": "tag",
+                  "isColumn": false,
+                  "isJSON": false,
+                  "id": "",
+                  "fieldContext": "log",
+                  "fieldDataType": "string",
+                  "signal": "logs"
+                },
+                {
+                  "key": "tool_name",
+                  "name": "tool_name",
+                  "dataType": "string",
+                  "type": "tag",
+                  "isColumn": false,
+                  "isJSON": false,
+                  "id": "",
+                  "fieldContext": "log",
+                  "fieldDataType": "string",
+                  "signal": "logs"
+                }
+              ],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "{{reason_code}} \u00b7 {{tool_name}}",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [
+                {
+                  "columnName": "count()",
+                  "order": "desc"
+                }
+              ],
+              "reduceTo": "sum",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "count()"
+                }
+              ],
+              "filter": {
+                "expression": "event = 'action_denied'"
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    },
+    {
+      "id": "outbox-pending",
+      "description": "Durable safety telemetry events that have not yet been confirmed exported.",
+      "isStacked": false,
+      "nullZeroValues": "zero",
+      "opacity": "1",
+      "panelTypes": "value",
+      "timePreferance": "GLOBAL_TIME",
+      "title": "Safety telemetry outbox pending",
+      "yAxisUnit": "none",
+      "query": {
+        "queryType": "builder",
+        "promql": [],
+        "clickhouse_sql": [],
+        "builder": {
+          "queryData": [
+            {
+              "queryName": "A",
+              "stepInterval": 60,
+              "dataSource": "metrics",
+              "aggregateAttribute": {
+                "key": "",
+                "name": "",
+                "dataType": "",
+                "type": "",
+                "isColumn": false,
+                "isJSON": false,
+                "id": "",
+                "fieldContext": "",
+                "fieldDataType": "",
+                "signal": ""
+              },
+              "groupBy": [],
+              "expression": "A",
+              "disabled": false,
+              "having": [],
+              "legend": "Safety telemetry outbox pending",
+              "limit": 100,
+              "offset": 0,
+              "pageSize": 100,
+              "orderBy": [],
+              "reduceTo": "last",
+              "timeAggregation": "latest",
+              "spaceAggregation": "max",
+              "functions": [],
+              "aggregations": [
+                {
+                  "expression": "",
+                  "metricName": "tracefence_telemetry_outbox_pending",
+                  "reduceTo": "last",
+                  "spaceAggregation": "max",
+                  "timeAggregation": "latest"
+                }
+              ],
+              "filter": {
+                "expression": ""
+              },
+              "source": ""
+            }
+          ],
+          "queryFormulas": []
+        }
+      },
+      "bucketCount": 30,
+      "bucketWidth": 0,
+      "columnUnits": {},
+      "fillSpans": false,
+      "mergeAllActiveQueries": false,
+      "selectedLogFields": [],
+      "selectedTracesFields": [],
+      "stackedBarChart": false,
+      "thresholds": [],
+      "isLogScale": false,
+      "columnWidths": {},
+      "customLegendColors": {},
+      "legendPosition": "bottom",
+      "contextLinks": {
+        "linksData": []
+      }
+    }
+  ]
+}
