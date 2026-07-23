@@ -154,7 +154,6 @@ def _state(session: Session, run_id: str, service_name: str, default_status: str
             updated_at=utcnow(),
         )
         session.add(state)
-        session.flush()
     return state
 
 
