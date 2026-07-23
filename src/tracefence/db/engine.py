@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from string import Template
 
 from sqlalchemy import (
     CheckConstraint,
@@ -16,7 +17,6 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tracefence.config import settings
 from tracefence.db.models import Base, SchemaMetadata
-
 
 # SQLite triggers make the proof revision a database-owned consistency
 # boundary. Service code cannot accidentally omit a bump when it mutates an
@@ -35,6 +35,17 @@ _PROOF_RELEVANT_RUN_TABLES = (
     "telemetry_outbox",
     "service_state",
 )
+_PROOF_REVISION_TRIGGER_DDL = Template(
+    """
+    CREATE TRIGGER IF NOT EXISTS $trigger_name
+    AFTER $operation ON $table
+    BEGIN
+        UPDATE runs
+        SET proof_revision = proof_revision + 1
+        WHERE id = $row.run_id;
+    END
+    """
+)
 
 
 def _proof_revision_trigger_names() -> set[str]:
@@ -52,18 +63,16 @@ def _install_proof_revision_triggers(selected_engine: Engine) -> None:
         for table in _PROOF_RELEVANT_RUN_TABLES:
             for operation in ("insert", "update", "delete"):
                 row = "OLD" if operation == "delete" else "NEW"
-                connection.exec_driver_sql(
-                    f"""
-                    CREATE TRIGGER IF NOT EXISTS
-                        trg_{table}_{operation}_proof_revision
-                    AFTER {operation.upper()} ON {table}
-                    BEGIN
-                        UPDATE runs
-                        SET proof_revision = proof_revision + 1
-                        WHERE id = {row}.run_id;
-                    END
-                    """
+                # Identifiers come exclusively from the private constant tuple
+                # above and the fixed operation tuple; no request/configuration
+                # value can reach this schema-bootstrap DDL.
+                trigger_ddl = _PROOF_REVISION_TRIGGER_DDL.substitute(
+                    trigger_name=f"trg_{table}_{operation}_proof_revision",
+                    operation=operation.upper(),
+                    table=table,
+                    row=row,
                 )
+                connection.exec_driver_sql(trigger_ddl)
         connection.exec_driver_sql(
             """
             CREATE TRIGGER IF NOT EXISTS trg_runs_update_proof_revision
