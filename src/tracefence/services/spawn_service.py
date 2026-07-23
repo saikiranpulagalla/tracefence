@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from uuid import uuid4
 
 from opentelemetry.propagate import inject
-from sqlalchemy import func, select, text
 from pydantic import ValidationError
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from tracefence.config import settings
@@ -24,9 +24,9 @@ from tracefence.domain.schemas import (
     CheckpointResponse,
     NodeActivate,
     NodeActivated,
+    ReplacementManifest,
     SpawnCreate,
     SpawnCreated,
-    ReplacementManifest,
 )
 from tracefence.security import generate_token, hash_token, payload_digest, token_matches
 from tracefence.services.common import (
@@ -144,33 +144,59 @@ class SpawnService:
 
     async def heartbeat(self, node_id: str, node_token: str) -> Node:
         now = utcnow()
-        expired = False
+        denial_code: str | None = None
         node: Node
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
                 node = await authenticate_node(session, node_id, node_token)
-                if node.status not in {NodeStatus.ACTIVE, NodeStatus.WAITING}:
-                    raise ConflictError("Node is not live", code="NODE_NOT_ACTIVE")
-                if node.lease_expires_at is None or node.lease_expires_at <= now:
+                run = session.get(Run, node.run_id)
+                if run is None:
+                    raise NotFoundError(f"Run {node.run_id} was not found")
+                if run.status != RunStatus.RUNNING:
+                    denial_code = "RUN_NOT_ACTIVE"
+                elif node.status not in {NodeStatus.ACTIVE, NodeStatus.WAITING}:
+                    denial_code = "NODE_NOT_ACTIVE"
+                elif node.lease_expires_at is None or node.lease_expires_at <= now:
                     node.status = NodeStatus.LEASE_EXPIRED
                     await self._record_lease_expiry_ack(session, node, now)
-                    session.commit()
-                    expired = True
+                    denial_code = "LEASE_EXPIRED"
                 else:
-                    node.last_heartbeat_at = now
-                    node.lease_expires_at = now + timedelta(
-                        seconds=settings.lease_ttl_seconds
-                    )
-                    session.commit()
+                    evaluation = await evaluate_scopes(session, node)
+                    if not evaluation.allowed:
+                        commands = await commands_for_scope_mismatches(
+                            session,
+                            evaluation.mismatches,
+                            run_id=node.run_id,
+                        )
+                        for command in commands:
+                            self._record_ack(
+                                session,
+                                node.run_id,
+                                command.id,
+                                node.id,
+                                AckType.COOPERATIVE,
+                                command.to_version,
+                                now,
+                            )
+                        node.status = evaluation.effective_status
+                        denial_code = evaluation.primary_reason or "SCOPE_INVALID"
+                    else:
+                        node.last_heartbeat_at = now
+                        node.lease_expires_at = now + timedelta(
+                            seconds=settings.lease_ttl_seconds
+                        )
+                session.commit()
             except Exception:
                 session.rollback()
                 raise
 
-        if expired:
-            telemetry.leases_expired_total.add(1)
+        if denial_code is not None:
+            if denial_code == "LEASE_EXPIRED":
+                telemetry.leases_expired_total.add(1)
             raise ConflictError(
-                "Expired lease cannot be revived by heartbeat", code="LEASE_EXPIRED"
+                f"Heartbeat denied: {denial_code}",
+                code=denial_code,
             )
         return node
 
