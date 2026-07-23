@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from tracefence.config import settings
-from tracefence.db.models import CorrectionProposal, ControlCommand, ControlScope, Node
+from tracefence.db.models import ControlCommand, ControlScope, CorrectionProposal, Node
 from tracefence.domain.enums import (
     CommandType,
     IssuerType,
@@ -36,6 +36,7 @@ from tracefence.services.common import (
     validate_node_runtime_state,
 )
 from tracefence.services.proposal_service import proposal_payload
+from tracefence.services.run_lifecycle import transition_run
 from tracefence.services.tool_registry import get_tool_spec
 from tracefence.telemetry.instruments import telemetry
 
@@ -116,6 +117,12 @@ class ControlService:
                         )
                     session.commit()
                     return self._to_response(existing, duplicate=True)
+
+                if run.status != RunStatus.RUNNING:
+                    raise ConflictError(
+                        "Terminal runs cannot accept new commands",
+                        code="RUN_TERMINAL_STATE",
+                    )
 
                 command_count = session.scalar(
                     select(func.count(ControlCommand.id)).where(
@@ -291,8 +298,12 @@ class ControlService:
                 scope.updated_at = utcnow()
 
                 if request.command_type == CommandType.CANCEL_RUN:
-                    run.status = RunStatus.CANCELLED
-                    run.finished_at = utcnow()
+                    transition_run(
+                        session,
+                        run,
+                        RunStatus.CANCELLED,
+                        finished_at=utcnow(),
+                    )
 
                 command = ControlCommand(
                     id=str(uuid4()),

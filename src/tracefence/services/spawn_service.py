@@ -36,6 +36,7 @@ from tracefence.services.common import (
     utcnow,
     validate_node_runtime_state,
 )
+from tracefence.services.run_lifecycle import transition_run
 from tracefence.telemetry.instruments import telemetry
 
 logger = logging.getLogger(__name__)
@@ -259,72 +260,94 @@ class SpawnService:
             )
 
     async def complete(self, node_id: str, node_token: str) -> None:
-        with self.session_factory() as session, session.begin():
-            node = await authenticate_node(session, node_id, node_token)
-            allowed, reason, _ = await validate_node_runtime_state(session, node)
-            if not allowed:
-                raise ConflictError(
-                    f"Node cannot complete: {reason}", code=reason or "COMPLETE_DENIED"
-                )
-
-            run = session.get(Run, node.run_id)
-            if run is None:
-                raise NotFoundError(f"Run {node.run_id} was not found")
-            if run.root_node_id == node.id:
-                others = session.execute(
-                    select(Node).where(Node.run_id == node.run_id, Node.id != node.id)
-                ).scalars().all()
-                live_nodes: list[str] = []
-                expired_count = 0
-                now = utcnow()
-                for other in others:
-                    if other.status in {
-                        NodeStatus.COMPLETED,
-                        NodeStatus.CANCELLED,
-                        NodeStatus.SUPERSEDED,
-                        NodeStatus.LEASE_EXPIRED,
-                    }:
-                        continue
-
-                    expired = False
-                    if other.status in {NodeStatus.ACTIVE, NodeStatus.WAITING}:
-                        expired = (
-                            other.lease_expires_at is None
-                            or other.lease_expires_at <= now
-                        )
-                    elif other.status == NodeStatus.PENDING:
-                        intent = session.execute(
-                            select(SpawnIntent).where(
-                                SpawnIntent.child_node_id == other.id,
-                                SpawnIntent.run_id == other.run_id,
-                            )
-                        ).scalar_one_or_none()
-                        expired = (
-                            intent is None
-                            or intent.consumed_at is None and intent.expires_at <= now
-                        )
-
-                    if expired:
-                        other.status = NodeStatus.LEASE_EXPIRED
-                        await self._record_lease_expiry_ack(session, other, now)
-                        expired_count += 1
-                        continue
-
-                    other_evaluation = await evaluate_scopes(session, other)
-                    if other_evaluation.allowed:
-                        live_nodes.append(other.id)
-                if expired_count:
-                    telemetry.leases_expired_total.add(expired_count)
-                if live_nodes:
+        with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            try:
+                node = await authenticate_node(session, node_id, node_token)
+                allowed, reason, _ = await validate_node_runtime_state(session, node)
+                if not allowed:
                     raise ConflictError(
-                        "Root cannot complete while valid descendant nodes remain live",
-                        code="RUN_HAS_LIVE_NODES",
+                        f"Node cannot complete: {reason}",
+                        code=reason or "COMPLETE_DENIED",
                     )
-                run.status = RunStatus.COMPLETED
-                run.finished_at = utcnow()
 
-            node.status = NodeStatus.COMPLETED
-            node.completed_at = utcnow()
+                run = session.get(Run, node.run_id)
+                if run is None:
+                    raise NotFoundError(f"Run {node.run_id} was not found")
+                if run.root_node_id == node.id:
+                    others = session.execute(
+                        select(Node).where(
+                            Node.run_id == node.run_id,
+                            Node.id != node.id,
+                        )
+                    ).scalars().all()
+                    live_nodes: list[str] = []
+                    expired_count = 0
+                    now = utcnow()
+                    for other in others:
+                        if other.status in {
+                            NodeStatus.COMPLETED,
+                            NodeStatus.CANCELLED,
+                            NodeStatus.SUPERSEDED,
+                            NodeStatus.LEASE_EXPIRED,
+                        }:
+                            continue
+
+                        expired = False
+                        if other.status in {
+                            NodeStatus.ACTIVE,
+                            NodeStatus.WAITING,
+                        }:
+                            expired = (
+                                other.lease_expires_at is None
+                                or other.lease_expires_at <= now
+                            )
+                        elif other.status == NodeStatus.PENDING:
+                            intent = session.execute(
+                                select(SpawnIntent).where(
+                                    SpawnIntent.child_node_id == other.id,
+                                    SpawnIntent.run_id == other.run_id,
+                                )
+                            ).scalar_one_or_none()
+                            expired = (
+                                intent is None
+                                or intent.consumed_at is None
+                                and intent.expires_at <= now
+                            )
+
+                        if expired:
+                            other.status = NodeStatus.LEASE_EXPIRED
+                            await self._record_lease_expiry_ack(
+                                session,
+                                other,
+                                now,
+                            )
+                            expired_count += 1
+                            continue
+
+                        other_evaluation = await evaluate_scopes(session, other)
+                        if other_evaluation.allowed:
+                            live_nodes.append(other.id)
+                    if expired_count:
+                        telemetry.leases_expired_total.add(expired_count)
+                    if live_nodes:
+                        raise ConflictError(
+                            "Root cannot complete while valid descendant nodes remain live",
+                            code="RUN_HAS_LIVE_NODES",
+                        )
+                    transition_run(
+                        session,
+                        run,
+                        RunStatus.COMPLETED,
+                        finished_at=utcnow(),
+                    )
+
+                node.status = NodeStatus.COMPLETED
+                node.completed_at = utcnow()
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
 
     async def create_replacement(
         self,
