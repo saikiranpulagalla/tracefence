@@ -163,6 +163,13 @@ make reset
 make api
 ```
 
+The worker keeps per-request HTTP deadlines below the lease TTL, stops work when heartbeat
+authority is lost, requires checkpoint JSON to contain `allowed: true`, and completes
+cooperative work explicitly. Worker exit statuses are: `0` completed, `2` action rejected,
+`3` lease lost, `4` transport/internal failure, `5` checkpoint denied, `6` completion
+rejected, and `7` activation rejected. Activation and node credentials are supplied through
+stdin/HTTP only and never through process arguments.
+
 The server binds to loopback by default:
 
 ```text

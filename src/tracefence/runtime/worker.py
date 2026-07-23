@@ -6,18 +6,32 @@ import json
 import os
 import signal
 import sys
+import threading
 from typing import Any
 
 import httpx
 from opentelemetry import propagate, trace
 from opentelemetry.trace import Link
 
+from tracefence.config import settings
 from tracefence.telemetry.setup import (
     configure_telemetry,
     force_flush_telemetry,
     instrument_httpx,
     shutdown_telemetry,
 )
+
+EXIT_SUCCESS = 0
+EXIT_OPERATION_REJECTED = 2
+EXIT_LEASE_LOST = 3
+EXIT_INTERNAL_OR_TRANSPORT_FAILURE = 4
+EXIT_CHECKPOINT_DENIED = 5
+EXIT_COMPLETION_REJECTED = 6
+EXIT_ACTIVATION_REJECTED = 7
+
+
+class _LeaseLost(Exception):
+    pass
 
 
 def _positive_float(value: str) -> float:
@@ -72,15 +86,41 @@ async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
             "tracefence.worker.mode": args.mode,
         },
     ) as lifecycle_span:
-        async with httpx.AsyncClient(base_url=args.api_url, timeout=10.0) as client:
-            response = await client.post(
-                f"/v1/nodes/{args.node_id}/activate",
-                json={
-                    "activation_token": startup["activation_token"],
-                    "process_id": os.getpid(),
-                },
-            )
-            response.raise_for_status()
+        retry_margin = args.heartbeat_retry_max + args.heartbeat_interval
+        if args.http_timeout >= settings.lease_ttl_seconds - retry_margin:
+            lifecycle_span.add_event("invalid_http_deadline")
+            return EXIT_INTERNAL_OR_TRANSPORT_FAILURE
+        timeout = httpx.Timeout(
+            connect=args.http_timeout,
+            read=args.http_timeout,
+            write=args.http_timeout,
+            pool=args.http_timeout,
+        )
+        limits = httpx.Limits(max_connections=4, max_keepalive_connections=2)
+        async with httpx.AsyncClient(
+            base_url=args.api_url,
+            timeout=timeout,
+            limits=limits,
+            follow_redirects=False,
+        ) as client:
+            try:
+                response = await client.post(
+                    f"/v1/nodes/{args.node_id}/activate",
+                    json={
+                        "operation_key": f"worker-activate-{args.node_id}",
+                        "activation_token": startup["activation_token"],
+                        "process_id": os.getpid(),
+                    },
+                )
+            except httpx.HTTPError as exc:
+                lifecycle_span.record_exception(exc)
+                return EXIT_INTERNAL_OR_TRANSPORT_FAILURE
+            if response.status_code >= 400:
+                lifecycle_span.add_event(
+                    "activation_rejected",
+                    {"http.status_code": response.status_code},
+                )
+                return EXIT_ACTIVATION_REJECTED
             activation = response.json()
             node_token = activation["node_token"]
             lifecycle_span.set_attribute("tracefence.run.id", activation["run_id"])
@@ -101,7 +141,7 @@ async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
                                 "current_operation": args.mode,
                             },
                         )
-                    except Exception as exc:
+                    except httpx.HTTPError as exc:
                         failures += 1
                         lifecycle_span.add_event(
                             "heartbeat_transport_failure",
@@ -125,7 +165,7 @@ async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
 
             async def wait_for_work_release() -> None:
                 if args.wait_for_release:
-                    release_task = asyncio.create_task(asyncio.to_thread(sys.stdin.readline))
+                    release_task = asyncio.create_task(_read_release_signal())
                     lease_task = asyncio.create_task(lease_lost.wait())
                     done, pending = await asyncio.wait(
                         {release_task, lease_task},
@@ -145,6 +185,27 @@ async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
                     except TimeoutError:
                         pass
 
+            async def post_while_live(
+                path: str,
+                *,
+                json_payload: dict[str, Any] | None = None,
+            ) -> httpx.Response:
+                request_task = asyncio.create_task(
+                    client.post(path, headers=headers, json=json_payload)
+                )
+                lease_task = asyncio.create_task(lease_lost.wait())
+                done, pending = await asyncio.wait(
+                    {request_task, lease_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if lease_task in done and lease_lost.is_set():
+                    request_task.cancel()
+                    await asyncio.gather(request_task, return_exceptions=True)
+                    raise _LeaseLost
+                lease_task.cancel()
+                await asyncio.gather(lease_task, return_exceptions=True)
+                return request_task.result()
+
             heartbeat_task = asyncio.create_task(
                 heartbeat_loop(), name=f"tracefence-heartbeat-{args.node_id}"
             )
@@ -152,7 +213,8 @@ async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
                 await wait_for_work_release()
                 if lease_lost.is_set():
                     lifecycle_span.set_attribute("tracefence.worker.terminal_state", "LEASE_LOST")
-                    return 3
+                    lifecycle_span.add_event("worker_lease_lost")
+                    return EXIT_LEASE_LOST
 
                 if args.mode == "non_compliant_action":
                     with tracer.start_as_current_span(
@@ -162,10 +224,9 @@ async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
                             "tracefence.action.tool": args.tool,
                         },
                     ):
-                        action = await client.post(
+                        action = await post_while_live(
                             f"/v1/nodes/{args.node_id}/actions",
-                            headers=headers,
-                            json={
+                            json_payload={
                                 "idempotency_key": args.idempotency_key,
                                 "tool_name": args.tool,
                                 "arguments": {},
@@ -176,30 +237,90 @@ async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
                         "tracefence.worker.terminal_state",
                         "ACTION_RETURNED" if action.status_code == 200 else "ACTION_FAILED",
                     )
-                    return 0 if action.status_code == 200 else 2
+                    return (
+                        EXIT_SUCCESS
+                        if action.status_code == 200
+                        else EXIT_OPERATION_REJECTED
+                    )
 
-                checkpoint = await client.post(
+                checkpoint = await post_while_live(
                     f"/v1/nodes/{args.node_id}/checkpoint",
-                    headers=headers,
-                    json={"stage": "worker_loop"},
+                    json_payload={"stage": "worker_loop"},
                 )
                 print(checkpoint.text, flush=True)
+                if checkpoint.status_code != 200:
+                    lifecycle_span.set_attribute(
+                        "tracefence.worker.terminal_state",
+                        "CHECKPOINT_REJECTED",
+                    )
+                    return EXIT_CHECKPOINT_DENIED
+                checkpoint_payload = checkpoint.json()
+                if (
+                    not isinstance(checkpoint_payload, dict)
+                    or checkpoint_payload.get("allowed") is not True
+                ):
+                    lifecycle_span.set_attribute(
+                        "tracefence.worker.terminal_state",
+                        "CHECKPOINT_DENIED",
+                    )
+                    return EXIT_CHECKPOINT_DENIED
+                completion = await post_while_live(
+                    f"/v1/nodes/{args.node_id}/complete",
+                )
+                if completion.status_code != 204:
+                    lifecycle_span.add_event(
+                        "completion_rejected",
+                        {"http.status_code": completion.status_code},
+                    )
+                    lifecycle_span.set_attribute(
+                        "tracefence.worker.terminal_state",
+                        "COMPLETION_REJECTED",
+                    )
+                    return EXIT_COMPLETION_REJECTED
                 lifecycle_span.set_attribute(
                     "tracefence.worker.terminal_state",
-                    "CHECKPOINT_RETURNED" if checkpoint.status_code == 200 else "CHECKPOINT_FAILED",
+                    "COMPLETED",
                 )
-                return 0 if checkpoint.status_code == 200 else 2
+                return EXIT_SUCCESS
+            except _LeaseLost:
+                lifecycle_span.set_attribute(
+                    "tracefence.worker.terminal_state",
+                    "LEASE_LOST",
+                )
+                lifecycle_span.add_event("worker_lease_lost")
+                return EXIT_LEASE_LOST
             except Exception as exc:
                 lifecycle_span.record_exception(exc)
                 terminal = (
                     "TRANSPORT_FAILED" if isinstance(exc, httpx.HTTPError) else "FAILED"
                 )
                 lifecycle_span.set_attribute("tracefence.worker.terminal_state", terminal)
-                return 4
+                return EXIT_INTERNAL_OR_TRANSPORT_FAILURE
             finally:
                 lease_lost.set()
                 heartbeat_task.cancel()
                 await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+
+async def _read_release_signal() -> str:
+    loop = asyncio.get_running_loop()
+    result: asyncio.Future[str] = loop.create_future()
+
+    def read() -> None:
+        line = sys.stdin.readline()
+
+        def publish() -> None:
+            if not result.done():
+                result.set_result(line)
+
+        loop.call_soon_threadsafe(publish)
+
+    threading.Thread(
+        target=read,
+        name="tracefence-worker-release-reader",
+        daemon=True,
+    ).start()
+    return await result
 
 
 def parse_args() -> argparse.Namespace:
@@ -215,6 +336,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-heartbeat-failures", type=_positive_int, default=3)
     parser.add_argument("--heartbeat-retry-base", type=_positive_float, default=0.25)
     parser.add_argument("--heartbeat-retry-max", type=_positive_float, default=2.0)
+    parser.add_argument("--http-timeout", type=_positive_float, default=2.0)
     parser.add_argument("--tool", default="restart_postgres")
     parser.add_argument("--idempotency-key", default="worker-action-001")
     return parser.parse_args()
