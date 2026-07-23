@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+
 from tracefence.config import settings
 from tracefence.domain.enums import ProofVerdict
 
@@ -49,103 +51,118 @@ class SigNozMCPClient:
                 evidence={},
             )
 
-        headers = {"SIGNOZ-API-KEY": settings.signoz_api_key}
         try:
-            async with streamable_http_client(settings.signoz_mcp_url, headers=headers) as streams:
-                read_stream, write_stream, _ = streams
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    tools = await session.list_tools()
-                    tool_names = {tool.name for tool in tools.tools}
-                    required = {
-                        "signoz_search_traces",
-                        "signoz_search_logs",
-                        "signoz_query_metrics",
-                    }
-                    missing = sorted(required - tool_names)
-                    if missing:
-                        return TelemetryProof(
-                            verdict=ProofVerdict.UNAVAILABLE,
-                            trace_ids=[],
-                            discrepancies=[f"Missing SigNoz MCP tools: {', '.join(missing)}"],
-                            evidence={"available_tools": sorted(tool_names)},
+            async with httpx.AsyncClient(
+                headers={"SIGNOZ-API-KEY": settings.signoz_api_key},
+                timeout=httpx.Timeout(connect=3, read=10, write=10, pool=3),
+                limits=httpx.Limits(
+                    max_connections=4,
+                    max_keepalive_connections=2,
+                ),
+                follow_redirects=False,
+            ) as http_client:
+                async with streamable_http_client(
+                    settings.signoz_mcp_url,
+                    http_client=http_client,
+                ) as streams:
+                    read_stream, write_stream, _ = streams
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        tools = await session.list_tools()
+                        tool_names = {tool.name for tool in tools.tools}
+                        required = {
+                            "signoz_search_traces",
+                            "signoz_search_logs",
+                            "signoz_query_metrics",
+                        }
+                        missing = sorted(required - tool_names)
+                        if missing:
+                            return TelemetryProof(
+                                verdict=ProofVerdict.UNAVAILABLE,
+                                trace_ids=[],
+                                discrepancies=[
+                                    f"Missing SigNoz MCP tools: {', '.join(missing)}"
+                                ],
+                                evidence={"available_tools": sorted(tool_names)},
+                            )
+
+                        time_arguments: dict[str, Any] = {"timeRange": "1h"}
+                        if start_ms is not None and end_ms is not None:
+                            time_arguments = {"start": start_ms, "end": end_ms}
+
+                        command_result = await session.call_tool(
+                            "signoz_search_traces",
+                            arguments={
+                                "searchContext": "TraceFence command issuance evidence",
+                                "operation": "tracefence.control.command_issue",
+                                "filter": f"attribute.tracefence.command.id = '{command_id}'",
+                                "limit": 100,
+                                **time_arguments,
+                            },
+                        )
+                        blocked_result = await session.call_tool(
+                            "signoz_search_traces",
+                            arguments={
+                                "searchContext": "TraceFence stale action block evidence",
+                                "operation": "tracefence.action.block",
+                                "filter": f"attribute.tracefence.command.id = '{command_id}'",
+                                "limit": 100,
+                                **time_arguments,
+                            },
+                        )
+                        log_result = await session.call_tool(
+                            "signoz_search_logs",
+                            arguments={
+                                "searchContext": "TraceFence correlated action-denied logs",
+                                "searchText": f"action_denied command_id={command_id}",
+                                "limit": 100,
+                                **time_arguments,
+                            },
+                        )
+                        metric_arguments = {
+                            "metricType": "sum",
+                            "isMonotonic": True,
+                            "temporality": "cumulative",
+                            "timeAggregation": "increase",
+                            "spaceAggregation": "sum",
+                            "requestType": "scalar",
+                            "reduceTo": "sum",
+                            **time_arguments,
+                        }
+                        attempts_metric = await session.call_tool(
+                            "signoz_query_metrics",
+                            arguments={
+                                "searchContext": "TraceFence stale action attempt invariant",
+                                "metricName": "tracefence_stale_action_attempts_total",
+                                **metric_arguments,
+                            },
+                        )
+                        committed_metric = await session.call_tool(
+                            "signoz_query_metrics",
+                            arguments={
+                                "searchContext": "TraceFence stale action commit invariant",
+                                "metricName": "tracefence_stale_actions_committed_total",
+                                **metric_arguments,
+                            },
                         )
 
-                    time_arguments: dict[str, Any] = {"timeRange": "1h"}
-                    if start_ms is not None and end_ms is not None:
-                        time_arguments = {"start": start_ms, "end": end_ms}
-
-                    command_result = await session.call_tool(
-                        "signoz_search_traces",
-                        arguments={
-                            "searchContext": "TraceFence command issuance evidence",
-                            "operation": "tracefence.control.command_issue",
-                            "filter": f"attribute.tracefence.command.id = '{command_id}'",
-                            "limit": 100,
-                            **time_arguments,
-                        },
-                    )
-                    blocked_result = await session.call_tool(
-                        "signoz_search_traces",
-                        arguments={
-                            "searchContext": "TraceFence stale action block evidence",
-                            "operation": "tracefence.action.block",
-                            "filter": f"attribute.tracefence.command.id = '{command_id}'",
-                            "limit": 100,
-                            **time_arguments,
-                        },
-                    )
-                    log_result = await session.call_tool(
-                        "signoz_search_logs",
-                        arguments={
-                            "searchContext": "TraceFence correlated action-denied logs",
-                            "searchText": f"action_denied command_id={command_id}",
-                            "limit": 100,
-                            **time_arguments,
-                        },
-                    )
-                    metric_arguments = {
-                        "metricType": "sum",
-                        "isMonotonic": True,
-                        "temporality": "cumulative",
-                        "timeAggregation": "increase",
-                        "spaceAggregation": "sum",
-                        "requestType": "scalar",
-                        "reduceTo": "sum",
-                        **time_arguments,
-                    }
-                    attempts_metric = await session.call_tool(
-                        "signoz_query_metrics",
-                        arguments={
-                            "searchContext": "TraceFence stale action attempt invariant",
-                            "metricName": "tracefence_stale_action_attempts_total",
-                            **metric_arguments,
-                        },
-                    )
-                    committed_metric = await session.call_tool(
-                        "signoz_query_metrics",
-                        arguments={
-                            "searchContext": "TraceFence stale action commit invariant",
-                            "metricName": "tracefence_stale_actions_committed_total",
-                            **metric_arguments,
-                        },
-                    )
-
-                    evidence = {
-                        "command_traces": _normalize_tool_result(command_result),
-                        "blocked_traces": _normalize_tool_result(blocked_result),
-                        "blocked_logs": _normalize_tool_result(log_result),
-                        "attempts_metric": _normalize_tool_result(attempts_metric),
-                        "committed_metric": _normalize_tool_result(committed_metric),
-                        "expected_stale_attempts": expected_stale_attempts,
-                        "expected_stale_committed": expected_stale_committed,
-                    }
-                    return _reconcile_evidence(command_id, evidence)
-        except Exception as exc:
+                        evidence = {
+                            "command_traces": _normalize_tool_result(command_result),
+                            "blocked_traces": _normalize_tool_result(blocked_result),
+                            "blocked_logs": _normalize_tool_result(log_result),
+                            "attempts_metric": _normalize_tool_result(attempts_metric),
+                            "committed_metric": _normalize_tool_result(committed_metric),
+                            "expected_stale_attempts": expected_stale_attempts,
+                            "expected_stale_committed": expected_stale_committed,
+                        }
+                        return _reconcile_evidence(command_id, evidence)
+        except (httpx.TransportError, TimeoutError, OSError) as exc:
             return TelemetryProof(
                 verdict=ProofVerdict.UNAVAILABLE,
                 trace_ids=[],
-                discrepancies=[f"SigNoz MCP query failed: {type(exc).__name__}: {exc}"],
+                discrepancies=[
+                    f"SigNoz MCP transport unavailable: {type(exc).__name__}: {exc}"
+                ],
                 evidence={},
             )
 
