@@ -13,6 +13,7 @@ from tracefence.domain.enums import (
     ProofVerdict,
     ProposalStatus,
     ProposalType,
+    ReplacementStatus,
     RunStatus,
 )
 
@@ -295,6 +296,7 @@ class CommandIssued(BaseModel):
     replacement_instruction: dict[str, Any] | None = None
     replacement_expected_tool: str | None = None
     replacement_manifest: dict[str, Any] | None = None
+    replacement_status: ReplacementStatus | None = None
     duplicate: bool = False
 
 

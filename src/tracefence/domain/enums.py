@@ -31,6 +31,14 @@ class CommandType(StrEnum):
     CORRECT_SUBTREE = "CORRECT_SUBTREE"
 
 
+class ReplacementStatus(StrEnum):
+    PENDING = "PENDING"
+    ACTIVATION_EXPIRED = "ACTIVATION_EXPIRED"
+    ACTIVE = "ACTIVE"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
 class ProposalType(StrEnum):
     CANCEL = "CANCEL"
     CORRECT = "CORRECT"

@@ -14,6 +14,7 @@ from tracefence.domain.enums import (
     IssuerType,
     ProposalStatus,
     ProposalType,
+    ReplacementStatus,
     RunStatus,
     ScopeStatus,
 )
@@ -274,11 +275,32 @@ class ControlService:
                     replacement_parent_id = None
                 else:
                     target_scope_id = target.own_scope_id
-                    replacement_parent_id = (
-                        target.parent_id
-                        if request.command_type == CommandType.CORRECT_SUBTREE
-                        else None
-                    )
+                    replacement_parent_id = None
+                    if request.command_type == CommandType.CORRECT_SUBTREE:
+                        intended_parent = (
+                            session.get(Node, target.parent_id)
+                            if target.parent_id is not None
+                            else None
+                        )
+                        if intended_parent is not None:
+                            intended_live, _, _ = await validate_node_runtime_state(
+                                session, intended_parent
+                            )
+                            if intended_live:
+                                replacement_parent_id = intended_parent.id
+                        if replacement_parent_id is None:
+                            root = session.get(Node, run.root_node_id)
+                            root_live = False
+                            if root is not None and root.id != target.id:
+                                root_live, _, _ = await validate_node_runtime_state(
+                                    session, root
+                                )
+                            if not root_live:
+                                raise ConflictError(
+                                    "No live authorized replacement parent is available",
+                                    code="REPLACEMENT_PARENT_UNAVAILABLE",
+                                )
+                            replacement_parent_id = root.id
 
                 scope = session.get(ControlScope, target_scope_id)
                 if scope is None or scope.run_id != run.id:
@@ -331,6 +353,11 @@ class ControlService:
                         else None
                     ),
                     replacement_node_id=None,
+                    replacement_status=(
+                        ReplacementStatus.PENDING
+                        if request.command_type == CommandType.CORRECT_SUBTREE
+                        else None
+                    ),
                     created_at=utcnow(),
                 )
                 session.add(command)
@@ -408,5 +435,10 @@ class ControlService:
             replacement_instruction=command.replacement_instruction_json,
             replacement_expected_tool=command.replacement_expected_tool,
             replacement_manifest=command.replacement_manifest_json,
+            replacement_status=(
+                ReplacementStatus(command.replacement_status)
+                if command.replacement_status is not None
+                else None
+            ),
             duplicate=duplicate,
         )

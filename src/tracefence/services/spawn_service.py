@@ -18,7 +18,14 @@ from tracefence.db.models import (
     Run,
     SpawnIntent,
 )
-from tracefence.domain.enums import AckType, CommandType, NodeStatus, RunStatus, ScopeStatus
+from tracefence.domain.enums import (
+    AckType,
+    CommandType,
+    NodeStatus,
+    ReplacementStatus,
+    RunStatus,
+    ScopeStatus,
+)
 from tracefence.domain.errors import AuthorizationError, ConflictError, NotFoundError
 from tracefence.domain.schemas import (
     CheckpointResponse,
@@ -127,6 +134,18 @@ class SpawnService:
                 node.last_heartbeat_at = now
                 node.lease_expires_at = lease_expires_at
                 node.process_id = request.process_id
+                if node.caused_by_command_id is not None:
+                    command = session.get(ControlCommand, node.caused_by_command_id)
+                    if (
+                        command is None
+                        or command.replacement_node_id != node.id
+                        or command.replacement_status != ReplacementStatus.PENDING
+                    ):
+                        raise ConflictError(
+                            "Replacement activation lifecycle is inconsistent",
+                            code="REPLACEMENT_LIFECYCLE_INVALID",
+                        )
+                    command.replacement_status = ReplacementStatus.ACTIVE
                 session.commit()
             except Exception:
                 session.rollback()
@@ -344,6 +363,18 @@ class SpawnService:
 
                 node.status = NodeStatus.COMPLETED
                 node.completed_at = utcnow()
+                if node.caused_by_command_id is not None:
+                    command = session.get(ControlCommand, node.caused_by_command_id)
+                    if (
+                        command is None
+                        or command.replacement_node_id != node.id
+                        or command.replacement_status != ReplacementStatus.ACTIVE
+                    ):
+                        raise ConflictError(
+                            "Replacement completion lifecycle is inconsistent",
+                            code="REPLACEMENT_LIFECYCLE_INVALID",
+                        )
+                    command.replacement_status = ReplacementStatus.COMPLETED
                 session.commit()
             except Exception:
                 session.rollback()
@@ -402,9 +433,17 @@ class SpawnService:
                             "Correction lineage is incomplete",
                             code="CORRECTION_LINEAGE_INVALID",
                         )
-                    if old.run_id != parent.run_id or old.parent_id != parent.id:
+                    run = session.get(Run, command.run_id)
+                    root_fallback = (
+                        run is not None
+                        and parent.id == run.root_node_id
+                        and command.replacement_parent_id == parent.id
+                    )
+                    if old.run_id != parent.run_id or (
+                        old.parent_id != parent.id and not root_fallback
+                    ):
                         raise ConflictError(
-                            "Replacement must share the corrected node's parent",
+                            "Replacement must use the command-authorized parent",
                             code="REPLACEMENT_PARENT_MISMATCH",
                         )
                     if old.own_scope_id != command.target_scope_id:

@@ -113,6 +113,7 @@ class GraphService:
                         "reason_code": command.reason_code,
                         "source_proposal_id": command.source_proposal_id,
                         "replacement_node_id": command.replacement_node_id,
+                        "replacement_status": command.replacement_status,
                         "replacement_manifest_digest": command.replacement_manifest_digest,
                         "replacement_manifest": command.replacement_manifest_json,
                         "created_at": iso_utc(command.created_at),

@@ -343,12 +343,18 @@ class ControlCommand(Base):
         CheckConstraint(
             "(command_type = 'CORRECT_SUBTREE' AND replacement_parent_id IS NOT NULL "
             "AND replacement_instruction_json IS NOT NULL "
-            "AND replacement_manifest_json IS NOT NULL AND replacement_manifest_digest IS NOT NULL) OR "
+            "AND replacement_manifest_json IS NOT NULL AND replacement_manifest_digest IS NOT NULL "
+            "AND replacement_status IS NOT NULL) OR "
             "(command_type != 'CORRECT_SUBTREE' AND replacement_parent_id IS NULL "
             "AND replacement_instruction_json IS NULL AND replacement_expected_tool IS NULL "
             "AND replacement_manifest_json IS NULL AND replacement_manifest_digest IS NULL "
-            "AND replacement_node_id IS NULL)",
+            "AND replacement_node_id IS NULL AND replacement_status IS NULL)",
             name="ck_command_replacement_shape",
+        ),
+        CheckConstraint(
+            "replacement_status IS NULL OR replacement_status IN "
+            "('PENDING','ACTIVATION_EXPIRED','ACTIVE','COMPLETED','FAILED')",
+            name="ck_command_replacement_status",
         ),
     )
 
@@ -377,6 +383,7 @@ class ControlCommand(Base):
     )
     replacement_manifest_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     replacement_node_id: Mapped[str | None] = mapped_column(String(36), nullable=True, unique=True)
+    replacement_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

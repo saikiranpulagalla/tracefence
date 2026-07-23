@@ -26,6 +26,7 @@ from tracefence.domain.enums import (
     CommandType,
     NodeStatus,
     ProofVerdict,
+    ReplacementStatus,
 )
 from tracefence.domain.errors import NotFoundError
 from tracefence.domain.schemas import ProofResponse, ReplacementManifest
@@ -581,19 +582,96 @@ class ProofService:
                 ProofVerdict.INCONSISTENT,
                 ProofVerdict.INCONSISTENT,
             )
-        manifest = manifest_model.model_dump(mode="json")
-        if command.replacement_node_id is None:
-            discrepancies.append("Correction has no registered replacement node")
+        try:
+            replacement_status = (
+                ReplacementStatus(command.replacement_status)
+                if command.replacement_status is not None
+                else None
+            )
+        except ValueError:
+            discrepancies.append("Correction replacement lifecycle state is invalid")
             return (
-                ProofVerdict.INCOMPLETE,
-                ProofVerdict.INCOMPLETE,
-                ProofVerdict.INCOMPLETE,
-                ProofVerdict.INCOMPLETE,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+        if replacement_status is None:
+            discrepancies.append("Correction replacement lifecycle state is missing")
+            return (
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+        manifest = manifest_model.model_dump(mode="json")
+        if replacement_status in {
+            ReplacementStatus.ACTIVATION_EXPIRED,
+            ReplacementStatus.FAILED,
+        }:
+            discrepancies.append(
+                "Replacement lifecycle terminated as "
+                f"{replacement_status.value}"
+            )
+            return (
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+        if command.replacement_node_id is None:
+            if replacement_status != ReplacementStatus.PENDING:
+                discrepancies.append(
+                    "Replacement lifecycle claims progress without a registered node"
+                )
+                verdict = ProofVerdict.INCONSISTENT
+            else:
+                discrepancies.append("Correction replacement is pending registration")
+                verdict = ProofVerdict.INCOMPLETE
+            return (
+                verdict,
+                verdict,
+                verdict,
+                verdict,
             )
 
         replacement = session.get(Node, command.replacement_node_id)
         if replacement is None:
             discrepancies.append("Correction references a missing replacement node")
+            return (
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+
+        if replacement_status == ReplacementStatus.PENDING:
+            if replacement.status == NodeStatus.PENDING:
+                discrepancies.append("Correction replacement is pending activation")
+                return (
+                    ProofVerdict.INCOMPLETE,
+                    ProofVerdict.INCOMPLETE,
+                    ProofVerdict.INCOMPLETE,
+                    ProofVerdict.INCOMPLETE,
+                )
+            discrepancies.append(
+                "Pending replacement lifecycle disagrees with the replacement node"
+            )
+            return (
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+                ProofVerdict.INCONSISTENT,
+            )
+        expected_node_statuses = (
+            {NodeStatus.ACTIVE, NodeStatus.WAITING}
+            if replacement_status == ReplacementStatus.ACTIVE
+            else {NodeStatus.COMPLETED}
+        )
+        if replacement.status not in expected_node_statuses:
+            discrepancies.append(
+                "Replacement lifecycle state disagrees with the replacement node status"
+            )
             return (
                 ProofVerdict.INCONSISTENT,
                 ProofVerdict.INCONSISTENT,

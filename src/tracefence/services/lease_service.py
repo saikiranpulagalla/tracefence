@@ -11,11 +11,12 @@ from tracefence.db.models import (
     ActionAttempt,
     ActionCommandMatch,
     CommandAcknowledgement,
+    ControlCommand,
     Node,
     Run,
     SpawnIntent,
 )
-from tracefence.domain.enums import AckType, NodeStatus, RunStatus
+from tracefence.domain.enums import AckType, NodeStatus, ReplacementStatus, RunStatus
 from tracefence.services.common import commands_for_scope_mismatches, evaluate_scopes, utcnow
 from tracefence.services.run_lifecycle import transition_run
 from tracefence.telemetry.instruments import telemetry, update_runtime_gauges
@@ -57,6 +58,19 @@ class LeaseService:
 
                 for node in [*nodes, *pending_nodes]:
                     node.status = NodeStatus.LEASE_EXPIRED
+                    if node.caused_by_command_id is not None:
+                        command = session.get(
+                            ControlCommand,
+                            node.caused_by_command_id,
+                        )
+                        if (
+                            command is not None
+                            and command.replacement_node_id == node.id
+                            and command.replacement_status == ReplacementStatus.PENDING
+                        ):
+                            command.replacement_status = (
+                                ReplacementStatus.ACTIVATION_EXPIRED
+                            )
                     run = session.get(Run, node.run_id)
                     if (
                         run is not None
