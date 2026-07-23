@@ -10,6 +10,8 @@ from sqlalchemy import func, select
 import tracefence.services.control_service as control_module
 import tracefence.services.run_service as run_module
 import tracefence.services.spawn_service as spawn_module
+from tests.helpers import activate, create_seeded_run
+from tests.unit.test_proof_contract import _corrected_recovery
 from tracefence.config import _bool_env, settings
 from tracefence.db.models import (
     ActionAttempt,
@@ -46,8 +48,6 @@ from tracefence.services.invariant_service import InvariantService
 from tracefence.services.proof_service import ProofService
 from tracefence.services.proposal_service import ProposalService
 from tracefence.services.spawn_service import SpawnService
-from tests.helpers import activate, create_seeded_run
-from tests.unit.test_proof_contract import _corrected_recovery
 
 
 async def test_recovery_proof_requires_stability_and_valid_result_digest(session_factory):
@@ -484,6 +484,12 @@ async def test_outbox_is_acknowledged_only_after_successful_telemetry_flush(
         assert "did not flush" in row.last_error
 
     monkeypatch.setattr(invariant_module, "force_flush_telemetry", lambda: True)
+    with session_factory() as session, session.begin():
+        row = session.get(
+            TelemetryOutbox,
+            "00000000-0000-0000-0000-000000000777",
+        )
+        row.next_attempt_at = utcnow()
     assert await service.deliver_pending() == 1
     with session_factory() as session:
         row = session.get(TelemetryOutbox, "00000000-0000-0000-0000-000000000777")

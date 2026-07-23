@@ -632,7 +632,13 @@ class TelemetryOutbox(Base):
             "(delivered_at IS NULL) OR (attempts >= 1 AND last_error IS NULL)",
             name="ck_outbox_delivery_shape",
         ),
+        CheckConstraint(
+            "(claim_owner IS NULL AND claim_expires_at IS NULL) OR "
+            "(claim_owner IS NOT NULL AND claim_expires_at IS NOT NULL)",
+            name="ck_outbox_claim_shape",
+        ),
         Index("ix_telemetry_outbox_pending", "delivered_at", "created_at"),
+        Index("ix_telemetry_outbox_claim", "delivered_at", "next_attempt_at", "claim_expires_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -644,6 +650,10 @@ class TelemetryOutbox(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    claim_owner: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class ServiceState(Base):

@@ -9,16 +9,23 @@ from opentelemetry.metrics import Observation
 
 
 @dataclass(frozen=True, slots=True)
-class _GaugeSnapshot:
+class GaugeSnapshot:
     active_nodes: int = 0
     live_affected_nodes: int = 0
     unacknowledged_live_nodes: int = 0
     orphan_nodes: int = 0
     telemetry_outbox_pending: int = 0
+    stale_violation_latched: int = 0
+    telemetry_delivery_last_success_unixtime: int = 0
 
 
 _gauge_lock = Lock()
-_gauge_snapshot = _GaugeSnapshot()
+_gauge_snapshot = GaugeSnapshot()
+
+
+def gauge_snapshot() -> GaugeSnapshot:
+    with _gauge_lock:
+        return _gauge_snapshot
 
 
 def update_runtime_gauges(
@@ -30,24 +37,65 @@ def update_runtime_gauges(
 ) -> None:
     global _gauge_snapshot
     with _gauge_lock:
-        _gauge_snapshot = _GaugeSnapshot(
+        _gauge_snapshot = GaugeSnapshot(
             active_nodes=active_nodes,
             live_affected_nodes=live_affected_nodes,
             unacknowledged_live_nodes=unacknowledged_live_nodes,
             orphan_nodes=orphan_nodes,
             telemetry_outbox_pending=_gauge_snapshot.telemetry_outbox_pending,
+            stale_violation_latched=_gauge_snapshot.stale_violation_latched,
+            telemetry_delivery_last_success_unixtime=(
+                _gauge_snapshot.telemetry_delivery_last_success_unixtime
+            ),
         )
 
 
 def update_outbox_gauge(pending: int) -> None:
     global _gauge_snapshot
     with _gauge_lock:
-        _gauge_snapshot = _GaugeSnapshot(
+        _gauge_snapshot = GaugeSnapshot(
             active_nodes=_gauge_snapshot.active_nodes,
             live_affected_nodes=_gauge_snapshot.live_affected_nodes,
             unacknowledged_live_nodes=_gauge_snapshot.unacknowledged_live_nodes,
             orphan_nodes=_gauge_snapshot.orphan_nodes,
             telemetry_outbox_pending=max(0, pending),
+            stale_violation_latched=_gauge_snapshot.stale_violation_latched,
+            telemetry_delivery_last_success_unixtime=(
+                _gauge_snapshot.telemetry_delivery_last_success_unixtime
+            ),
+        )
+
+
+def update_stale_violation_gauge(count: int) -> None:
+    global _gauge_snapshot
+    with _gauge_lock:
+        _gauge_snapshot = GaugeSnapshot(
+            active_nodes=_gauge_snapshot.active_nodes,
+            live_affected_nodes=_gauge_snapshot.live_affected_nodes,
+            unacknowledged_live_nodes=_gauge_snapshot.unacknowledged_live_nodes,
+            orphan_nodes=_gauge_snapshot.orphan_nodes,
+            telemetry_outbox_pending=_gauge_snapshot.telemetry_outbox_pending,
+            stale_violation_latched=max(
+                _gauge_snapshot.stale_violation_latched,
+                int(count > 0),
+            ),
+            telemetry_delivery_last_success_unixtime=(
+                _gauge_snapshot.telemetry_delivery_last_success_unixtime
+            ),
+        )
+
+
+def update_telemetry_delivery_success(timestamp: int) -> None:
+    global _gauge_snapshot
+    with _gauge_lock:
+        _gauge_snapshot = GaugeSnapshot(
+            active_nodes=_gauge_snapshot.active_nodes,
+            live_affected_nodes=_gauge_snapshot.live_affected_nodes,
+            unacknowledged_live_nodes=_gauge_snapshot.unacknowledged_live_nodes,
+            orphan_nodes=_gauge_snapshot.orphan_nodes,
+            telemetry_outbox_pending=_gauge_snapshot.telemetry_outbox_pending,
+            stale_violation_latched=_gauge_snapshot.stale_violation_latched,
+            telemetry_delivery_last_success_unixtime=max(0, timestamp),
         )
 
 
@@ -104,6 +152,16 @@ def build_telemetry() -> Telemetry:
         "tracefence_telemetry_outbox_pending",
         callbacks=[_observe("telemetry_outbox_pending")],
         description="Durable safety telemetry events awaiting confirmed export",
+    )
+    meter.create_observable_gauge(
+        "tracefence_stale_violation_latched",
+        callbacks=[_observe("stale_violation_latched")],
+        description="Latched process gauge backed by persistent stale-commit violations",
+    )
+    meter.create_observable_gauge(
+        "tracefence_telemetry_delivery_last_success_unixtime",
+        callbacks=[_observe("telemetry_delivery_last_success_unixtime")],
+        description="Last confirmed outbox delivery time for external dead-man monitoring",
     )
     return Telemetry(
         tracer=trace.get_tracer("tracefence"),

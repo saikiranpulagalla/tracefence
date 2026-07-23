@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
+from dataclasses import dataclass
+from datetime import timedelta
 from uuid import uuid4
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -16,7 +19,11 @@ from tracefence.db.models import (
 )
 from tracefence.domain.enums import ActionDecision, CommandType
 from tracefence.services.common import iso_utc, utcnow
-from tracefence.telemetry.instruments import telemetry
+from tracefence.telemetry.instruments import (
+    telemetry,
+    update_stale_violation_gauge,
+    update_telemetry_delivery_success,
+)
 from tracefence.telemetry.setup import force_flush_telemetry, telemetry_health
 
 logger = logging.getLogger(__name__)
@@ -25,11 +32,28 @@ STALE_COMMIT_VIOLATION = "STALE_ACTION_COMMITTED"
 STALE_COMMIT_EVENT = "tracefence.stale_action_committed"
 
 
+@dataclass(frozen=True, slots=True)
+class _ViolationCandidate:
+    run_id: str
+    command_id: str
+    action_id: str
+    node_id: str
+    tool_name: str
+    attempted_at: str
+    committed_at: str
+
+
 class InvariantService:
     """Persist safety violations and deliver their telemetry through an outbox."""
 
-    def __init__(self, session_factory: sessionmaker) -> None:
+    def __init__(
+        self,
+        session_factory: sessionmaker,
+        *,
+        owner_id: str | None = None,
+    ) -> None:
         self.session_factory = session_factory
+        self.owner_id = owner_id or f"{os.getpid()}:{uuid4()}"
 
     @staticmethod
     def _node_affected(command: ControlCommand, node: Node) -> bool:
@@ -43,10 +67,12 @@ class InvariantService:
             for item in (node.scope_snapshot_json or [])
         )
 
-    async def scan(self, run_id: str | None = None) -> int:
-        created = 0
+    def _discover_candidates(
+        self,
+        run_id: str | None,
+    ) -> list[_ViolationCandidate]:
+        candidates: list[_ViolationCandidate] = []
         with self.session_factory() as session:
-            session.execute(text("BEGIN IMMEDIATE"))
             commands_query = select(ControlCommand).order_by(ControlCommand.created_at)
             if run_id is not None:
                 commands_query = commands_query.where(ControlCommand.run_id == run_id)
@@ -71,58 +97,116 @@ class InvariantService:
                     )
                 ).scalars().all()
                 for action in actions:
-                    existing = session.execute(
-                        select(InvariantViolation.id).where(
-                            InvariantViolation.run_id == command.run_id,
-                            InvariantViolation.command_id == command.id,
-                            InvariantViolation.action_id == action.id,
-                            InvariantViolation.violation_type == STALE_COMMIT_VIOLATION,
-                        )
-                    ).scalar_one_or_none()
-                    if existing is not None:
+                    attempted_at = iso_utc(action.attempted_at)
+                    committed_at = iso_utc(action.committed_at)
+                    if attempted_at is None or committed_at is None:
                         continue
-                    violation_id = str(uuid4())
-                    event_key = f"stale-commit:{command.id}:{action.id}"
-                    details = {
-                        "violation_id": violation_id,
-                        "run_id": command.run_id,
-                        "command_id": command.id,
-                        "action_id": action.id,
-                        "node_id": action.node_id,
-                        "tool_name": action.tool_name,
-                        "attempted_at": iso_utc(action.attempted_at),
-                        "committed_at": iso_utc(action.committed_at),
-                    }
-                    session.add(
-                        InvariantViolation(
-                            id=violation_id,
+                    candidates.append(
+                        _ViolationCandidate(
                             run_id=command.run_id,
                             command_id=command.id,
                             action_id=action.id,
+                            node_id=action.node_id,
+                            tool_name=action.tool_name,
+                            attempted_at=attempted_at,
+                            committed_at=committed_at,
+                        )
+                    )
+        return candidates
+
+    async def scan(self, run_id: str | None = None) -> int:
+        created = 0
+        for candidate in self._discover_candidates(run_id):
+            violation_id = str(uuid4())
+            details = {
+                "violation_id": violation_id,
+                "run_id": candidate.run_id,
+                "command_id": candidate.command_id,
+                "action_id": candidate.action_id,
+                "node_id": candidate.node_id,
+                "tool_name": candidate.tool_name,
+                "attempted_at": candidate.attempted_at,
+                "committed_at": candidate.committed_at,
+            }
+            with self.session_factory() as session:
+                session.execute(text("BEGIN IMMEDIATE"))
+                existing = session.execute(
+                    select(InvariantViolation.id).where(
+                        InvariantViolation.run_id == candidate.run_id,
+                        InvariantViolation.command_id == candidate.command_id,
+                        InvariantViolation.action_id == candidate.action_id,
+                        InvariantViolation.violation_type == STALE_COMMIT_VIOLATION,
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    session.rollback()
+                    continue
+                session.add(
+                        InvariantViolation(
+                            id=violation_id,
+                            run_id=candidate.run_id,
+                            command_id=candidate.command_id,
+                            action_id=candidate.action_id,
                             violation_type=STALE_COMMIT_VIOLATION,
                             details_json=details,
                             detected_at=utcnow(),
                         )
                     )
-                    session.add(
+                session.add(
                         TelemetryOutbox(
                             id=str(uuid4()),
-                            event_key=event_key,
-                            run_id=command.run_id,
+                            event_key=(
+                                f"stale-commit:{candidate.command_id}:"
+                                f"{candidate.action_id}"
+                            ),
+                            run_id=candidate.run_id,
                             event_type=STALE_COMMIT_EVENT,
                             payload_json=details,
                             created_at=utcnow(),
                         )
                     )
+                try:
+                    session.commit()
                     created += 1
-            try:
-                session.commit()
-            except IntegrityError:
-                # A uniqueness race or corrupt insert rolls back the whole scan.
-                # Report only durable rows; the next scanner iteration retries.
-                session.rollback()
-                created = 0
+                except IntegrityError:
+                    session.rollback()
+        with self.session_factory() as session:
+            persistent_count = int(
+                session.scalar(select(func.count(InvariantViolation.id))) or 0
+            )
+        update_stale_violation_gauge(persistent_count)
         return created
+
+    def _claim_pending(self, limit: int) -> list[str]:
+        now = utcnow()
+        claim_expires = now + timedelta(seconds=30)
+        with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            rows = session.execute(
+                select(TelemetryOutbox)
+                .where(
+                    TelemetryOutbox.delivered_at.is_(None),
+                    or_(
+                        TelemetryOutbox.next_attempt_at.is_(None),
+                        TelemetryOutbox.next_attempt_at <= now,
+                    ),
+                    or_(
+                        TelemetryOutbox.claim_owner.is_(None),
+                        TelemetryOutbox.claim_expires_at <= now,
+                    ),
+                )
+                .order_by(TelemetryOutbox.created_at)
+                .limit(limit)
+            ).scalars().all()
+            claimed_ids: list[str] = []
+            for row in rows:
+                row.claim_owner = self.owner_id
+                row.claim_expires_at = claim_expires
+                row.last_attempt_at = now
+                row.attempts += 1
+                claimed_ids.append(row.id)
+            session.commit()
+            return claimed_ids
 
     async def deliver_pending(self, limit: int = 100) -> int:
         """Export pending invariant events with at-least-once delivery semantics.
@@ -138,21 +222,17 @@ class InvariantService:
         if health["status"] != "READY":
             return 0
 
-        with self.session_factory() as session:
-            pending_ids = list(
-                session.execute(
-                    select(TelemetryOutbox.id)
-                    .where(TelemetryOutbox.delivered_at.is_(None))
-                    .order_by(TelemetryOutbox.created_at)
-                    .limit(limit)
-                ).scalars()
-            )
+        pending_ids = self._claim_pending(limit)
 
         delivered = 0
         for row_id in pending_ids:
             with self.session_factory() as session:
                 row = session.get(TelemetryOutbox, row_id)
-                if row is None or row.delivered_at is not None:
+                if (
+                    row is None
+                    or row.delivered_at is not None
+                    or row.claim_owner != self.owner_id
+                ):
                     continue
                 event_type = row.event_type
                 event_key = row.event_key
@@ -184,21 +264,39 @@ class InvariantService:
                 with self.session_factory() as session:
                     session.execute(text("BEGIN IMMEDIATE"))
                     current = session.get(TelemetryOutbox, row_id)
-                    if current is None or current.delivered_at is not None:
+                    if (
+                        current is None
+                        or current.delivered_at is not None
+                        or current.claim_owner != self.owner_id
+                    ):
                         session.rollback()
                         continue
-                    current.attempts += 1
                     current.delivered_at = utcnow()
                     current.last_error = None
+                    current.next_attempt_at = None
+                    current.claim_owner = None
+                    current.claim_expires_at = None
                     session.commit()
                     delivered += 1
+                    update_telemetry_delivery_success(
+                        int(current.delivered_at.timestamp())
+                    )
             except Exception as exc:  # pragma: no cover - branch tested through state
                 with self.session_factory() as session:
                     session.execute(text("BEGIN IMMEDIATE"))
                     failed = session.get(TelemetryOutbox, row_id)
-                    if failed is not None and failed.delivered_at is None:
-                        failed.attempts += 1
+                    if (
+                        failed is not None
+                        and failed.delivered_at is None
+                        and failed.claim_owner == self.owner_id
+                    ):
                         failed.last_error = f"{type(exc).__name__}: {exc}"[:1000]
+                        backoff_seconds = min(300, 2 ** min(failed.attempts, 8))
+                        failed.next_attempt_at = utcnow() + timedelta(
+                            seconds=backoff_seconds
+                        )
+                        failed.claim_owner = None
+                        failed.claim_expires_at = None
                         session.commit()
                     else:
                         session.rollback()

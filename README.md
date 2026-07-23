@@ -86,7 +86,7 @@ Detailed design: [`ARCHITECTURE.md`](ARCHITECTURE.md). Security model:
 - A supervised invariant auditor persists stale-commit violations and an at-least-once
   telemetry outbox independently of proof requests.
 - Request-body size and process-local rate limits are enforced before route execution.
-- Database schema version **16** validates required tables, columns, indexes, foreign keys and
+- Database schema version **17** validates required tables, columns, indexes, foreign keys and
   check constraints and fails closed on incompatible databases.
 - Missing, ambiguous or contradictory SigNoz evidence cannot become `VERIFIED`.
 
