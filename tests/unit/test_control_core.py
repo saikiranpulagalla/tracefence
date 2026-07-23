@@ -192,7 +192,7 @@ async def test_correction_replacement_and_recovery_are_proven(session_factory):
     assert proof.recovery_outcome_verdict == ProofVerdict.VERIFIED
     assert proof.runtime_verdict == ProofVerdict.VERIFIED
     assert proof.telemetry_verdict == ProofVerdict.UNAVAILABLE
-    assert proof.overall_verdict == ProofVerdict.PARTIAL
+    assert proof.overall_verdict == ProofVerdict.UNAVAILABLE
     assert proof.affected_registered_nodes == 2
     assert proof.classifications["ACKNOWLEDGED"] == 1
     assert proof.classifications["BLOCKED_AT_GATEWAY"] == 1

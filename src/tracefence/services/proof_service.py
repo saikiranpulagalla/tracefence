@@ -40,6 +40,34 @@ from tracefence.telemetry.setup import force_flush_telemetry, telemetry_export_w
 
 
 _MAX_PROOF_STABILITY_ATTEMPTS = 3
+_VERDICT_SEVERITY = (
+    ProofVerdict.INCONSISTENT,
+    ProofVerdict.STATE_CHANGED_DURING_PROOF,
+    ProofVerdict.INCOMPLETE,
+    ProofVerdict.PARTIAL,
+    ProofVerdict.UNAVAILABLE,
+    ProofVerdict.VERIFIED,
+)
+
+
+def combine_proof_verdicts(*verdicts: ProofVerdict) -> ProofVerdict:
+    """Combine proof dimensions using the one authoritative severity lattice.
+
+    Contradictory evidence is INCONSISTENT. A proof that could not observe one
+    stable authoritative revision is STATE_CHANGED_DURING_PROOF. INCOMPLETE
+    means required runtime evidence is missing; PARTIAL means available
+    evidence verified only part of the contract; UNAVAILABLE means a mandatory
+    evidence provider could not be consulted. VERIFIED is possible only when
+    every applicable mandatory dimension is VERIFIED. NOT_APPLICABLE
+    dimensions are ignored unless every dimension is NOT_APPLICABLE.
+    """
+
+    applicable = [
+        verdict for verdict in verdicts if verdict != ProofVerdict.NOT_APPLICABLE
+    ]
+    if not applicable:
+        return ProofVerdict.NOT_APPLICABLE
+    return min(applicable, key=_VERDICT_SEVERITY.index)
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,11 +421,12 @@ class ProofService:
 
         await self.invariants.scan(command.run_id)
 
-        control_verdict = (
-            ProofVerdict.VERIFIED
-            if stale_committed == 0 and not unclassified and unrelated_interrupted == 0
-            else ProofVerdict.INCOMPLETE
-        )
+        if stale_committed > 0:
+            control_verdict = ProofVerdict.INCONSISTENT
+        elif unclassified or unrelated_interrupted > 0:
+            control_verdict = ProofVerdict.INCOMPLETE
+        else:
+            control_verdict = ProofVerdict.VERIFIED
         runtime_verdict = self._combine_runtime_verdicts(
             control_verdict, replacement_verdict, recovery_verdict
         )
@@ -429,14 +458,10 @@ class ProofService:
                 evidence=telemetry_proof.evidence,
             )
 
-        if runtime_verdict != ProofVerdict.VERIFIED:
-            overall = runtime_verdict
-        elif telemetry_proof.verdict == ProofVerdict.VERIFIED:
-            overall = ProofVerdict.VERIFIED
-        elif telemetry_proof.verdict == ProofVerdict.INCONSISTENT:
-            overall = ProofVerdict.INCONSISTENT
-        else:
-            overall = ProofVerdict.PARTIAL
+        overall = combine_proof_verdicts(
+            runtime_verdict,
+            telemetry_proof.verdict,
+        )
 
         discrepancies.extend(telemetry_proof.discrepancies)
         if unclassified:
@@ -721,19 +746,7 @@ class ProofService:
         postcondition: ProofVerdict,
         stability: ProofVerdict,
     ) -> ProofVerdict:
-        verdicts = (action, postcondition, stability)
-        if all(verdict == ProofVerdict.NOT_APPLICABLE for verdict in verdicts):
-            return ProofVerdict.NOT_APPLICABLE
-        if ProofVerdict.INCONSISTENT in verdicts:
-            return ProofVerdict.INCONSISTENT
-        if any(verdict == ProofVerdict.INCOMPLETE for verdict in verdicts):
-            return ProofVerdict.INCOMPLETE
-        if all(
-            verdict in {ProofVerdict.VERIFIED, ProofVerdict.NOT_APPLICABLE}
-            for verdict in verdicts
-        ):
-            return ProofVerdict.VERIFIED
-        return ProofVerdict.INCOMPLETE
+        return combine_proof_verdicts(action, postcondition, stability)
 
     @staticmethod
     def _combine_runtime_verdicts(
@@ -741,14 +754,4 @@ class ProofService:
         replacement: ProofVerdict,
         recovery: ProofVerdict,
     ) -> ProofVerdict:
-        verdicts = (control, replacement, recovery)
-        if ProofVerdict.INCONSISTENT in verdicts:
-            return ProofVerdict.INCONSISTENT
-        if any(v == ProofVerdict.INCOMPLETE for v in verdicts):
-            return ProofVerdict.INCOMPLETE
-        if control == ProofVerdict.VERIFIED and all(
-            v in {ProofVerdict.VERIFIED, ProofVerdict.NOT_APPLICABLE}
-            for v in (replacement, recovery)
-        ):
-            return ProofVerdict.VERIFIED
-        return ProofVerdict.INCOMPLETE
+        return combine_proof_verdicts(control, replacement, recovery)
