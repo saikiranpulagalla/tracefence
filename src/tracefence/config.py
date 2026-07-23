@@ -70,6 +70,7 @@ class Settings:
     otlp_endpoint: str = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
     otel_metric_export_interval_ms: int = _int_env("TRACEFENCE_OTEL_METRIC_EXPORT_INTERVAL_MS", 2000)
     otel_export_timeout_ms: int = _int_env("TRACEFENCE_OTEL_EXPORT_TIMEOUT_MS", 5000)
+    build_commit: str = os.getenv("TRACEFENCE_BUILD_COMMIT", "")
     signoz_url: str = os.getenv("SIGNOZ_URL", "http://localhost:8080")
     signoz_mcp_url: str = os.getenv("SIGNOZ_MCP_URL", "http://localhost:8000/mcp")
     signoz_api_key: str = os.getenv("SIGNOZ_API_KEY", "")

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 from datetime import UTC, datetime
 from threading import Lock
+from uuid import uuid4
 
 from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
@@ -14,6 +16,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from tracefence.config import settings
 from tracefence.logging_config import JsonFormatter
+from tracefence.signoz.mcp_client import ExportWatermark
 
 _logger = logging.getLogger(__name__)
 _provider_lock = Lock()
@@ -26,8 +29,12 @@ _instrumentation_errors: list[str] = []
 _otel_log_handler: logging.Handler | None = None
 _configured_service_name: str | None = None
 _shutdown_registered = False
-_successful_flush_sequence = 0
+_export_sequence = 0
 _last_successful_flush_at: datetime | None = None
+_last_export_watermark: ExportWatermark | None = None
+_service_instance_id = os.getenv("TRACEFENCE_SERVICE_INSTANCE_ID") or str(uuid4())
+_process_instance_id = str(uuid4())
+_telemetry_schema_version = 1
 
 
 def configure_telemetry(service_name: str = "tracefence-control-plane") -> None:
@@ -49,6 +56,10 @@ def configure_telemetry(service_name: str = "tracefence-control-plane") -> None:
     resource = Resource.create(
         {
             "service.name": service_name,
+            "service.instance.id": _service_instance_id,
+            "process.instance.id": _process_instance_id,
+            "tracefence.build.commit": settings.build_commit or "UNSET",
+            "tracefence.telemetry.schema_version": _telemetry_schema_version,
             "deployment.environment": settings.environment,
         }
     )
@@ -152,7 +163,8 @@ def _configure_otlp_logs(resource: Resource) -> bool:
         handler.setFormatter(JsonFormatter())
         root = logging.getLogger()
         if not any(getattr(existing, "_tracefence_otel", False) for existing in root.handlers):
-            setattr(handler, "_tracefence_otel", True)
+            telemetry_marker = "_tracefence_otel"
+            setattr(handler, telemetry_marker, True)
             root.addHandler(handler)
             _otel_log_handler = handler
         return True
@@ -161,15 +173,43 @@ def _configure_otlp_logs(resource: Resource) -> bool:
         return False
 
 
-def force_flush_telemetry(timeout_millis: int | None = None) -> bool:
+def force_flush_telemetry(
+    timeout_millis: int | None = None,
+    *,
+    run_id: str | None = None,
+    command_id: str | None = None,
+    command_created_ms: int | None = None,
+) -> bool:
     """Flush spans, metrics and logs before evidence queries.
 
     A proof must not race the SDK's batch timers. Providers that are not owned by
     TraceFence are deliberately ignored rather than guessed at.
     """
 
-    if settings.otlp_endpoint and _telemetry_state != "READY":
+    global _export_sequence, _last_successful_flush_at
+    global _last_export_watermark
+
+    if not settings.otlp_endpoint or _telemetry_state != "READY":
         return False
+    proposed_sequence: int | None = None
+    proposed_at: datetime | None = None
+    if run_id is not None and command_id is not None:
+        proposed_at = datetime.now(UTC)
+        proposed_at_ms = int(proposed_at.timestamp() * 1000)
+        if command_created_ms is not None and proposed_at_ms <= command_created_ms:
+            return False
+        with _provider_lock:
+            _export_sequence += 1
+            proposed_sequence = _export_sequence
+        with trace.get_tracer("tracefence.telemetry").start_as_current_span(
+            "tracefence.telemetry.export_watermark"
+        ) as span:
+            span.set_attribute("tracefence.run.id", run_id)
+            span.set_attribute("tracefence.command.id", command_id)
+            span.set_attribute("tracefence.telemetry.exported_at_ms", proposed_at_ms)
+            span.set_attribute("tracefence.telemetry.export_sequence", proposed_sequence)
+            span.set_attribute("tracefence.telemetry.schema_version", _telemetry_schema_version)
+
     timeout = timeout_millis or settings.otel_export_timeout_ms
     with _provider_lock:
         providers = (_tracer_provider, _meter_provider, _logger_provider)
@@ -182,14 +222,30 @@ def force_flush_telemetry(timeout_millis: int | None = None) -> bool:
         except Exception:
             _logger.exception("Telemetry force-flush failed")
             results.append(False)
-    if settings.otlp_endpoint and not results:
+    if not results:
         return False
-    success = all(results) if results else True
-    if success and settings.otlp_endpoint and _telemetry_state == "READY":
-        global _successful_flush_sequence, _last_successful_flush_at
+    success = all(results)
+    if success:
         with _provider_lock:
-            _successful_flush_sequence += 1
             _last_successful_flush_at = datetime.now(UTC)
+            if (
+                run_id is not None
+                and command_id is not None
+                and proposed_at is not None
+                and proposed_sequence is not None
+            ):
+                _last_export_watermark = ExportWatermark(
+                    service_name=_configured_service_name
+                    or "tracefence-control-plane",
+                    service_instance_id=_service_instance_id,
+                    process_instance_id=_process_instance_id,
+                    build_commit=settings.build_commit or "UNSET",
+                    schema_version=_telemetry_schema_version,
+                    run_id=run_id,
+                    command_id=command_id,
+                    exported_at_ms=int(proposed_at.timestamp() * 1000),
+                    sequence=proposed_sequence,
+                )
     return success
 
 
@@ -199,10 +255,46 @@ def telemetry_export_watermark() -> str | None:
     with _provider_lock:
         if _last_successful_flush_at is None or _configured_service_name is None:
             return None
+        sequence = (
+            _last_export_watermark.sequence
+            if _last_export_watermark is not None
+            else 0
+        )
         return (
-            f"{_configured_service_name}:{_successful_flush_sequence}:"
+            f"{_configured_service_name}:{sequence}:"
             f"{_last_successful_flush_at.isoformat()}"
         )
+
+
+def telemetry_export_context(
+    run_id: str,
+    command_id: str,
+) -> ExportWatermark | None:
+    """Return only a successful export bound to this run and command."""
+
+    with _provider_lock:
+        watermark = _last_export_watermark
+        if (
+            watermark is None
+            or watermark.run_id != run_id
+            or watermark.command_id != command_id
+        ):
+            return None
+        return watermark
+
+
+def telemetry_process_identity() -> dict[str, str | int]:
+    """Return the immutable identity applied to all telemetry in this process."""
+
+    with _provider_lock:
+        return {
+            "service_name": _configured_service_name
+            or "tracefence-control-plane",
+            "service_instance_id": _service_instance_id,
+            "process_instance_id": _process_instance_id,
+            "build_commit": settings.build_commit or "UNSET",
+            "schema_version": _telemetry_schema_version,
+        }
 
 
 def telemetry_health() -> dict[str, object]:

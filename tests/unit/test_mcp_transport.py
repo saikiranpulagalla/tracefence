@@ -9,10 +9,10 @@ from types import ModuleType, SimpleNamespace
 import httpx
 
 import tracefence.signoz.mcp_client as mcp_module
+from tests.unit.test_mcp_reconciliation import context, evidence
 from tracefence.config import settings
 from tracefence.domain.enums import ProofVerdict
 from tracefence.signoz.mcp_client import SigNozMCPClient
-
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -47,21 +47,19 @@ class _FakeClientSession:
         )
 
     async def call_tool(self, name: str, arguments: dict):
+        payload = evidence()
         if name == "signoz_search_traces":
-            rows = []
             if arguments.get("operation") == "tracefence.control.command_issue":
-                rows = [
-                    {
-                        "name": "tracefence.control.command_issue",
-                        "traceId": "d" * 32,
-                        "command_id": "transport-command",
-                    }
-                ]
-            return _ToolResult({"results": rows})
+                return _ToolResult(payload["command_traces"])
+            if arguments.get("operation") == "tracefence.action.block":
+                return _ToolResult(payload["blocked_traces"])
+            return _ToolResult(payload["export_watermarks"])
         if name == "signoz_search_logs":
-            return _ToolResult({"results": []})
+            return _ToolResult(payload["blocked_logs"])
         metric_name = arguments["metricName"]
-        return _ToolResult({"metric": metric_name, "value": 0})
+        if metric_name == "tracefence_stale_action_attempts_total":
+            return _ToolResult(payload["attempts_metric"])
+        return _ToolResult(payload["committed_metric"])
 
 
 async def test_supported_streamable_http_client_receives_owned_bounded_httpx_client(
@@ -86,9 +84,15 @@ async def test_supported_streamable_http_client_receives_owned_bounded_httpx_cli
     fake_client_package.__path__ = []
     fake_streamable = ModuleType("mcp.client.streamable_http")
     fake_streamable.streamable_http_client = fake_streamable_http_client
+    fake_shared = ModuleType("mcp.shared")
+    fake_shared.__path__ = []
+    fake_exceptions = ModuleType("mcp.shared.exceptions")
+    fake_exceptions.McpError = type("McpError", (Exception,), {})
     monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
     monkeypatch.setitem(sys.modules, "mcp.client", fake_client_package)
     monkeypatch.setitem(sys.modules, "mcp.client.streamable_http", fake_streamable)
+    monkeypatch.setitem(sys.modules, "mcp.shared", fake_shared)
+    monkeypatch.setitem(sys.modules, "mcp.shared.exceptions", fake_exceptions)
     monkeypatch.setattr(
         mcp_module,
         "settings",
@@ -100,11 +104,7 @@ async def test_supported_streamable_http_client_receives_owned_bounded_httpx_cli
     )
 
     result = await SigNozMCPClient().verify_command(
-        command_id="transport-command",
-        expected_stale_attempts=0,
-        expected_stale_committed=0,
-        start_ms=1_000,
-        end_ms=2_000,
+        context=context(),
     )
 
     client = captured["client"]

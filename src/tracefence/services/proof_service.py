@@ -31,13 +31,21 @@ from tracefence.domain.enums import (
 from tracefence.domain.errors import NotFoundError
 from tracefence.domain.schemas import ProofResponse, ReplacementManifest
 from tracefence.security import payload_digest
-from tracefence.signoz.mcp_client import SigNozMCPClient
 from tracefence.services.action_gateway import STALE_REASONS
 from tracefence.services.common import descendants_including_self, evaluate_scopes, utcnow
 from tracefence.services.invariant_service import InvariantService
+from tracefence.signoz.mcp_client import (
+    RuntimeBlockedAction,
+    SigNozMCPClient,
+    TelemetryVerificationContext,
+)
 from tracefence.telemetry.instruments import telemetry
-from tracefence.telemetry.setup import force_flush_telemetry, telemetry_export_watermark
-
+from tracefence.telemetry.setup import (
+    force_flush_telemetry,
+    telemetry_export_context,
+    telemetry_export_watermark,
+    telemetry_process_identity,
+)
 
 _MAX_PROOF_STABILITY_ATTEMPTS = 3
 _VERDICT_SEVERITY = (
@@ -227,7 +235,7 @@ class ProofService:
             )
             if revision is None:
                 raise NotFoundError(f"Run {run_id} was not found")
-            return revision
+            return int(revision)
 
     @staticmethod
     def _cache_key(
@@ -382,6 +390,22 @@ class ProofService:
                 and action.committed_at is not None
             ]
             stale_committed = len(stale_committed_actions)
+            runtime_blocked_actions = tuple(
+                RuntimeBlockedAction(
+                    action_id=action.id,
+                    node_id=action.node_id,
+                    target_scope_id=action.matched_scope_id or "",
+                    snapshot_version=action.matched_snapshot_version or 0,
+                    live_version=action.matched_live_version or 0,
+                    live_status=action.matched_live_status or "",
+                    denial_reason=action.denial_reason or "",
+                )
+                for action in actions
+                if action.side_effecting
+                and action.decision == ActionDecision.DENY
+                and action.denial_reason in STALE_REASONS
+                and action.id in matched_action_ids
+            )
 
             all_nodes = session.execute(
                 select(Node).where(Node.run_id == command.run_id)
@@ -439,26 +463,40 @@ class ProofService:
         # Flush the batch exporters before querying SigNoz so proof generation
         # cannot race the SDK export timers. Failure is surfaced through MCP
         # reconciliation rather than silently upgrading evidence.
-        flush_ok = await asyncio.to_thread(force_flush_telemetry)
-        telemetry_proof = await self.mcp_client.verify_command(
+        flush_ok = await asyncio.to_thread(
+            force_flush_telemetry,
+            run_id=command.run_id,
             command_id=command.id,
-            expected_stale_attempts=stale_attempts,
-            expected_stale_committed=stale_committed,
-            start_ms=max(0, command_started_ms - 5_000),
-            end_ms=int(utcnow().replace(tzinfo=UTC).timestamp() * 1000) + 5_000,
+            command_created_ms=command_started_ms,
         )
-        if not flush_ok:
-            flush_message = "OpenTelemetry exporters did not flush successfully before MCP queries"
-            telemetry_proof = type(telemetry_proof)(
-                verdict=(
-                    ProofVerdict.PARTIAL
-                    if telemetry_proof.verdict == ProofVerdict.VERIFIED
-                    else telemetry_proof.verdict
+        export_watermark = (
+            telemetry_export_context(command.run_id, command.id)
+            if flush_ok
+            else None
+        )
+        telemetry_identity = telemetry_process_identity()
+        telemetry_proof = await self.mcp_client.verify_command(
+            context=TelemetryVerificationContext(
+                command_id=command.id,
+                run_id=command.run_id,
+                command_created_ms=command_started_ms,
+                start_ms=max(0, command_started_ms - 5_000),
+                end_ms=int(utcnow().replace(tzinfo=UTC).timestamp() * 1000)
+                + 5_000,
+                command_operation="tracefence.control.command_issue",
+                service_name=str(telemetry_identity["service_name"]),
+                service_instance_id=str(
+                    telemetry_identity["service_instance_id"]
                 ),
-                trace_ids=telemetry_proof.trace_ids,
-                discrepancies=[*telemetry_proof.discrepancies, flush_message],
-                evidence=telemetry_proof.evidence,
-            )
+                process_instance_id=str(
+                    telemetry_identity["process_instance_id"]
+                ),
+                build_commit=str(telemetry_identity["build_commit"]),
+                schema_version=int(telemetry_identity["schema_version"]),
+                blocked_actions=runtime_blocked_actions,
+                export_watermark=export_watermark,
+            ),
+        )
 
         overall = combine_proof_verdicts(
             runtime_verdict,

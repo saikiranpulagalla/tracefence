@@ -1,113 +1,309 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import replace
+
+import pytest
+
 from tracefence.domain.enums import ProofVerdict
-from tracefence.signoz.mcp_client import _reconcile_evidence
+from tracefence.signoz.mcp_client import (
+    ExportWatermark,
+    RuntimeBlockedAction,
+    TelemetryFailureKind,
+    TelemetryVerificationContext,
+    _normalize_tool_result,
+    _reconcile_evidence,
+)
+
+COMMAND_ID = "command-123"
+RUN_ID = "run-123"
+ACTION_ID = "action-123"
+COMMAND_TIME_MS = 1_000_000
+WINDOW_START_MS = 995_000
+WINDOW_END_MS = 1_010_000
+IDENTITY = {
+    "service_name": "tracefence-control-plane",
+    "service_instance_id": "service-instance-a",
+    "process_instance_id": "process-a",
+    "build_commit": "0123456789abcdef",
+    "schema_version": 1,
+}
 
 
-def evidence(command_id: str, *, blocked: int = 1, committed: int = 0):
-    trace_id = "a" * 32
+def context(*, with_exporter: bool = True) -> TelemetryVerificationContext:
+    watermark = (
+        ExportWatermark(
+            run_id=RUN_ID,
+            command_id=COMMAND_ID,
+            exported_at_ms=1_005_000,
+            sequence=7,
+            **IDENTITY,
+        )
+        if with_exporter
+        else None
+    )
+    return TelemetryVerificationContext(
+        command_id=COMMAND_ID,
+        run_id=RUN_ID,
+        command_created_ms=COMMAND_TIME_MS,
+        start_ms=WINDOW_START_MS,
+        end_ms=WINDOW_END_MS,
+        command_operation="tracefence.control.command_issue",
+        service_name=IDENTITY["service_name"],
+        service_instance_id=IDENTITY["service_instance_id"],
+        process_instance_id=IDENTITY["process_instance_id"],
+        build_commit=IDENTITY["build_commit"],
+        schema_version=IDENTITY["schema_version"],
+        blocked_actions=(
+            RuntimeBlockedAction(
+                action_id=ACTION_ID,
+                node_id="node-123",
+                target_scope_id="scope-123",
+                snapshot_version=1,
+                live_version=2,
+                live_status="CANCELLED",
+                denial_reason="SCOPE_CANCELLED",
+            ),
+        ),
+        export_watermark=watermark,
+    )
+
+
+def evidence() -> dict:
+    blocked = {
+        "command_id": COMMAND_ID,
+        "run_id": RUN_ID,
+        "action_id": ACTION_ID,
+        "node_id": "node-123",
+        "target_scope_id": "scope-123",
+        "snapshot_version": 1,
+        "live_version": 2,
+        "live_status": "CANCELLED",
+        "denial_reason": "SCOPE_CANCELLED",
+        "timestamp_ms": 1_003_000,
+        **IDENTITY,
+    }
     return {
         "command_traces": {
             "results": [
                 {
-                    "name": "tracefence.control.command_issue",
-                    "traceId": trace_id,
-                    "command_id": command_id,
+                    "trace_id": "a" * 32,
+                    "command_id": COMMAND_ID,
+                    "run_id": RUN_ID,
+                    "operation": "tracefence.control.command_issue",
+                    "timestamp_ms": 1_001_000,
+                    **IDENTITY,
                 }
             ]
         },
         "blocked_traces": {
             "results": [
                 {
-                    "name": "tracefence.action.block",
-                    "traceId": trace_id,
-                    "command_id": command_id,
+                    **blocked,
+                    "trace_id": "b" * 32,
+                    "operation": "tracefence.action.block",
                 }
-                for _ in range(blocked)
             ]
         },
         "blocked_logs": {
             "results": [
-                {"body": f"action_denied command_id={command_id}"}
-                for _ in range(blocked)
+                {
+                    **blocked,
+                    "event_name": "action_denied",
+                }
+            ]
+        },
+        "export_watermarks": {
+            "results": [
+                {
+                    "trace_id": "c" * 32,
+                    "command_id": COMMAND_ID,
+                    "run_id": RUN_ID,
+                    "operation": "tracefence.telemetry.export_watermark",
+                    "exported_at_ms": 1_005_000,
+                    "sequence": 7,
+                    **IDENTITY,
+                }
             ]
         },
         "attempts_metric": {
-            "metric": "tracefence_stale_action_attempts_total",
-            "value": blocked,
+            "results": [
+                {
+                    "metric_name": "tracefence_stale_action_attempts_total",
+                    "value": 1.0,
+                }
+            ]
         },
         "committed_metric": {
-            "metric": "tracefence_stale_actions_committed_total",
-            "value": committed,
+            "results": [
+                {
+                    "metric_name": "tracefence_stale_actions_committed_total",
+                    "value": 0.0,
+                }
+            ]
         },
-        "expected_stale_attempts": 1,
-        "expected_stale_committed": 0,
     }
 
 
-def test_structured_mcp_evidence_reconciles_to_verified():
-    result = _reconcile_evidence("command-123", evidence("command-123"))
+def reconcile(payload: dict | None = None, *, ctx=None):
+    return _reconcile_evidence(ctx or context(), payload or evidence())
+
+
+def test_complete_exact_command_evidence_verifies():
+    result = reconcile()
+
     assert result.verdict == ProofVerdict.VERIFIED
-    assert result.trace_ids == ["a" * 32]
+    assert result.failure_kind is None
+    assert result.trace_ids == ["a" * 32, "b" * 32, "c" * 32]
 
 
-def test_mcp_count_disagreement_is_inconsistent():
-    result = _reconcile_evidence("command-123", evidence("command-123", blocked=2))
+def test_cross_command_blocked_rows_are_inconsistent():
+    payload = evidence()
+    payload["blocked_traces"]["results"][0]["command_id"] = "another-command"
+
+    result = reconcile(payload)
+
     assert result.verdict == ProofVerdict.INCONSISTENT
-    assert any("Blocked trace count" in item for item in result.discrepancies)
+    assert result.failure_kind == TelemetryFailureKind.EVIDENCE_INCONSISTENT
 
 
-def test_nonzero_stale_committed_metric_is_inconsistent():
-    result = _reconcile_evidence("command-123", evidence("command-123", committed=1))
-    assert result.verdict == ProofVerdict.INCONSISTENT
-    assert any("Stale-committed metric delta" in item for item in result.discrepancies)
+def test_missing_action_id_is_schema_mismatch():
+    payload = evidence()
+    del payload["blocked_logs"]["results"][0]["action_id"]
 
+    result = reconcile(payload)
 
-def test_global_attempt_metric_may_include_concurrent_commands():
-    payload = evidence("command-123")
-    payload["attempts_metric"]["value"] = 3
-    result = _reconcile_evidence("command-123", payload)
-    assert result.verdict == ProofVerdict.VERIFIED
-
-
-def test_global_attempt_metric_cannot_undercount_command_evidence():
-    payload = evidence("command-123")
-    payload["attempts_metric"]["value"] = 0
-    result = _reconcile_evidence("command-123", payload)
-    assert result.verdict == ProofVerdict.INCONSISTENT
-    assert any("below runtime count" in item for item in result.discrepancies)
-
-
-def test_mcp_input_validation_notice_prevents_verified_proof():
-    payload = evidence("command-123")
-    payload["blocked_logs"]["notice"] = "Input validation notice: ignored unknown field"
-    result = _reconcile_evidence("command-123", payload)
     assert result.verdict == ProofVerdict.PARTIAL
-    assert any("validation notice" in item.lower() for item in result.discrepancies)
+    assert result.failure_kind == TelemetryFailureKind.RESPONSE_SCHEMA_MISMATCH
 
 
-def test_concrete_result_rows_take_precedence_over_unrelated_metadata_count():
-    payload = evidence("command-123")
-    payload["blocked_traces"]["metadata"] = {"count": 999}
-    result = _reconcile_evidence("command-123", payload)
-    assert result.verdict == ProofVerdict.VERIFIED
+def test_duplicate_action_and_trace_ids_are_rejected():
+    payload = evidence()
+    payload["blocked_traces"]["results"].append(
+        deepcopy(payload["blocked_traces"]["results"][0])
+    )
+
+    result = reconcile(payload)
+
+    assert result.verdict == ProofVerdict.INCONSISTENT
+    assert "duplicate" in " ".join(result.discrepancies).lower()
 
 
-class _TextItem:
-    def __init__(self, text: str):
-        self.text = text
+def test_trace_and_log_action_sets_must_match_exactly():
+    payload = evidence()
+    payload["blocked_logs"]["results"] = []
+
+    result = reconcile(payload)
+
+    assert result.verdict == ProofVerdict.INCONSISTENT
+    assert "action-id set" in " ".join(result.discrepancies).lower()
 
 
-class _StructuredWithNotice:
-    def __init__(self):
-        self.structuredContent = {"results": [{"name": "tracefence.action.block"}]}
-        self.content = [_TextItem("Input validation notice: unknown argument")]
-        self.isError = False
+@pytest.mark.parametrize("invalid_value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_metric_values_are_schema_mismatch(invalid_value):
+    payload = evidence()
+    payload["attempts_metric"]["results"][0]["value"] = invalid_value
+
+    result = reconcile(payload)
+
+    assert result.verdict == ProofVerdict.PARTIAL
+    assert result.failure_kind == TelemetryFailureKind.RESPONSE_SCHEMA_MISMATCH
 
 
-def test_normalization_preserves_notice_beside_structured_content():
-    from tracefence.signoz.mcp_client import _normalize_tool_result
+def test_historical_evidence_from_another_process_or_build_is_inconsistent():
+    payload = evidence()
+    payload["command_traces"]["results"][0]["process_instance_id"] = "old-process"
+    payload["blocked_logs"]["results"][0]["build_commit"] = "old-build"
 
-    normalized = _normalize_tool_result(_StructuredWithNotice())
-    assert normalized["structured"]["results"]
-    assert "Input validation notice" in str(normalized["content"])
+    result = reconcile(payload)
+
+    assert result.verdict == ProofVerdict.INCONSISTENT
+    assert result.failure_kind == TelemetryFailureKind.EVIDENCE_INCONSISTENT
+
+
+def test_exporter_disabled_cannot_verify():
+    result = reconcile(ctx=context(with_exporter=False))
+
+    assert result.verdict == ProofVerdict.UNAVAILABLE
+    assert result.failure_kind == TelemetryFailureKind.EXPORTER_UNAVAILABLE
+
+
+def test_export_watermark_predating_command_is_inconsistent():
+    ctx = context()
+    assert ctx.export_watermark is not None
+    ctx = replace(
+        ctx,
+        export_watermark=replace(
+            ctx.export_watermark,
+            exported_at_ms=COMMAND_TIME_MS - 1,
+        ),
+    )
+
+    result = reconcile(ctx=ctx)
+
+    assert result.verdict == ProofVerdict.INCONSISTENT
+    assert "predates" in " ".join(result.discrepancies).lower()
+
+
+def test_ambiguous_nested_result_containers_are_schema_mismatch():
+    payload = evidence()
+    payload["command_traces"]["data"] = deepcopy(
+        payload["command_traces"]["results"]
+    )
+
+    result = reconcile(payload)
+
+    assert result.verdict == ProofVerdict.PARTIAL
+    assert result.failure_kind == TelemetryFailureKind.RESPONSE_SCHEMA_MISMATCH
+
+
+def test_malformed_timestamp_is_schema_mismatch():
+    payload = evidence()
+    payload["blocked_logs"]["results"][0]["timestamp_ms"] = "yesterday"
+
+    result = reconcile(payload)
+
+    assert result.verdict == ProofVerdict.PARTIAL
+    assert result.failure_kind == TelemetryFailureKind.RESPONSE_SCHEMA_MISMATCH
+
+
+def test_out_of_window_rows_are_inconsistent():
+    payload = evidence()
+    payload["blocked_traces"]["results"][0]["timestamp_ms"] = WINDOW_END_MS + 1
+
+    result = reconcile(payload)
+
+    assert result.verdict == ProofVerdict.INCONSISTENT
+    assert "outside" in " ".join(result.discrepancies).lower()
+
+
+def test_response_shape_drift_is_schema_mismatch():
+    payload = evidence()
+    payload["command_traces"]["results"][0]["unexpected_new_field"] = "drift"
+
+    result = reconcile(payload)
+
+    assert result.verdict == ProofVerdict.PARTIAL
+    assert result.failure_kind == TelemetryFailureKind.RESPONSE_SCHEMA_MISMATCH
+
+
+class _ErrorToolResult:
+    structuredContent = {"results": []}
+    content = []
+    isError = True
+
+
+def test_is_error_true_is_rejected_unconditionally():
+    with pytest.raises(ValueError, match="MCP tool returned isError"):
+        _normalize_tool_result(_ErrorToolResult())
+
+
+class _StructuredWithWarning:
+    structuredContent = {"results": []}
+    content = [type("Text", (), {"text": "Input validation notice"})()]
+    isError = False
+
+
+def test_validation_warning_content_is_not_silently_discarded():
+    with pytest.raises(ValueError, match="additional content"):
+        _normalize_tool_result(_StructuredWithWarning())
