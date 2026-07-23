@@ -141,7 +141,7 @@ class ProofService:
                 owner = False
 
         if not owner:
-            response = await asyncio.wrap_future(inflight)
+            response = await asyncio.shield(asyncio.wrap_future(inflight))
             return response.model_copy(deep=True)
 
         try:
@@ -163,7 +163,8 @@ class ProofService:
                             response=stored,
                         )
                     self._inflight.pop(command_id, None)
-                    inflight.set_result(stored.model_copy(deep=True))
+                    if not inflight.done():
+                        inflight.set_result(stored.model_copy(deep=True))
                 return response
 
             if last_response is None:
@@ -181,7 +182,8 @@ class ProofService:
             stored = unstable.model_copy(deep=True)
             with self._state_lock:
                 self._inflight.pop(command_id, None)
-                inflight.set_result(stored.model_copy(deep=True))
+                if not inflight.done():
+                    inflight.set_result(stored.model_copy(deep=True))
             return unstable
         except BaseException as exc:
             with self._state_lock:

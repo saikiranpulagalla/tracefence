@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
+import pytest
 from sqlalchemy import select, text
 
 import tracefence.services.proof_service as proof_module
@@ -51,6 +52,24 @@ class _CountingVerifiedMCPClient:
         return TelemetryProof(
             verdict=ProofVerdict.VERIFIED,
             trace_ids=["b" * 32],
+            discrepancies=[],
+            evidence={},
+        )
+
+
+class _BlockingVerifiedMCPClient:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def verify_command(self, **_kwargs) -> TelemetryProof:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return TelemetryProof(
+            verdict=ProofVerdict.VERIFIED,
+            trace_ids=["c" * 32],
             discrepancies=[],
             evidence={},
         )
@@ -190,3 +209,36 @@ async def test_raw_proof_relevant_mutations_increment_run_revision(session_facto
         after_node = session.get(Run, run.run_id)
         assert after_node is not None
         assert after_node.proof_revision == before_revision + 2
+
+
+async def test_cancelling_follower_does_not_cancel_owner_or_shared_cache(
+    session_factory,
+    monkeypatch,
+):
+    _run, _old, command, _replacement, _action = await _corrected_recovery(
+        session_factory, key="proof-follower-cancellation"
+    )
+    monkeypatch.setattr(
+        proof_module,
+        "telemetry_export_watermark",
+        lambda: "stable-test-watermark",
+    )
+    mcp = _BlockingVerifiedMCPClient()
+    proofs = ProofService(session_factory, mcp_client=mcp)
+
+    owner = asyncio.create_task(proofs.build(command.command_id))
+    await asyncio.wait_for(mcp.started.wait(), timeout=1)
+    follower = asyncio.create_task(proofs.build(command.command_id))
+    await asyncio.sleep(0)
+
+    follower.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await follower
+
+    mcp.release.set()
+    owner_result = await asyncio.wait_for(owner, timeout=1)
+    cached_result = await proofs.build(command.command_id)
+
+    assert owner_result.overall_verdict == ProofVerdict.VERIFIED
+    assert cached_result == owner_result
+    assert mcp.calls == 1
