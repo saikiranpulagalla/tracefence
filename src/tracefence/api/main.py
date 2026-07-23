@@ -131,6 +131,7 @@ app.add_middleware(
     requests_per_minute=settings.rate_limit_per_minute,
     proof_requests_per_minute=settings.proof_rate_limit_per_minute,
     max_buckets=settings.rate_limit_max_buckets,
+    trusted_proxy_hosts=set(settings.trusted_proxy_hosts),
 )
 app.add_middleware(SecurityHeadersMiddleware)
 

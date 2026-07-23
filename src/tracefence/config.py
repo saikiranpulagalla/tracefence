@@ -34,6 +34,14 @@ def _int_env(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be an integer") from exc
 
 
+def _csv_env(name: str) -> tuple[str, ...]:
+    return tuple(
+        item.strip()
+        for item in os.getenv(name, "").split(",")
+        if item.strip()
+    )
+
+
 def _looks_like_placeholder(value: str) -> bool:
     normalized = value.strip().lower()
     markers = ("change-me", "changeme", "replace-", "generate-", "placeholder", "example")
@@ -79,11 +87,36 @@ class Settings:
     max_proposals_per_run: int = _int_env("TRACEFENCE_MAX_PROPOSALS_PER_RUN", 256)
     proof_cache_seconds: int = _int_env("TRACEFENCE_PROOF_CACHE_SECONDS", 2)
     max_request_bytes: int = _int_env("TRACEFENCE_MAX_REQUEST_BYTES", 262144)
-    rate_limit_per_minute: int = _int_env("TRACEFENCE_RATE_LIMIT_PER_MINUTE", 600)
+    rate_limit_per_minute: int = _int_env("TRACEFENCE_RATE_LIMIT_PER_MINUTE", 10_000)
     proof_rate_limit_per_minute: int = _int_env(
         "TRACEFENCE_PROOF_RATE_LIMIT_PER_MINUTE", 60
     )
     rate_limit_max_buckets: int = _int_env("TRACEFENCE_RATE_LIMIT_MAX_BUCKETS", 10_000)
+    heartbeat_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_HEARTBEAT_RATE_LIMIT_PER_MINUTE",
+        120,
+    )
+    action_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_ACTION_RATE_LIMIT_PER_MINUTE",
+        120,
+    )
+    spawn_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_SPAWN_RATE_LIMIT_PER_MINUTE",
+        60,
+    )
+    activation_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_ACTIVATION_RATE_LIMIT_PER_MINUTE",
+        30,
+    )
+    command_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_COMMAND_RATE_LIMIT_PER_MINUTE",
+        120,
+    )
+    operator_read_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_OPERATOR_READ_RATE_LIMIT_PER_MINUTE",
+        600,
+    )
+    trusted_proxy_hosts: tuple[str, ...] = _csv_env("TRACEFENCE_TRUSTED_PROXY_HOSTS")
     otlp_endpoint: str = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
     otel_metric_export_interval_ms: int = _int_env("TRACEFENCE_OTEL_METRIC_EXPORT_INTERVAL_MS", 2000)
     otel_export_timeout_ms: int = _int_env("TRACEFENCE_OTEL_EXPORT_TIMEOUT_MS", 5000)
@@ -202,6 +235,28 @@ class Settings:
                 "TRACEFENCE_PROOF_RATE_LIMIT_PER_MINUTE must be positive and no greater "
                 "than TRACEFENCE_RATE_LIMIT_PER_MINUTE"
             )
+        for name, value in (
+            (
+                "TRACEFENCE_HEARTBEAT_RATE_LIMIT_PER_MINUTE",
+                self.heartbeat_rate_limit_per_minute,
+            ),
+            ("TRACEFENCE_ACTION_RATE_LIMIT_PER_MINUTE", self.action_rate_limit_per_minute),
+            ("TRACEFENCE_SPAWN_RATE_LIMIT_PER_MINUTE", self.spawn_rate_limit_per_minute),
+            (
+                "TRACEFENCE_ACTIVATION_RATE_LIMIT_PER_MINUTE",
+                self.activation_rate_limit_per_minute,
+            ),
+            (
+                "TRACEFENCE_COMMAND_RATE_LIMIT_PER_MINUTE",
+                self.command_rate_limit_per_minute,
+            ),
+            (
+                "TRACEFENCE_OPERATOR_READ_RATE_LIMIT_PER_MINUTE",
+                self.operator_read_rate_limit_per_minute,
+            ),
+        ):
+            if not 1 <= value <= 100_000:
+                errors.append(f"{name} must be between 1 and 100000")
         if not 100 <= self.rate_limit_max_buckets <= 1_000_000:
             errors.append("TRACEFENCE_RATE_LIMIT_MAX_BUCKETS must be between 100 and 1000000")
         if self.otel_metric_export_interval_ms <= 0:

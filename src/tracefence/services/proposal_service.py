@@ -10,6 +10,7 @@ from tracefence.db.models import CorrectionProposal
 from tracefence.domain.enums import CommandType, ProposalStatus, ProposalType
 from tracefence.domain.errors import AuthorizationError, ConflictError, NotFoundError
 from tracefence.domain.schemas import ProposalCreate, ProposalReview
+from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import payload_digest
 from tracefence.services.common import (
     authenticate_node,
@@ -43,6 +44,10 @@ class ProposalService:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             reporter = await authenticate_node(session, reporter_node_id, reporter_token)
+            authenticated_rate_limiter.check(
+                "command",
+                f"{reporter.run_id}:{reporter.id}",
+            )
             allowed, reason, _ = await validate_node_runtime_state(session, reporter)
             if not allowed:
                 session.rollback()

@@ -36,6 +36,7 @@ from tracefence.domain.schemas import (
     SpawnCreate,
     SpawnCreated,
 )
+from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import generate_token, hash_token, payload_digest, token_matches
 from tracefence.services.common import (
     authenticate_node,
@@ -89,6 +90,10 @@ class SpawnService:
                             )
                             recovered = True
                     if not recovered:
+                        authenticated_rate_limiter.check(
+                            "spawn",
+                            f"{parent.run_id}:{parent.id}",
+                        )
                         allowed, reason, _ = await validate_node_runtime_state(
                             session, parent
                         )
@@ -200,6 +205,10 @@ class SpawnService:
                     raise ConflictError(
                         "Activation token already used", code="ACTIVATION_TOKEN_USED"
                     )
+                authenticated_rate_limiter.check(
+                    "activation",
+                    f"{node.run_id}:{node.id}",
+                )
                 if intent.expires_at <= now:
                     raise ConflictError(
                         "Activation token expired", code="ACTIVATION_TOKEN_EXPIRED"
@@ -270,6 +279,10 @@ class SpawnService:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
                 node = await authenticate_node(session, node_id, node_token)
+                authenticated_rate_limiter.check(
+                    "heartbeat",
+                    f"{node.run_id}:{node.id}",
+                )
                 run = session.get(Run, node.run_id)
                 if run is None:
                     raise NotFoundError(f"Run {node.run_id} was not found")
@@ -325,6 +338,10 @@ class SpawnService:
     ) -> CheckpointResponse:
         with self.session_factory() as session, session.begin():
             node = await authenticate_node(session, node_id, node_token)
+            authenticated_rate_limiter.check(
+                "heartbeat",
+                f"{node.run_id}:{node.id}",
+            )
             allowed, reason, evaluation = await validate_node_runtime_state(session, node)
             if allowed:
                 logger.info(
@@ -383,6 +400,10 @@ class SpawnService:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
                 node = await authenticate_node(session, node_id, node_token)
+                authenticated_rate_limiter.check(
+                    "heartbeat",
+                    f"{node.run_id}:{node.id}",
+                )
                 allowed, reason, _ = await validate_node_runtime_state(session, node)
                 if not allowed:
                     raise ConflictError(
@@ -530,6 +551,10 @@ class SpawnService:
                             )
                             recovered = True
                     if not recovered:
+                        authenticated_rate_limiter.check(
+                            "spawn",
+                            f"{parent.run_id}:{parent.id}",
+                        )
                         allowed, reason, _ = await validate_node_runtime_state(
                             session, parent
                         )

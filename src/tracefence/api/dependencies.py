@@ -11,7 +11,8 @@ from fastapi import Header
 from tracefence.config import settings
 from tracefence.db.engine import SessionLocal
 from tracefence.domain.errors import AuthenticationError, ServiceUnavailableError
-from tracefence.security import operator_key_matches
+from tracefence.rate_limits import authenticated_rate_limiter
+from tracefence.security import operator_fingerprint, operator_key_matches
 from tracefence.services.action_gateway import ActionGateway
 from tracefence.services.control_service import ControlService
 from tracefence.services.graph_service import GraphService
@@ -178,3 +179,18 @@ def require_operator(
 ) -> None:
     if not operator_key_matches(x_operator_key):
         raise AuthenticationError("Invalid or missing operator key")
+    authenticated_rate_limiter.check(
+        "operator_read",
+        operator_fingerprint(x_operator_key or ""),
+    )
+
+
+def require_proof_operator(
+    x_operator_key: str | None = Header(default=None, alias="X-Operator-Key"),
+) -> None:
+    if not operator_key_matches(x_operator_key):
+        raise AuthenticationError("Invalid or missing operator key")
+    authenticated_rate_limiter.check(
+        "proof",
+        operator_fingerprint(x_operator_key or ""),
+    )

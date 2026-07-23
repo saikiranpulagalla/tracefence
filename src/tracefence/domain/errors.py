@@ -38,3 +38,12 @@ class ConflictError(TraceFenceError):
 class ServiceUnavailableError(TraceFenceError):
     def __init__(self, message: str, *, code: str) -> None:
         super().__init__(message, code=code, status_code=503)
+
+
+class RateLimitError(TraceFenceError):
+    def __init__(self, category: str) -> None:
+        super().__init__(
+            "Authenticated request rate limit exceeded",
+            code=f"{category.upper()}_RATE_LIMIT_EXCEEDED",
+            status_code=429,
+        )

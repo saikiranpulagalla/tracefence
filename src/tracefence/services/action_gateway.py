@@ -22,6 +22,7 @@ from tracefence.db.models import (
 from tracefence.domain.enums import AckType, ActionDecision
 from tracefence.domain.errors import ConflictError
 from tracefence.domain.schemas import ActionExecute, ActionResult, ReplacementManifest
+from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import payload_digest, token_matches
 from tracefence.services.common import (
     commands_for_scope_mismatches,
@@ -78,6 +79,10 @@ class ActionGateway:
                         )
                     session.commit()
                     return self._result(existing, duplicate=True)
+                authenticated_rate_limiter.check(
+                    "action",
+                    f"{node.run_id}:{node.id}",
+                )
 
                 # Tool existence and argument-shape errors are evaluated only after
                 # node authentication and exact replay handling, so the gateway

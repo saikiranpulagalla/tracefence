@@ -26,6 +26,7 @@ from tracefence.domain.schemas import (
     ReplacementManifest,
     command_authorization_payload,
 )
+from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import payload_digest
 from tracefence.services.authority_service import AuthorityService
 from tracefence.services.common import (
@@ -71,9 +72,6 @@ class ControlService:
                     if principal.node_id is None or node_token is None:
                         raise AuthorizationError("Agent principal requires a node token")
                     issuer_node = await authenticate_node(session, principal.node_id, node_token)
-                    allowed, reason, _ = await validate_node_runtime_state(session, issuer_node)
-                    if not allowed:
-                        raise AuthorizationError(f"Issuer is not live: {reason}")
                     issuer_fingerprint = f"agent:{issuer_node.id}"
                 else:
                     issuer_fingerprint = principal.principal_id or "human:operator"
@@ -118,6 +116,22 @@ class ControlService:
                         )
                     session.commit()
                     return self._to_response(existing, duplicate=True)
+
+                authenticated_rate_limiter.check(
+                    "command",
+                    (
+                        f"{issuer_node.run_id}:{issuer_node.id}"
+                        if issuer_node is not None
+                        else issuer_fingerprint
+                    ),
+                )
+                if issuer_node is not None:
+                    allowed, reason, _ = await validate_node_runtime_state(
+                        session,
+                        issuer_node,
+                    )
+                    if not allowed:
+                        raise AuthorizationError(f"Issuer is not live: {reason}")
 
                 if run.status != RunStatus.RUNNING:
                     raise ConflictError(
