@@ -161,11 +161,14 @@ def _configure_otlp_logs(resource: Resource) -> bool:
             _logger_provider = provider
         handler = LoggingHandler(level=logging.INFO, logger_provider=provider)
         handler.setFormatter(JsonFormatter())
-        root = logging.getLogger()
-        if not any(getattr(existing, "_tracefence_otel", False) for existing in root.handlers):
+        tracefence_logger = logging.getLogger("tracefence")
+        if not any(
+            getattr(existing, "_tracefence_otel", False)
+            for existing in tracefence_logger.handlers
+        ):
             telemetry_marker = "_tracefence_otel"
             setattr(handler, telemetry_marker, True)
-            root.addHandler(handler)
+            tracefence_logger.addHandler(handler)
             _otel_log_handler = handler
         return True
     except Exception:
@@ -341,7 +344,7 @@ def shutdown_telemetry() -> None:
         handler = _otel_log_handler
         _otel_log_handler = None
     if handler is not None:
-        logging.getLogger().removeHandler(handler)
+        logging.getLogger("tracefence").removeHandler(handler)
         try:
             handler.close()
         except Exception:
@@ -380,21 +383,3 @@ def instrument_app(app: object) -> None:
             f"FastAPI instrumentation: {type(exc).__name__}: {exc}"
         )
         _logger.exception("Failed to instrument FastAPI")
-
-    instrument_httpx()
-
-
-def instrument_httpx() -> None:
-    try:
-        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-
-        HTTPXClientInstrumentor().instrument()
-    except ImportError:
-        message = "HTTPX OpenTelemetry instrumentation package is not installed"
-        _record_instrumentation_error(message)
-        _logger.info(message)
-    except Exception as exc:
-        _record_instrumentation_error(
-            f"HTTPX instrumentation: {type(exc).__name__}: {exc}"
-        )
-        _logger.exception("Failed to instrument HTTPX")

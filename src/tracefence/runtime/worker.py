@@ -14,10 +14,10 @@ from opentelemetry import propagate, trace
 from opentelemetry.trace import Link
 
 from tracefence.config import settings
+from tracefence.telemetry.instrumentation import instrument_httpx_client
 from tracefence.telemetry.setup import (
     configure_telemetry,
     force_flush_telemetry,
-    instrument_httpx,
     shutdown_telemetry,
 )
 
@@ -67,7 +67,6 @@ def _read_startup_payload() -> dict[str, Any]:
 
 async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
     configure_telemetry("tracefence-worker")
-    instrument_httpx()
 
     carrier = startup.get("trace_context")
     links: list[Link] = []
@@ -103,6 +102,7 @@ async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
             limits=limits,
             follow_redirects=False,
         ) as client:
+            instrument_httpx_client(client)
             try:
                 response = await client.post(
                     f"/v1/nodes/{args.node_id}/activate",

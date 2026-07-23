@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, ValidationError
 
 from tracefence.config import settings
 from tracefence.domain.enums import ProofVerdict
+from tracefence.telemetry.instrumentation import instrument_httpx_client
 
 
 class TelemetryFailureKind(StrEnum):
@@ -225,6 +226,7 @@ class SigNozMCPClient:
                 ),
                 follow_redirects=False,
             ) as http_client:
+                instrument_httpx_client(http_client)
                 async with streamable_http_client(
                     settings.signoz_mcp_url,
                     http_client=http_client,

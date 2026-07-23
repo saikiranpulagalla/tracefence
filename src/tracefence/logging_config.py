@@ -54,12 +54,16 @@ class JsonFormatter(logging.Formatter):
 
 
 def configure_logging(level: int = logging.INFO) -> None:
-    root = logging.getLogger()
-    root.setLevel(level)
-    if any(getattr(handler, "_tracefence_console", False) for handler in root.handlers):
+    logger = logging.getLogger("tracefence")
+    logger.setLevel(level)
+    logger.propagate = False
+    if any(
+        getattr(handler, "_tracefence_console", False)
+        for handler in logger.handlers
+    ):
         return
     handler = logging.StreamHandler()
     handler.setLevel(level)
     handler.setFormatter(JsonFormatter())
-    setattr(handler, "_tracefence_console", True)
-    root.addHandler(handler)
+    handler._tracefence_console = True
+    logger.addHandler(handler)

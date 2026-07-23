@@ -132,8 +132,6 @@ class Settings:
     frontend_origin: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
     def validate_security(self) -> None:
-        if self.environment.lower() == "test":
-            return
         errors: list[str] = []
         if not self.operator_key:
             errors.append("TRACEFENCE_OPERATOR_KEY is required")

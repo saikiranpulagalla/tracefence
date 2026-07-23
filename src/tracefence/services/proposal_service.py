@@ -143,13 +143,21 @@ class ProposalService:
             session.commit()
             return proposal
 
-    async def list_for_run(self, run_id: str) -> list[dict]:
+    async def list_for_run(
+        self,
+        run_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
         with self.session_factory() as session:
             await get_run(session, run_id)
             rows = session.execute(
                 select(CorrectionProposal)
                 .where(CorrectionProposal.run_id == run_id)
                 .order_by(CorrectionProposal.created_at)
+                .limit(limit)
+                .offset(offset)
             ).scalars().all()
             return [
                 {

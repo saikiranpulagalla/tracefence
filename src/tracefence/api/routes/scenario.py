@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, Response
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query, Response
 
 from tracefence.api.dependencies import (
     call_blocking_service,
@@ -21,8 +23,18 @@ async def seed(run_id: str) -> Response:
 
 
 @router.get("/{run_id}/services", dependencies=[Depends(require_operator)])
-async def services(run_id: str) -> list[dict]:
-    return await call_blocking_service(lambda: state_service.list_states(run_id))
+async def services(
+    run_id: str,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[dict]:
+    return await call_blocking_service(
+        lambda: state_service.list_states(
+            run_id,
+            limit=limit,
+            offset=offset,
+        )
+    )
 
 
 @router.post("/{run_id}/expire-leases", dependencies=[Depends(require_operator)])
