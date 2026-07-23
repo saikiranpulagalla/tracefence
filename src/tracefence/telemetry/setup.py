@@ -303,6 +303,11 @@ def telemetry_health() -> dict[str, object]:
             "status": _telemetry_state,
             "configured": bool(settings.otlp_endpoint),
             "errors": list(_telemetry_errors),
+            "last_successful_flush_at": (
+                _last_successful_flush_at.isoformat()
+                if _last_successful_flush_at is not None
+                else None
+            ),
         }
 
 

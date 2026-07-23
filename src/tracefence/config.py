@@ -78,6 +78,10 @@ class Settings:
         "TRACEFENCE_EXTERNAL_IO_DEADLINE_SECONDS",
         30,
     )
+    readiness_cache_seconds: int = _int_env(
+        "TRACEFENCE_READINESS_CACHE_SECONDS",
+        2,
+    )
     max_active_runs: int = _int_env("TRACEFENCE_MAX_ACTIVE_RUNS", 32)
     max_nodes_per_run: int = _int_env("TRACEFENCE_MAX_NODES_PER_RUN", 128)
     max_graph_depth: int = _int_env("TRACEFENCE_MAX_GRAPH_DEPTH", 12)
@@ -209,6 +213,10 @@ class Settings:
         ):
             if not 1 <= value <= 300:
                 errors.append(f"{name} must be between 1 and 300")
+        if not 1 <= self.readiness_cache_seconds <= 30:
+            errors.append(
+                "TRACEFENCE_READINESS_CACHE_SECONDS must be between 1 and 30"
+            )
         for name, value, maximum in (
             ("TRACEFENCE_MAX_ACTIVE_RUNS", self.max_active_runs, 10_000),
             ("TRACEFENCE_MAX_NODES_PER_RUN", self.max_nodes_per_run, 100_000),

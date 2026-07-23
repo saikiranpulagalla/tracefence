@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 
 from tracefence.api.dependencies import (
     call_blocking_service,
+    call_external_service,
     control_plane_runtime,
     external_io_runtime,
     invariant_service,
@@ -60,7 +61,7 @@ async def _invariant_auditor(app: FastAPI) -> None:
     while True:
         try:
             created = await call_blocking_service(invariant_service.scan)
-            delivered = await call_blocking_service(invariant_service.deliver_pending)
+            delivered = await call_external_service(invariant_service.deliver_pending)
             pending = await call_blocking_service(invariant_service.pending_count)
             app.state.invariant_outbox_pending = pending
             update_outbox_gauge(pending)

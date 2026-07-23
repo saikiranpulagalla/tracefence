@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -78,6 +80,47 @@ class MCPToolResultError(ValueError):
 
 class ResponseSchemaError(ValueError):
     pass
+
+
+_health_lock = threading.Lock()
+_last_success_at: str | None = None
+_last_status = "never_observed"
+_last_available: bool | None = None
+
+
+def mcp_health() -> dict[str, object]:
+    """Return the last observed MCP state without doing remote I/O."""
+
+    configured = bool(settings.signoz_mcp_url and settings.signoz_api_key)
+    if not configured:
+        return {
+            "configured": False,
+            "available": None,
+            "status": "unconfigured",
+            "last_success_at": None,
+        }
+    with _health_lock:
+        return {
+            "configured": True,
+            "available": _last_available,
+            "status": _last_status,
+            "last_success_at": _last_success_at,
+        }
+
+
+def _record_mcp_health(
+    *,
+    available: bool,
+    status: str,
+    successful_query: bool = False,
+) -> None:
+    global _last_available, _last_status, _last_success_at
+
+    with _health_lock:
+        _last_available = available
+        _last_status = status
+        if successful_query:
+            _last_success_at = datetime.now(UTC).isoformat()
 
 
 class _StrictEvidenceModel(BaseModel):
@@ -278,18 +321,31 @@ class SigNozMCPClient:
                             },
                         )
         except (httpx.TransportError, TimeoutError, OSError) as exc:
+            _record_mcp_health(
+                available=False,
+                status=TelemetryFailureKind.TRANSPORT_UNAVAILABLE.value.lower(),
+            )
             return _failure(
                 ProofVerdict.UNAVAILABLE,
                 TelemetryFailureKind.TRANSPORT_UNAVAILABLE,
                 f"SigNoz MCP transport unavailable: {type(exc).__name__}: {exc}",
             )
         except McpError as exc:
+            _record_mcp_health(
+                available=True,
+                status=TelemetryFailureKind.MCP_TOOL_ERROR.value.lower(),
+            )
             return _failure(
                 ProofVerdict.UNAVAILABLE,
                 TelemetryFailureKind.MCP_TOOL_ERROR,
                 f"SigNoz MCP tool error: {type(exc).__name__}: {exc}",
             )
 
+        _record_mcp_health(
+            available=True,
+            status="ready",
+            successful_query=True,
+        )
         try:
             evidence = {
                 "command_traces": _normalize_tool_result(command_result),
@@ -300,12 +356,20 @@ class SigNozMCPClient:
                 "committed_metric": _normalize_tool_result(committed_metric),
             }
         except MCPToolResultError as exc:
+            _record_mcp_health(
+                available=True,
+                status=TelemetryFailureKind.MCP_TOOL_ERROR.value.lower(),
+            )
             return _failure(
                 ProofVerdict.UNAVAILABLE,
                 TelemetryFailureKind.MCP_TOOL_ERROR,
                 str(exc),
             )
         except ResponseSchemaError as exc:
+            _record_mcp_health(
+                available=True,
+                status=TelemetryFailureKind.RESPONSE_SCHEMA_MISMATCH.value.lower(),
+            )
             return _failure(
                 ProofVerdict.PARTIAL,
                 TelemetryFailureKind.RESPONSE_SCHEMA_MISMATCH,
@@ -313,8 +377,18 @@ class SigNozMCPClient:
             )
 
         try:
-            return _reconcile_evidence(context, evidence)
+            proof = _reconcile_evidence(context, evidence)
+            if proof.failure_kind is not None:
+                _record_mcp_health(
+                    available=True,
+                    status=proof.failure_kind.value.lower(),
+                )
+            return proof
         except Exception as exc:
+            _record_mcp_health(
+                available=True,
+                status=TelemetryFailureKind.INTERNAL_PARSER_DEFECT.value.lower(),
+            )
             return _failure(
                 ProofVerdict.INCONSISTENT,
                 TelemetryFailureKind.INTERNAL_PARSER_DEFECT,

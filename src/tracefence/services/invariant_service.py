@@ -223,6 +223,13 @@ class InvariantService:
             return 0
 
         pending_ids = self._claim_pending(limit)
+        if not pending_ids:
+            if await self.pending_count():
+                return 0
+            if not force_flush_telemetry():
+                raise RuntimeError("Telemetry exporter dead-man flush failed")
+            update_telemetry_delivery_success(int(utcnow().timestamp()))
+            return 0
 
         delivered = 0
         for row_id in pending_ids:

@@ -6,12 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.helpers import create_seeded_run
 from tracefence.api.middleware import RateLimitMiddleware
 from tracefence.domain.errors import NotFoundError
 from tracefence.evidence import EvidenceIntegrityError, resolve_evidence_path, write_evidence_bundle
 from tracefence.services.graph_service import GraphService
 from tracefence.services.proposal_service import ProposalService
-from tests.helpers import create_seeded_run
 
 
 async def _asgi_request(
@@ -298,11 +298,18 @@ async def test_readiness_requires_empty_outbox_when_otlp_is_configured(monkeypat
 
     monkeypatch.setattr(health, "settings", replace(settings, otlp_endpoint="http://otel"))
     monkeypatch.setattr(health, "_database_ready", lambda: True)
+    monkeypatch.setattr(health, "_database_readable", lambda: True)
+    monkeypatch.setattr(health, "_database_writable", lambda: True)
     monkeypatch.setattr(health.control_plane_runtime, "probe", healthy_probe)
     monkeypatch.setattr(
         health,
         "telemetry_health",
-        lambda: {"status": "READY", "configured": True, "errors": []},
+        lambda: {
+            "status": "READY",
+            "configured": True,
+            "errors": [],
+            "last_successful_flush_at": datetime.now(UTC).isoformat(),
+        },
     )
     request = SimpleNamespace(
         app=SimpleNamespace(

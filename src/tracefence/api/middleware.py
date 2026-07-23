@@ -253,6 +253,7 @@ class SecurityHeadersMiddleware:
         async def secure_send(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
+                path = str(scope.get("path", ""))
                 headers.extend(
                     [
                         (
@@ -266,6 +267,14 @@ class SecurityHeadersMiddleware:
                         (b"cross-origin-opener-policy", b"same-origin"),
                     ]
                 )
+                if path == "/health" or path.startswith("/v1/"):
+                    if not any(
+                        key.lower() == b"cache-control"
+                        for key, _value in headers
+                    ):
+                        headers.append(
+                            (b"cache-control", b"no-store, private")
+                        )
                 message["headers"] = headers
             await send(message)
 

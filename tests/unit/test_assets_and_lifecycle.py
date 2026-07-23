@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
+from tests.helpers import activate, create_seeded_run
 from tracefence.db.models import Node, Run
 from tracefence.domain.enums import NodeStatus, RunStatus
 from tracefence.domain.errors import ConflictError
@@ -15,7 +16,6 @@ from tracefence.domain.schemas import SpawnCreate
 from tracefence.services.common import utcnow
 from tracefence.services.lease_service import LeaseService
 from tracefence.services.spawn_service import SpawnService
-from tests.helpers import activate, create_seeded_run
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -304,7 +304,7 @@ async def test_readiness_fails_closed_when_database_or_scanner_is_unhealthy(monk
     request.app.state.lease_scanner_error = "scanner failed"
     payload, ready = await health._readiness_payload(request)
     assert ready is False
-    assert payload["lease_scanner"]["error"] == "scanner failed"
+    assert payload["lease_scanner"]["error"] is True
 
 
 async def test_readiness_waits_for_first_successful_lease_scan(monkeypatch):
@@ -317,6 +317,8 @@ async def test_readiness_waits_for_first_successful_lease_scan(monkeypatch):
         return True
 
     monkeypatch.setattr(health.control_plane_runtime, "probe", healthy_probe)
+    monkeypatch.setattr(health, "_database_readable", lambda: True)
+    monkeypatch.setattr(health, "_database_writable", lambda: True)
     _readiness_payload = health._readiness_payload
 
     request = SimpleNamespace(
