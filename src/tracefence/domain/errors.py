@@ -33,3 +33,8 @@ class NotFoundError(TraceFenceError):
 class ConflictError(TraceFenceError):
     def __init__(self, message: str, *, code: str = "CONFLICT") -> None:
         super().__init__(message, code=code, status_code=409)
+
+
+class ServiceUnavailableError(TraceFenceError):
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message, code=code, status_code=503)

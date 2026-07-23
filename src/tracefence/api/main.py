@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from tracefence.api.dependencies import (
     call_blocking_service,
     control_plane_runtime,
+    external_io_runtime,
     invariant_service,
     lease_service,
 )
@@ -27,13 +28,13 @@ from tracefence.config import settings
 from tracefence.db.engine import init_db
 from tracefence.logging_config import configure_logging
 from tracefence.services.common import iso_utc, utcnow
+from tracefence.telemetry.instruments import update_outbox_gauge
 from tracefence.telemetry.setup import (
     configure_telemetry,
     force_flush_telemetry,
     instrument_app,
     register_telemetry_shutdown,
 )
-from tracefence.telemetry.instruments import update_outbox_gauge
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings.validate_security()
     init_db()
     control_plane_runtime.start()
+    external_io_runtime.start()
     app.state.lease_scanner_last_success = None
     app.state.lease_scanner_error = None
     app.state.invariant_auditor_last_success = None
@@ -101,6 +103,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         with suppress(asyncio.CancelledError):
             await auditor
         await control_plane_runtime.stop()
+        await external_io_runtime.stop()
         if not force_flush_telemetry():
             logger.error("Telemetry flush failed during application shutdown")
 

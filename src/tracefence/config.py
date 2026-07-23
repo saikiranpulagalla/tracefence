@@ -62,6 +62,14 @@ class Settings:
     lease_scan_interval_seconds: int = _int_env("TRACEFENCE_LEASE_SCAN_INTERVAL_SECONDS", 2)
     control_convergence_slo_seconds: int = _int_env("TRACEFENCE_CONTROL_CONVERGENCE_SLO_SECONDS", 10)
     control_plane_workers: int = _int_env("TRACEFENCE_CONTROL_PLANE_WORKERS", 8)
+    safety_queue_size: int = _int_env("TRACEFENCE_SAFETY_QUEUE_SIZE", 64)
+    safety_deadline_seconds: int = _int_env("TRACEFENCE_SAFETY_DEADLINE_SECONDS", 5)
+    external_io_workers: int = _int_env("TRACEFENCE_EXTERNAL_IO_WORKERS", 8)
+    external_io_queue_size: int = _int_env("TRACEFENCE_EXTERNAL_IO_QUEUE_SIZE", 16)
+    external_io_deadline_seconds: int = _int_env(
+        "TRACEFENCE_EXTERNAL_IO_DEADLINE_SECONDS",
+        30,
+    )
     max_active_runs: int = _int_env("TRACEFENCE_MAX_ACTIVE_RUNS", 32)
     max_nodes_per_run: int = _int_env("TRACEFENCE_MAX_NODES_PER_RUN", 128)
     max_graph_depth: int = _int_env("TRACEFENCE_MAX_GRAPH_DEPTH", 12)
@@ -151,6 +159,23 @@ class Settings:
             )
         if not 1 <= self.control_plane_workers <= 64:
             errors.append("TRACEFENCE_CONTROL_PLANE_WORKERS must be between 1 and 64")
+        for name, value in (
+            ("TRACEFENCE_SAFETY_QUEUE_SIZE", self.safety_queue_size),
+            ("TRACEFENCE_EXTERNAL_IO_QUEUE_SIZE", self.external_io_queue_size),
+        ):
+            if not 1 <= value <= 10_000:
+                errors.append(f"{name} must be between 1 and 10000")
+        if not 1 <= self.external_io_workers <= 64:
+            errors.append("TRACEFENCE_EXTERNAL_IO_WORKERS must be between 1 and 64")
+        for name, value in (
+            ("TRACEFENCE_SAFETY_DEADLINE_SECONDS", self.safety_deadline_seconds),
+            (
+                "TRACEFENCE_EXTERNAL_IO_DEADLINE_SECONDS",
+                self.external_io_deadline_seconds,
+            ),
+        ):
+            if not 1 <= value <= 300:
+                errors.append(f"{name} must be between 1 and 300")
         for name, value, maximum in (
             ("TRACEFENCE_MAX_ACTIVE_RUNS", self.max_active_runs, 10_000),
             ("TRACEFENCE_MAX_NODES_PER_RUN", self.max_nodes_per_run, 100_000),
