@@ -10,6 +10,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from tracefence.evidence import _atomic_private_write
+
 DASHBOARD_TITLE = "TraceFence Control Integrity"
 ALERT_CHANNEL_TOKEN = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
 REQUIRED_TOOLS = {
@@ -286,8 +288,12 @@ async def provision(
         return 1
 
     mcp_url = os.getenv("SIGNOZ_MCP_URL", "http://localhost:8000/mcp")
-    dashboard = json.loads(dashboard_path.read_text())
-    alerts = json.loads(alerts_path.read_text())
+    dashboard_text, alerts_text = await asyncio.gather(
+        asyncio.to_thread(dashboard_path.read_text),
+        asyncio.to_thread(alerts_path.read_text),
+    )
+    dashboard = json.loads(dashboard_text)
+    alerts = json.loads(alerts_text)
     _validate_dashboard(dashboard)
     _validate_alerts(alerts)
 
@@ -469,8 +475,10 @@ async def provision(
                         }
                     )
 
-    evidence_path.parent.mkdir(parents=True, exist_ok=True)
-    evidence_path.write_text(json.dumps(evidence, indent=2, default=str) + "\n")
+    _atomic_private_write(
+        evidence_path,
+        (json.dumps(evidence, indent=2, default=str) + "\n").encode("utf-8"),
+    )
     print(f"PASS Dashboard: {evidence['dashboard']['status']}")
     for alert in evidence["alerts"]:
         print(f"PASS Alert {alert['name']}: {alert['status']}")

@@ -344,10 +344,6 @@ def main() -> int:
     parser.add_argument("--mcp-url", default=os.getenv("SIGNOZ_MCP_URL", "http://localhost:8000/mcp"))
     parser.add_argument("--require-alerts", action="store_true")
     parser.add_argument("--proof-bundle", type=Path)
-    parser.add_argument(
-        "--evidence-signing-key",
-        default=os.getenv("TRACEFENCE_EVIDENCE_SIGNING_KEY", ""),
-    )
     args = parser.parse_args()
     return asyncio.run(
         verify(
@@ -355,7 +351,10 @@ def main() -> int:
             args.mcp_url,
             require_alerts=args.require_alerts,
             proof_bundle=args.proof_bundle,
-            evidence_signing_key=args.evidence_signing_key,
+            evidence_signing_key=os.getenv(
+                "TRACEFENCE_EVIDENCE_SIGNING_KEY",
+                "",
+            ),
         )
     )
 

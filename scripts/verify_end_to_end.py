@@ -199,12 +199,14 @@ def _load_bundle(
     *,
     expected_commit: str | None,
     max_age_seconds: int | None,
+    expected_live_api_url: str | None,
 ) -> dict[str, Any]:
     resolved, manifest = resolve_evidence_path(
         path,
         signing_key=signing_key,
         expected_commit=expected_commit,
         max_age_seconds=max_age_seconds,
+        expected_live_api_url=expected_live_api_url,
     )
     if manifest is not None:
         print(f"PASS evidence manifest integrity ({manifest['generated_at']})")
@@ -250,6 +252,7 @@ def verify(
         evidence_signing_key,
         expected_commit=expected_commit,
         max_age_seconds=max_age_seconds,
+        expected_live_api_url=api_url,
     )
     _verify_internal_consistency(bundle, require_telemetry)
     if api_url is not None:
@@ -268,12 +271,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle", type=Path, default=Path("evidence/latest.json"))
     parser.add_argument("--require-telemetry", action="store_true")
-    parser.add_argument("--api-url")
-    parser.add_argument("--operator-key", default=os.getenv("TRACEFENCE_OPERATOR_KEY", ""))
-    parser.add_argument(
-        "--evidence-signing-key",
-        default=os.getenv("TRACEFENCE_EVIDENCE_SIGNING_KEY", ""),
-    )
+    parser.add_argument("--api-url", required=True)
     parser.add_argument(
         "--expected-commit",
         default=os.getenv("TRACEFENCE_EXPECTED_EVIDENCE_COMMIT", "") or None,
@@ -285,12 +283,23 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
+        if not args.expected_commit:
+            raise VerificationError(
+                "TRACEFENCE_EXPECTED_EVIDENCE_COMMIT is required"
+            )
+        if args.max_age_seconds is None:
+            raise VerificationError(
+                "TRACEFENCE_EVIDENCE_MAX_AGE_SECONDS is required"
+            )
         verify(
             args.bundle,
             args.require_telemetry,
             api_url=args.api_url,
-            operator_key=args.operator_key,
-            evidence_signing_key=args.evidence_signing_key,
+            operator_key=os.getenv("TRACEFENCE_OPERATOR_KEY", ""),
+            evidence_signing_key=os.getenv(
+                "TRACEFENCE_EVIDENCE_SIGNING_KEY",
+                "",
+            ),
             expected_commit=args.expected_commit,
             max_age_seconds=args.max_age_seconds,
         )

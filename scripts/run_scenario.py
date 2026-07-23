@@ -12,6 +12,8 @@ import httpx
 
 from tracefence.evidence import validate_evidence_generation, write_evidence_bundle
 
+REPO_DIR = Path(__file__).resolve().parents[1]
+
 
 async def post(client: httpx.AsyncClient, path: str, **kwargs: Any) -> Any:
     response = await client.post(path, **kwargs)
@@ -32,11 +34,13 @@ async def run(
     evidence_signing_key: str | None = None,
 ) -> dict:
     if not operator_key:
-        raise RuntimeError("TRACEFENCE_OPERATOR_KEY or --operator-key is required")
-    repo_dir = Path(__file__).resolve().parents[1]
-    validate_evidence_generation(repo_dir, signing_key=evidence_signing_key)
+        raise RuntimeError("TRACEFENCE_OPERATOR_KEY is required")
+    validate_evidence_generation(
+        REPO_DIR,
+        signing_key=evidence_signing_key,
+    )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(output_dir.mkdir, parents=True, exist_ok=True)
     operator_headers = {"X-Operator-Key": operator_key}
     worker: asyncio.subprocess.Process | None = None
 
@@ -290,8 +294,9 @@ async def run(
     write_evidence_bundle(
         output_dir,
         bundle,
-        repo_dir=repo_dir,
+        repo_dir=REPO_DIR,
         signing_key=evidence_signing_key,
+        live_api_url=api_url,
     )
     return bundle
 
@@ -299,12 +304,7 @@ async def run(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--api-url", default="http://127.0.0.1:9000")
-    parser.add_argument("--operator-key", default=os.getenv("TRACEFENCE_OPERATOR_KEY", ""))
     parser.add_argument("--output-dir", type=Path, default=Path("evidence"))
-    parser.add_argument(
-        "--evidence-signing-key",
-        default=os.getenv("TRACEFENCE_EVIDENCE_SIGNING_KEY", ""),
-    )
     return parser.parse_args()
 
 
@@ -313,9 +313,9 @@ if __name__ == "__main__":
     result = asyncio.run(
         run(
             args.api_url,
-            args.operator_key,
+            os.getenv("TRACEFENCE_OPERATOR_KEY", ""),
             args.output_dir,
-            args.evidence_signing_key or None,
+            os.getenv("TRACEFENCE_EVIDENCE_SIGNING_KEY", "") or None,
         )
     )
     print(json.dumps({"run_id": result["run"]["run_id"], "proof": result["proof"]}, indent=2))

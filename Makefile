@@ -1,5 +1,7 @@
 PYTHON ?= python
 API_URL ?= http://127.0.0.1:9000
+EXPECTED_COMMIT ?= $(shell git rev-parse HEAD)
+EVIDENCE_MAX_AGE_SECONDS ?= 900
 
 .PHONY: install install-core install-dev install-full test audit api scenario verify reset signoz provision-signoz verify-signoz verify-all clean
 
@@ -37,7 +39,7 @@ scenario:
 	PYTHONPATH=src $(PYTHON) scripts/run_scenario.py --api-url $(API_URL)
 
 verify:
-	PYTHONPATH=src $(PYTHON) scripts/verify_end_to_end.py --bundle evidence/latest.json
+	PYTHONPATH=src TRACEFENCE_EXPECTED_EVIDENCE_COMMIT=$(EXPECTED_COMMIT) TRACEFENCE_EVIDENCE_MAX_AGE_SECONDS=$(EVIDENCE_MAX_AGE_SECONDS) $(PYTHON) scripts/verify_end_to_end.py --bundle evidence/latest.json --api-url $(API_URL)
 
 reset:
 	PYTHONPATH=src $(PYTHON) scripts/reset_state.py --yes
@@ -52,7 +54,7 @@ verify-signoz:
 	PYTHONPATH=src $(PYTHON) scripts/verify_signoz.py --require-alerts
 
 verify-all:
-	PYTHONPATH=src $(PYTHON) scripts/verify_end_to_end.py --bundle evidence/latest.json --require-telemetry
+	PYTHONPATH=src TRACEFENCE_EXPECTED_EVIDENCE_COMMIT=$(EXPECTED_COMMIT) TRACEFENCE_EVIDENCE_MAX_AGE_SECONDS=$(EVIDENCE_MAX_AGE_SECONDS) $(PYTHON) scripts/verify_end_to_end.py --bundle evidence/latest.json --api-url $(API_URL) --require-telemetry
 	PYTHONPATH=src $(PYTHON) scripts/verify_signoz.py --require-alerts --proof-bundle evidence/latest.json
 
 clean:
