@@ -127,7 +127,8 @@ concurrent recovery budget, credential response-loss and process-worker tests: a
 - `reports/sbom.cdx.json`: reproducible validated CycloneDX JSON.
 - `reports/secret-scan.json`: PASS, no high-confidence secret findings, and no secret values
   included in the report.
-- `casting.yaml.lock` is a source-content integrity lock, not a Foundry deployment receipt.
+- `casting.source.lock.json` is a source-content integrity lock. The ignored
+  `casting.yaml.lock` is reserved for the real Foundry deployment receipt.
 
 ## Database migration
 

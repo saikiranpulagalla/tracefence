@@ -39,7 +39,7 @@ def write_lock(source: Path, destination: Path) -> None:
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
-    write_lock(root / "casting.yaml", root / "casting.yaml.lock")
+    write_lock(root / "casting.yaml", root / "casting.source.lock.json")
 
 
 if __name__ == "__main__":

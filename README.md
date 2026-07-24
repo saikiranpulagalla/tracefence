@@ -224,10 +224,11 @@ Install the checked-in Foundry configuration:
 make signoz
 ```
 
-The checked-in `casting.yaml.lock` binds the reviewed `casting.yaml` source bytes only. A real
-Foundry installation must replace or augment that source lock with the deployment tool's own
-environment-specific lock/receipt. The checked-in lock is not evidence that Foundry or SigNoz
-was deployed.
+The checked-in `casting.source.lock.json` binds the reviewed `casting.yaml` source bytes only. A real
+Foundry run creates the environment-specific `casting.yaml.lock` deployment receipt; it is ignored
+by Git and can never be substituted by the source lock. `bootstrap_signoz.sh` snapshots any prior
+receipt, runs `gauge` and `cast`, then fails closed unless Foundry creates or replaces a structurally
+valid receipt.
 
 Configure a real service-account key and existing notification channel:
 

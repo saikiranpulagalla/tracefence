@@ -50,7 +50,8 @@
 
 ## Pending external release gate
 
-- Generate `casting.yaml.lock` on the target Foundry installation.
+- Generate the environment-specific `casting.yaml.lock` receipt on the target
+  Foundry installation; `casting.source.lock.json` is not deployment evidence.
 - Run the complete telemetry-enabled scenario against live SigNoz.
 - Provision and verify the dashboard and alerts through MCP.
 - Require telemetry and overall proof verdicts to reach `VERIFIED`.
@@ -71,5 +72,5 @@
 - Verified 194 tests, 77.57% total branch-aware coverage, Ruff, strict mypy, Bandit, pip-audit,
   wheel/sdist construction and clean wheel installation.
 - Generated four hash-locked dependency sets, a CycloneDX SBOM, a zero-advisory dependency report,
-  a redacted secret-scan report and a source-content `casting.yaml.lock`.
+  a redacted secret-scan report and a source-content `casting.source.lock.json`.
 - Live Foundry/SigNoz telemetry reconciliation remains blocked and is not reported as verified.

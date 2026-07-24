@@ -12,7 +12,7 @@ help:
 	@echo "test               Run the complete test suite"
 	@echo "audit              Compile, JS syntax, Ruff, mypy, Bandit, pip-audit and coverage"
 	@echo "locks              Regenerate four hash-locked dependency sets"
-	@echo "release-artifacts  Generate source lock, SBOM and redacted secret-scan report"
+	@echo "release-artifacts  Generate casting.source.lock.json, SBOM and redacted secret-scan report"
 	@echo "scenario           Run one distributed scenario against API_URL"
 	@echo "verify             Verify signed evidence against commit, freshness and live API"
 	@echo "verify-all         Verify evidence and require live telemetry reconciliation"

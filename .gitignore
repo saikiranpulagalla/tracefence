@@ -36,3 +36,5 @@ build/
 .secrets/
 secrets/
 credentials/
+casting.yaml.lock
+pours/

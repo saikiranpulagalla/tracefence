@@ -228,7 +228,8 @@ The 194-test suite covers, among other cases:
 On the target WSL/Docker environment:
 
 1. create and preserve a real environment-specific Foundry deployment lock/receipt (the
-   checked-in `casting.yaml.lock` is only a source-content lock);
+   checked-in `casting.source.lock.json` is only a source-content lock and
+   Foundry's ignored `casting.yaml.lock` is required as deployment evidence);
 2. install MCP and OpenTelemetry instrumentation extras;
 3. start SigNoz and confirm traces, metrics and logs arrive;
 4. configure a real notification channel;
