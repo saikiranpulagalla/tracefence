@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from threading import Lock
 from uuid import uuid4
 
+from fastapi import FastAPI
 from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
@@ -372,7 +373,7 @@ def _record_instrumentation_error(message: str) -> None:
         _telemetry_state = "FAILED"
 
 
-def instrument_app(app: object) -> None:
+def instrument_app(app: FastAPI) -> None:
     try:
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 

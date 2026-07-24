@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 
+import httpx
+
 _logger = logging.getLogger(__name__)
 
 
-def instrument_httpx_client(client: object) -> None:
+def instrument_httpx_client(client: httpx.Client | httpx.AsyncClient) -> None:
     """Instrument only an HTTPX client owned by TraceFence."""
 
     try:
