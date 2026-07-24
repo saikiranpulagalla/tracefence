@@ -612,11 +612,24 @@ def _adapt_query_builder_payload(
     *,
     defaults: dict[str, Any],
 ) -> dict[str, Any]:
+    if set(payload) != {"status", "data"}:
+        raise ResponseSchemaError(
+            "SigNoz response contains an ambiguous result container"
+        )
     if payload.get("status") != "success":
         raise ResponseSchemaError("SigNoz Query Builder response was not successful")
     outer = payload.get("data")
     if not isinstance(outer, dict):
         raise ResponseSchemaError("SigNoz Query Builder data envelope must be an object")
+    allowed_outer_keys = {"type", "data", "meta", "warning"}
+    if not set(outer).issubset(allowed_outer_keys):
+        raise ResponseSchemaError(
+            "SigNoz data envelope contains an ambiguous result container"
+        )
+    if not isinstance(outer.get("type"), str):
+        raise ResponseSchemaError("SigNoz Query Builder response lacks a result type")
+    if "meta" in outer and not isinstance(outer["meta"], dict):
+        raise ResponseSchemaError("SigNoz Query Builder metadata is malformed")
     warning = outer.get("warning")
     if warning is not None:
         if not isinstance(warning, dict) or set(warning) != {"warnings"}:
@@ -642,6 +655,10 @@ def _adapt_query_builder_payload(
     for result_set in result_sets:
         if not isinstance(result_set, dict):
             raise ResponseSchemaError("SigNoz Query Builder result set must be an object")
+        if not set(result_set).issubset({"queryName", "rows", "columns"}):
+            raise ResponseSchemaError(
+                "SigNoz result set contains an ambiguous row container"
+            )
         query_name = result_set.get("queryName")
         if not isinstance(query_name, str) or not query_name:
             raise ResponseSchemaError("SigNoz Query Builder result set lacks queryName")
@@ -691,6 +708,8 @@ def _adapt_query_builder_row(
 ) -> dict[str, Any]:
     if not isinstance(row, dict):
         raise ResponseSchemaError("SigNoz Query Builder row must be an object")
+    if not set(row).issubset({"timestamp", "data"}):
+        raise ResponseSchemaError("SigNoz row contains an ambiguous data container")
     raw_data = row.get("data")
     if isinstance(raw_data, dict):
         items = list(raw_data.items())
