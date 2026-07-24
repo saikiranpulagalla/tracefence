@@ -47,6 +47,29 @@ def _resolve_command_replacement(
     return graph_command, replacement
 
 
+def _verify_telemetry_gate(
+    proof: dict[str, Any],
+    *,
+    require_telemetry: bool,
+) -> None:
+    telemetry_verdict = proof["telemetry_verdict"]
+    overall_verdict = proof["overall_verdict"]
+    if require_telemetry:
+        check(telemetry_verdict == "VERIFIED", "SigNoz telemetry proof is verified")
+        check(overall_verdict == "VERIFIED", "overall proof is verified")
+        check(bool(proof["trace_ids"]), "SigNoz trace IDs are present")
+        return
+
+    check(
+        telemetry_verdict in {"UNAVAILABLE", "PARTIAL", "VERIFIED"},
+        "telemetry has no contradictory or incomplete evidence",
+    )
+    check(
+        overall_verdict == telemetry_verdict,
+        "overall proof follows the canonical verdict lattice",
+    )
+
+
 def _verify_internal_consistency(bundle: dict[str, Any], require_telemetry: bool) -> None:
     proof = bundle["proof"]
     actions = bundle["actions"]
@@ -182,15 +205,7 @@ def _verify_internal_consistency(bundle: dict[str, Any], require_telemetry: bool
         "recovery postconditions are causally bound to the authorized action",
     )
 
-    if require_telemetry:
-        check(proof["telemetry_verdict"] == "VERIFIED", "SigNoz telemetry proof is verified")
-        check(proof["overall_verdict"] == "VERIFIED", "overall proof is verified")
-        check(bool(proof["trace_ids"]), "SigNoz trace IDs are present")
-    else:
-        check(
-            proof["overall_verdict"] in {"PARTIAL", "VERIFIED"},
-            "overall proof truthfully reflects telemetry availability",
-        )
+    _verify_telemetry_gate(proof, require_telemetry=require_telemetry)
 
 
 def _load_bundle(

@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.lock_casting import lock_payload, write_lock
 from scripts.secret_scan import scan_paths
+from scripts.verify_end_to_end import VerificationError, _verify_telemetry_gate
 
 
 def test_secret_scan_reports_only_location_and_type(tmp_path: Path) -> None:
@@ -27,3 +30,18 @@ def test_casting_lock_is_content_bound_and_atomic(tmp_path: Path) -> None:
 
     assert json.loads(destination.read_text(encoding="utf-8")) == lock_payload(source)
     assert not list(tmp_path.glob(".casting.yaml.lock.*"))
+
+
+def test_release_verifier_accepts_canonical_unavailable_telemetry_lattice() -> None:
+    proof = {
+        "runtime_verdict": "VERIFIED",
+        "telemetry_verdict": "UNAVAILABLE",
+        "overall_verdict": "UNAVAILABLE",
+        "trace_ids": [],
+    }
+
+    _verify_telemetry_gate(proof, require_telemetry=False)
+
+    proof["overall_verdict"] = "PARTIAL"
+    with pytest.raises(VerificationError):
+        _verify_telemetry_gate(proof, require_telemetry=False)

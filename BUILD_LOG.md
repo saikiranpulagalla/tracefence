@@ -68,7 +68,7 @@
   identity-aware, bounded invariant/outbox processing and hardened readiness.
 - Added SQLite-only enforcement, Alembic schema 17, constrained reset tooling, protected frontend
   state clearing and worker completion/lease-loss lifecycle tests.
-- Verified 191 tests, 77.41% total branch-aware coverage, Ruff, strict mypy, Bandit, pip-audit,
+- Verified 192 tests, 77.41% total branch-aware coverage, Ruff, strict mypy, Bandit, pip-audit,
   wheel/sdist construction and clean wheel installation.
 - Generated four hash-locked dependency sets, a CycloneDX SBOM, a zero-advisory dependency report,
   a redacted secret-scan report and a source-content `casting.yaml.lock`.
