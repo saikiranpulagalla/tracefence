@@ -49,6 +49,7 @@ locks:
 	$(PYTHON) -m piptools compile --generate-hashes --resolver=backtracking --output-file requirements-lock/runtime.txt requirements.txt
 	$(PYTHON) -m piptools compile --generate-hashes --allow-unsafe --resolver=backtracking --output-file requirements-lock/development.txt requirements-dev.txt
 	$(PYTHON) -m piptools compile --generate-hashes --resolver=backtracking --output-file requirements-lock/full.txt requirements-full.txt
+	$(PYTHON) scripts/normalize_lock_markers.py
 	$(PYTHON) -m piptools compile --generate-hashes --allow-unsafe --resolver=backtracking --output-file requirements-lock/build.txt requirements-build.in
 
 release-artifacts:

@@ -13,7 +13,7 @@ overlapping commands, evidence integrity and telemetry delivery fail closed.
 Current pre-release local gate:
 
 ```text
-192 automated tests passed
+194 automated tests passed
 branch-aware total coverage             77.57% (required >= 70%)
 Python compileall                       PASS
 frontend JavaScript syntax              PASS
@@ -203,7 +203,7 @@ proof, graph, actions, services and violations against the authenticated live AP
 
 ## Automated adversarial coverage
 
-The 192-test suite covers, among other cases:
+The 194-test suite covers, among other cases:
 
 - delegated run-cancellation escalation;
 - invalid-token and payload-confused replay;

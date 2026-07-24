@@ -96,11 +96,11 @@ pip-audit --progress-spinner off
 No known vulnerabilities found
 
 PYTHONPATH=src TRACEFENCE_ENV=test pytest -q
-192 passed, 3 upstream deprecation warnings
+194 passed, 3 upstream deprecation warnings
 
 PYTHONPATH=src TRACEFENCE_ENV=test pytest -q --cov=tracefence --cov-branch \
   --cov-report=term-missing --cov-fail-under=70
-192 passed
+194 passed
 Total coverage: 77.57%
 
 python -m build
