@@ -229,8 +229,10 @@ is exposed as `DISABLED`, `CONFIGURED`, `READY`, `DEGRADED` or `FAILED`; configu
 telemetry can make readiness fail closed.
 
 The MCP adapter requires command evidence, stale-action evidence, correlated logs and safety
-metrics. Missing or ambiguous evidence yields `PARTIAL`/`UNAVAILABLE`; contradiction yields
-`INCONSISTENT`.
+metrics. Provider absence yields `UNAVAILABLE`; an available provider that returns only part of
+its required contract yields `PARTIAL`; missing or ambiguous required rows fail closed and
+contradiction yields `INCONSISTENT`. Overall proof uses the same severity lattice, so runtime
+`VERIFIED` + telemetry `UNAVAILABLE` = overall `UNAVAILABLE`.
 
 ## 13. Signed evidence
 

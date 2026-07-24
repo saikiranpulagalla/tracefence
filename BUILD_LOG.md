@@ -7,7 +7,7 @@
 - Implemented command-specific authority and atomic gateway admission for simulated tools.
 - Added independent non-compliant worker scenario and deterministic runtime proof.
 - Added OpenTelemetry foundations, SigNoz assets and a control-integrity UI.
-- Kept telemetry unavailable/partial rather than fabricating Foundry, MCP or SigNoz evidence.
+- Kept telemetry `UNAVAILABLE` rather than fabricating Foundry, MCP or SigNoz evidence.
 
 ## 2026-07-22 — First audit remediation
 

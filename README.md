@@ -30,7 +30,7 @@ recovery postcondition           VERIFIED
 recovery stability               VERIFIED
 runtime proof                    VERIFIED
 telemetry proof                  UNAVAILABLE until live SigNoz is configured
-overall proof                    PARTIAL until telemetry verifies
+overall proof                    UNAVAILABLE
 ```
 
 ## Architecture
@@ -272,12 +272,19 @@ Runtime proof reports:
 - `runtime_verdict`
 
 Telemetry reconciliation then validates command spans, stale-action spans, correlated logs and
-metrics. The overall verdict is:
+metrics. The overall verdict uses the canonical severity order `INCONSISTENT`,
+`STATE_CHANGED_DURING_PROOF`, `INCOMPLETE`, `PARTIAL`, `UNAVAILABLE`, then
+`VERIFIED`:
 
-- `VERIFIED`: runtime and telemetry both verify;
-- `PARTIAL`: runtime verifies but telemetry is unavailable or incomplete;
-- `INCONSISTENT`: authoritative state and telemetry disagree;
-- `INCOMPLETE`: control convergence, replacement or recovery is unfinished.
+- `INCONSISTENT`: authoritative state and telemetry contradict one another;
+- `STATE_CHANGED_DURING_PROOF`: no stable proof-relevant revision was obtained;
+- `INCOMPLETE`: required runtime evidence is missing or unfinished;
+- `PARTIAL`: an available evidence provider verified only part of its contract;
+- `UNAVAILABLE`: a mandatory evidence provider could not be consulted;
+- `VERIFIED`: every mandatory runtime and telemetry dimension verifies.
+
+Consequently, runtime `VERIFIED` + telemetry `UNAVAILABLE` = overall `UNAVAILABLE`;
+unavailable telemetry is never described as a partially verified result.
 
 ## Important limitations
 

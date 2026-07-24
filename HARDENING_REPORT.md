@@ -56,7 +56,7 @@ Redis pool reset count                  1
 checkout status                         healthy
 committed side effects                  exactly 1
 telemetry proof                         UNAVAILABLE
-overall proof                           PARTIAL
+overall proof                           UNAVAILABLE
 ```
 
 The second execution used a different run ID and command ID while sharing the same application
