@@ -1,8 +1,8 @@
 # TraceFence Hardening and Release Verification Report
 
-Date: 2026-07-22
+Date: 2026-07-24
 Release candidate: `0.2.0`
-Required database schema: **13**
+Required database schema: **17**
 
 ## Executive result
 
@@ -13,21 +13,23 @@ overlapping commands, evidence integrity and telemetry delivery fail closed.
 Current pre-release local gate:
 
 ```text
-98 automated tests passed
-branch coverage                         73.81% (required >= 70%)
+191 automated tests passed
+branch-aware total coverage             77.41% (required >= 70%)
 Python compileall                       PASS
 frontend JavaScript syntax              PASS
-Git whitespace                          PASS
+Ruff                                    PASS
+strict mypy                             PASS (51 source files)
+Bandit                                  PASS
+pip-audit                               PASS (56 release dependencies, 0 advisories)
 wheel build/content                     PASS
 installed wheel service                 PASS
 /livez                                  200
-/readyz                                 200 with database/runtime/scanner/auditor checks
+/readyz                                 evaluated with database/runtime/scanner/auditor checks
 frontend and packaged app.js            200
 ```
 
-Static/security tools are configured in CI (`Ruff`, strict `mypy`, `Bandit`, `pip-audit`) but
-could not be installed in the isolated runner because its package index did not expose those
-artifacts. This report does not claim those four checks ran locally.
+The release dependency graph is preserved in four hash-locked sets. A reproducible CycloneDX
+SBOM, dependency-audit report and redacted high-confidence secret-scan report are checked in.
 
 ## Signed two-run candidate validation
 
@@ -129,7 +131,7 @@ The Action Gateway validates identity, replay, quota, run/node status, lease, ev
 scope, capability and arguments inside one write transaction. Denied stale attempts record exact
 command/scope/snapshot/live-version attribution and acknowledge all matching commands.
 
-Schema 13 validates required tables, columns, indexes, foreign keys and checks at startup. The
+Schema 17 validates required tables, columns, indexes, foreign keys and checks at startup. The
 database independently rejects malformed or cross-run:
 
 - root, parent, supersedes, scope-owner and correction links;
@@ -201,7 +203,7 @@ proof, graph, actions, services and violations against the authenticated live AP
 
 ## Automated adversarial coverage
 
-The 98-test suite covers, among other cases:
+The 191-test suite covers, among other cases:
 
 - delegated run-cancellation escalation;
 - invalid-token and payload-confused replay;
@@ -225,7 +227,8 @@ The 98-test suite covers, among other cases:
 
 On the target WSL/Docker environment:
 
-1. generate a real `casting.yaml.lock` with Foundry;
+1. create and preserve a real environment-specific Foundry deployment lock/receipt (the
+   checked-in `casting.yaml.lock` is only a source-content lock);
 2. install MCP and OpenTelemetry instrumentation extras;
 3. start SigNoz and confirm traces, metrics and logs arrive;
 4. configure a real notification channel;
@@ -247,5 +250,5 @@ overall_verdict   = VERIFIED
 - The operator is one credential/fingerprint trust domain rather than IdP-backed per-user RBAC.
 - TraceFence cannot revoke independent credentials held outside the gateway.
 - Worker runtime/model binaries are not remotely attested.
-- Full local `Ruff`/`mypy`/`Bandit`/`pip-audit` execution remains blocked by the isolated runner;
-  CI is configured to perform them in a connected environment.
+- Live Foundry/SigNoz reconciliation is not verified in this runner because Docker was not
+  running and no SigNoz credentials were available.

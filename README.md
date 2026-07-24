@@ -210,10 +210,11 @@ Generated evidence is placed under an immutable timestamped directory with a sig
 make audit
 ```
 
-The current source passes **99 tests** and **73.81% branch coverage** in the available runner,
-plus Python compilation, JavaScript syntax, whitespace, wheel-content and installed-service
-checks. CI additionally runs Ruff, strict mypy, Bandit, pip-audit, wheel/sdist construction and
-clean-wheel installation.
+The current source passes **191 tests** and **77.41% total branch-aware coverage** in the
+available runner, plus Python compilation, JavaScript syntax, Ruff, strict mypy, Bandit,
+pip-audit, wheel/sdist construction, hash-locked installation and clean-wheel service checks.
+`make audit` executes the compile, JavaScript syntax, static, security, dependency and coverage
+gates shown by `make help`; it does not perform live SigNoz verification.
 
 ## SigNoz deployment and verification
 
@@ -223,8 +224,10 @@ Install the checked-in Foundry configuration:
 make signoz
 ```
 
-This must create a real `casting.yaml.lock` on the target machine. Never fabricate or copy a
-lock from another environment.
+The checked-in `casting.yaml.lock` binds the reviewed `casting.yaml` source bytes only. A real
+Foundry installation must replace or augment that source lock with the deployment tool's own
+environment-specific lock/receipt. The checked-in lock is not evidence that Foundry or SigNoz
+was deployed.
 
 Configure a real service-account key and existing notification channel:
 
