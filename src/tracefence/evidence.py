@@ -5,7 +5,7 @@ import hmac
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import tempfile
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import PackageNotFoundError, version
@@ -14,6 +14,8 @@ from typing import Any
 
 from tracefence.config import settings
 from tracefence.db.engine import SCHEMA_VERSION
+
+# Security: Git is resolved with shutil.which and receives fixed internal arguments.
 
 
 class EvidenceIntegrityError(RuntimeError):
@@ -81,7 +83,8 @@ def _git_metadata(repo_dir: Path) -> dict[str, Any]:
         if git is None:
             return None
         try:
-            completed = subprocess.run(  # nosec B603 - executable resolved via shutil.which; args are internal constants
+            # Security: executable is resolved via shutil.which; arguments are constants.
+            completed = subprocess.run(  # nosec B603
                 [git, *args],
                 cwd=repo_dir,
                 check=True,

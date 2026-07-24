@@ -7,12 +7,12 @@ import pytest
 from sqlalchemy import select, text
 
 import tracefence.services.proof_service as proof_module
+from tests.unit.test_proof_contract import _corrected_recovery
 from tracefence.db.models import Node, Run, ServiceState
 from tracefence.domain.enums import ProofVerdict
 from tracefence.services.common import utcnow
 from tracefence.services.proof_service import ProofService
 from tracefence.signoz.mcp_client import TelemetryProof
-from tests.unit.test_proof_contract import _corrected_recovery
 
 
 class _MutatingMCPClient:

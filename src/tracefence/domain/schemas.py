@@ -54,7 +54,7 @@ class RunCreate(StrictModel):
     )
 
     @model_validator(mode="after")
-    def validate_root_capabilities(self) -> "RunCreate":
+    def validate_root_capabilities(self) -> RunCreate:
         self.root_capabilities = _canonical_capabilities(self.root_capabilities)
         return self
 
@@ -74,7 +74,7 @@ class SpawnCreate(StrictModel):
     behavior: Literal["cooperative", "non_compliant"] = "cooperative"
 
     @model_validator(mode="after")
-    def validate_capabilities(self) -> "SpawnCreate":
+    def validate_capabilities(self) -> SpawnCreate:
         self.capabilities = _canonical_capabilities(self.capabilities)
         return self
 
@@ -138,7 +138,7 @@ class ProposalCommandAuthorization(StrictModel):
     recovery_stability_seconds: int = Field(default=0, ge=0, le=300)
 
     @model_validator(mode="after")
-    def validate_authorization_shape(self) -> "ProposalCommandAuthorization":
+    def validate_authorization_shape(self) -> ProposalCommandAuthorization:
         if self.command_type == CommandType.CANCEL_RUN:
             raise ValueError("Proposals cannot authorize CANCEL_RUN")
         if self.command_type == CommandType.CORRECT_SUBTREE:
@@ -169,7 +169,7 @@ class ProposalReview(StrictModel):
     authorized_command: ProposalCommandAuthorization | None = None
 
     @model_validator(mode="after")
-    def terminal_review_only(self) -> "ProposalReview":
+    def terminal_review_only(self) -> ProposalReview:
         if self.status not in {ProposalStatus.ACCEPTED, ProposalStatus.REJECTED}:
             raise ValueError("Proposal review status must be ACCEPTED or REJECTED")
         if self.status == ProposalStatus.ACCEPTED and self.authorized_command is None:
@@ -196,7 +196,7 @@ class CommandCreate(StrictModel):
     recovery_stability_seconds: int = Field(default=0, ge=0, le=300)
 
     @model_validator(mode="after")
-    def validate_command_shape(self) -> "CommandCreate":
+    def validate_command_shape(self) -> CommandCreate:
         if self.command_type == CommandType.CORRECT_SUBTREE:
             if self.replacement_instruction is None:
                 raise ValueError("CORRECT_SUBTREE requires replacement_instruction")
@@ -245,7 +245,7 @@ class RecoveryContract(StrictModel):
     postconditions: list[RecoveryPostcondition] = Field(default_factory=list, max_length=32)
 
     @model_validator(mode="after")
-    def validate_tool_shape(self) -> "RecoveryContract":
+    def validate_tool_shape(self) -> RecoveryContract:
         if len(self.allowed_resources) != len(set(self.allowed_resources)):
             raise ValueError("Recovery resources must be unique")
         if self.allowed_resources != sorted(self.allowed_resources):
@@ -277,7 +277,7 @@ class ReplacementManifest(StrictModel):
     recovery_contract: RecoveryContract
 
     @model_validator(mode="after")
-    def validate_capabilities(self) -> "ReplacementManifest":
+    def validate_capabilities(self) -> ReplacementManifest:
         if len(self.capabilities_exact) != len(set(self.capabilities_exact)):
             raise ValueError("Replacement capabilities must be unique")
         if self.capabilities_exact != sorted(self.capabilities_exact):

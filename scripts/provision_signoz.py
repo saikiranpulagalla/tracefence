@@ -13,7 +13,7 @@ from typing import Any
 from tracefence.evidence import _atomic_private_write
 
 DASHBOARD_TITLE = "TraceFence Control Integrity"
-ALERT_CHANNEL_TOKEN = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
+ALERT_CHANNEL_PLACEHOLDER = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
 REQUIRED_TOOLS = {
     "signoz_list_metrics",
     "signoz_list_dashboards",
@@ -219,7 +219,10 @@ def _validate_alerts(alerts: list[dict[str, Any]]) -> None:
         thresholds = alert["condition"].get("thresholds", {}).get("spec", [])
         if not thresholds:
             raise ValueError(f"Alert {name} has no threshold tier")
-        if not any(ALERT_CHANNEL_TOKEN in tier.get("channels", []) for tier in thresholds):
+        if not any(
+            ALERT_CHANNEL_PLACEHOLDER in tier.get("channels", [])
+            for tier in thresholds
+        ):
             raise ValueError(f"Alert {name} must use the notification-channel placeholder")
 
 
@@ -228,7 +231,7 @@ def _substitute_channel(value: Any, channel: str) -> Any:
         return {key: _substitute_channel(item, channel) for key, item in value.items()}
     if isinstance(value, list):
         return [_substitute_channel(item, channel) for item in value]
-    return channel if value == ALERT_CHANNEL_TOKEN else value
+    return channel if value == ALERT_CHANNEL_PLACEHOLDER else value
 
 
 def _prepare_alert_payload(

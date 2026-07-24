@@ -5,6 +5,7 @@ from uuid import uuid4
 import pytest
 
 import tracefence.services.proof_service as proof_module
+from tests.helpers import activate, create_seeded_run
 from tracefence.db.models import ActionAttempt
 from tracefence.domain.enums import ActionDecision, CommandType, IssuerType, ProofVerdict
 from tracefence.domain.schemas import CommandCreate, Principal, SpawnCreate
@@ -14,7 +15,6 @@ from tracefence.services.control_service import ControlService
 from tracefence.services.proof_service import ProofService
 from tracefence.services.spawn_service import SpawnService
 from tracefence.signoz.mcp_client import TelemetryProof
-from tests.helpers import activate, create_seeded_run
 
 
 class _VerdictMCPClient:

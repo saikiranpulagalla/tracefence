@@ -5,15 +5,15 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import select
 
+from tests.helpers import activate, create_seeded_run
 from tracefence.db.models import ControlCommand, Node
 from tracefence.domain.enums import CommandType, IssuerType
-from tracefence.domain.errors import ConflictError
+from tracefence.domain.errors import ConflictError, TraceFenceError
 from tracefence.domain.schemas import CommandCreate, Principal, SpawnCreate
+from tracefence.services.common import utcnow
 from tracefence.services.control_service import ControlService
 from tracefence.services.spawn_service import SpawnService
 from tracefence.services.state_service import StateService
-from tracefence.services.common import utcnow
-from tests.helpers import activate, create_seeded_run
 
 
 async def test_expired_lease_cannot_be_revived(session_factory):
@@ -50,7 +50,7 @@ async def test_replacement_requires_real_correction_and_leaves_no_orphan(session
         ),
     )
 
-    with pytest.raises(Exception):
+    with pytest.raises(TraceFenceError):
         await spawns.create_replacement(
             run.root_node_id,
             run.root_token,
@@ -96,7 +96,7 @@ async def test_cancel_run_by_delegated_parent_is_denied_in_service(session_facto
             SpawnCreate(role="child", capabilities=[]),
         ),
     )
-    with pytest.raises(Exception):
+    with pytest.raises(TraceFenceError):
         await controls.issue_command(
             CommandCreate(
                 idempotency_key="bad-cancel-run",
@@ -147,7 +147,7 @@ async def test_human_cancel_run_targeting_child_is_denied(session_factory):
             SpawnCreate(role="child", capabilities=[]),
         ),
     )
-    with pytest.raises(Exception):
+    with pytest.raises(TraceFenceError):
         await controls.issue_command(
             CommandCreate(
                 idempotency_key="human-bad-target",
@@ -248,7 +248,7 @@ async def test_parent_chain_not_lineage_cache_controls_authority(session_factory
     )
     assert allowed.command_id
 
-    with pytest.raises(Exception):
+    with pytest.raises(TraceFenceError):
         await controls.issue_command(
             CommandCreate(
                 idempotency_key="forged-lineage",

@@ -65,5 +65,5 @@ def configure_logging(level: int = logging.INFO) -> None:
     handler = logging.StreamHandler()
     handler.setLevel(level)
     handler.setFormatter(JsonFormatter())
-    handler._tracefence_console = True
+    handler.__dict__["_tracefence_console"] = True
     logger.addHandler(handler)

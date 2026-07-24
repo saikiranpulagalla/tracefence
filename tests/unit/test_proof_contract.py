@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from tests.helpers import activate, create_seeded_run
 from tracefence.db.models import ServiceState
 from tracefence.domain.enums import CommandType, IssuerType, ProofVerdict
 from tracefence.domain.errors import ConflictError
@@ -12,7 +13,6 @@ from tracefence.services.control_service import ControlService
 from tracefence.services.proof_service import ProofService
 from tracefence.services.spawn_service import SpawnService
 from tracefence.services.state_service import StateService
-from tests.helpers import activate, create_seeded_run
 
 
 async def _corrected_recovery(session_factory, *, key: str = "proof-contract"):

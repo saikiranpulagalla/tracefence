@@ -41,7 +41,7 @@ ALERT_NAMES = {
 }
 
 
-ALERT_CHANNEL_TOKEN = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
+ALERT_CHANNEL_PLACEHOLDER = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -55,7 +55,7 @@ def _substitute_channel(value: Any, channel: str) -> Any:
         return {key: _substitute_channel(item, channel) for key, item in value.items()}
     if isinstance(value, list):
         return [_substitute_channel(item, channel) for item in value]
-    return channel if value == ALERT_CHANNEL_TOKEN else value
+    return channel if value == ALERT_CHANNEL_PLACEHOLDER else value
 
 
 def _deployment_digest(template: dict[str, Any], channel: str, spec_digest: str) -> str:

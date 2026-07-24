@@ -4,10 +4,10 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
+from tests.helpers import create_seeded_run
 from tracefence.domain.errors import ConflictError
 from tracefence.domain.schemas import NodeActivate, SpawnCreate
 from tracefence.services.spawn_service import SpawnService
-from tests.helpers import create_seeded_run
 
 
 async def test_activation_token_is_consumed_exactly_once_under_race(session_factory):

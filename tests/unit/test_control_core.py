@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from tests.helpers import activate, create_seeded_run
+from tracefence.db.models import ActionAttempt
 from tracefence.domain.enums import ActionDecision, CommandType, IssuerType, ProofVerdict
 from tracefence.domain.schemas import ActionExecute, CommandCreate, Principal, SpawnCreate
-from tracefence.db.models import ActionAttempt
 from tracefence.services.action_gateway import ActionGateway
 from tracefence.services.control_service import ControlService
 from tracefence.services.graph_service import GraphService
@@ -10,7 +11,6 @@ from tracefence.services.proof_service import ProofService
 from tracefence.services.spawn_service import SpawnService
 from tracefence.services.state_service import StateService
 from tracefence.signoz.mcp_client import TelemetryProof
-from tests.helpers import activate, create_seeded_run
 
 
 async def test_hierarchical_scope_blocks_stale_descendant_and_preserves_sibling(

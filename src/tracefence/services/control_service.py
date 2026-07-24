@@ -23,6 +23,7 @@ from tracefence.domain.schemas import (
     CommandCreate,
     CommandIssued,
     Principal,
+    RecoveryContract,
     ReplacementManifest,
     command_authorization_payload,
 )
@@ -281,7 +282,9 @@ class ControlService:
                         instruction_version=target.instruction_version + 1,
                         capabilities_exact=requested_capabilities,
                         max_children=max_children,
-                        recovery_contract=recovery_contract,
+                        recovery_contract=RecoveryContract.model_validate(
+                            recovery_contract
+                        ),
                     ).model_dump(mode="json")
 
                 if request.command_type == CommandType.CANCEL_RUN:

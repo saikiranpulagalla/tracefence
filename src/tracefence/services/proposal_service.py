@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import cast
 from uuid import uuid4
 
 from sqlalchemy import func, select, text
@@ -95,7 +96,10 @@ class ProposalService:
     ) -> CorrectionProposal:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            proposal = session.get(CorrectionProposal, proposal_id)
+            proposal = cast(
+                CorrectionProposal | None,
+                session.get(CorrectionProposal, proposal_id),
+            )
             if proposal is None:
                 session.rollback()
                 raise NotFoundError(f"Proposal {proposal_id} was not found")

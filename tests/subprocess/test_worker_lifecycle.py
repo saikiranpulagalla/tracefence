@@ -198,7 +198,9 @@ def test_waiting_worker_terminates_without_stdin_thread_hang(worker_api):
     assert process.stdin is not None
     process.stdin.write(json.dumps({"activation_token": state.activation_token}) + "\n")
     process.stdin.flush()
-    deadline = time.monotonic() + 3
+    # Coverage instrumentation and cold Windows process startup can exceed
+    # three seconds; the assertion still requires activation before termination.
+    deadline = time.monotonic() + 10
     while not any(path.endswith("/activate") for path in state.paths):
         assert time.monotonic() < deadline
         time.sleep(0.02)

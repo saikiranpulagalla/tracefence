@@ -235,7 +235,7 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
             )
 
         expected_ck_names = {
-            constraint.name
+            str(constraint.name)
             for constraint in table.constraints
             if isinstance(constraint, CheckConstraint) and constraint.name
         }
