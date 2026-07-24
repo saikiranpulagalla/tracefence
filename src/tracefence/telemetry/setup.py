@@ -376,7 +376,7 @@ def instrument_app(app: object) -> None:
     try:
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-        FastAPIInstrumentor.instrument_app(app)  # type: ignore[arg-type]
+        FastAPIInstrumentor.instrument_app(app)
     except ImportError:
         message = "FastAPI OpenTelemetry instrumentation package is not installed"
         _record_instrumentation_error(message)

@@ -11,7 +11,7 @@ def instrument_httpx_client(client: object) -> None:
     try:
         from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
-        HTTPXClientInstrumentor.instrument_client(client)  # type: ignore[arg-type]
+        HTTPXClientInstrumentor.instrument_client(client)
     except ImportError:
         _logger.info(
             "HTTPX OpenTelemetry instrumentation package is not installed"

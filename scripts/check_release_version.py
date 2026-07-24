@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import subprocess
 import tomllib
 from pathlib import Path
 
@@ -52,16 +51,7 @@ def assert_tag_matches_package(tag: str, version: str) -> None:
 def _current_tag() -> str | None:
     if os.getenv("GITHUB_REF_TYPE") == "tag":
         return os.getenv("GITHUB_REF_NAME")
-    completed = subprocess.run(
-        ["git", "describe", "--tags", "--exact-match"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        return None
-    tag = completed.stdout.strip()
-    return tag or None
+    return None
 
 
 def main() -> None:
