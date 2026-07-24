@@ -109,6 +109,22 @@ def test_release_verifier_accepts_canonical_unavailable_telemetry_lattice() -> N
         _verify_telemetry_gate(proof, require_telemetry=False)
 
 
+def test_public_verdict_documentation_matches_canonical_lattice() -> None:
+    root = Path(__file__).resolve().parents[2]
+    documents = [
+        root / "README.md",
+        root / "ARCHITECTURE.md",
+        root / "HARDENING_REPORT.md",
+        root / "FINAL_REMEDIATION_REPORT.md",
+    ]
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in documents)
+
+    assert "overall proof                    PARTIAL until telemetry verifies" not in combined
+    assert "overall proof                           PARTIAL" not in combined
+    assert "`PARTIAL`: runtime verifies but telemetry is unavailable" not in combined
+    assert "runtime `VERIFIED` + telemetry `UNAVAILABLE` = overall `UNAVAILABLE`" in combined
+
+
 def test_full_hash_lock_keeps_mcp_pywin32_platform_conditional() -> None:
     root = Path(__file__).resolve().parents[2]
     lock = (root / "requirements-lock" / "full.txt").read_text(encoding="utf-8")
