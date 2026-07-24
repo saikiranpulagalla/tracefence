@@ -41,7 +41,7 @@ ALERT_NAMES = {
 }
 
 
-ALERT_CHANNEL_TOKEN = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
+ALERT_CHANNEL_PLACEHOLDER = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -55,7 +55,7 @@ def _substitute_channel(value: Any, channel: str) -> Any:
         return {key: _substitute_channel(item, channel) for key, item in value.items()}
     if isinstance(value, list):
         return [_substitute_channel(item, channel) for item in value]
-    return channel if value == ALERT_CHANNEL_TOKEN else value
+    return channel if value == ALERT_CHANNEL_PLACEHOLDER else value
 
 
 def _deployment_digest(template: dict[str, Any], channel: str, spec_digest: str) -> str:
@@ -344,10 +344,6 @@ def main() -> int:
     parser.add_argument("--mcp-url", default=os.getenv("SIGNOZ_MCP_URL", "http://localhost:8000/mcp"))
     parser.add_argument("--require-alerts", action="store_true")
     parser.add_argument("--proof-bundle", type=Path)
-    parser.add_argument(
-        "--evidence-signing-key",
-        default=os.getenv("TRACEFENCE_EVIDENCE_SIGNING_KEY", ""),
-    )
     args = parser.parse_args()
     return asyncio.run(
         verify(
@@ -355,7 +351,10 @@ def main() -> int:
             args.mcp_url,
             require_alerts=args.require_alerts,
             proof_bundle=args.proof_bundle,
-            evidence_signing_key=args.evidence_signing_key,
+            evidence_signing_key=os.getenv(
+                "TRACEFENCE_EVIDENCE_SIGNING_KEY",
+                "",
+            ),
         )
     )
 

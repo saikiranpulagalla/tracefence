@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import cast
 from uuid import uuid4
 
 from sqlalchemy import func, select, text
@@ -10,6 +11,7 @@ from tracefence.db.models import CorrectionProposal
 from tracefence.domain.enums import CommandType, ProposalStatus, ProposalType
 from tracefence.domain.errors import AuthorizationError, ConflictError, NotFoundError
 from tracefence.domain.schemas import ProposalCreate, ProposalReview
+from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import payload_digest
 from tracefence.services.common import (
     authenticate_node,
@@ -43,6 +45,10 @@ class ProposalService:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             reporter = await authenticate_node(session, reporter_node_id, reporter_token)
+            authenticated_rate_limiter.check(
+                "command",
+                f"{reporter.run_id}:{reporter.id}",
+            )
             allowed, reason, _ = await validate_node_runtime_state(session, reporter)
             if not allowed:
                 session.rollback()
@@ -90,7 +96,10 @@ class ProposalService:
     ) -> CorrectionProposal:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            proposal = session.get(CorrectionProposal, proposal_id)
+            proposal = cast(
+                CorrectionProposal | None,
+                session.get(CorrectionProposal, proposal_id),
+            )
             if proposal is None:
                 session.rollback()
                 raise NotFoundError(f"Proposal {proposal_id} was not found")
@@ -138,13 +147,21 @@ class ProposalService:
             session.commit()
             return proposal
 
-    async def list_for_run(self, run_id: str) -> list[dict]:
+    async def list_for_run(
+        self,
+        run_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
         with self.session_factory() as session:
             await get_run(session, run_id)
             rows = session.execute(
                 select(CorrectionProposal)
                 .where(CorrectionProposal.run_id == run_id)
                 .order_by(CorrectionProposal.created_at)
+                .limit(limit)
+                .offset(offset)
             ).scalars().all()
             return [
                 {

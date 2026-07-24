@@ -5,6 +5,7 @@ import secrets
 from dataclasses import dataclass
 
 _PROCESS_LOCAL_SECRET = secrets.token_urlsafe(48)
+_PROCESS_LOCAL_RECOVERY_SECRET = secrets.token_urlsafe(48)
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -33,6 +34,14 @@ def _int_env(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be an integer") from exc
 
 
+def _csv_env(name: str) -> tuple[str, ...]:
+    return tuple(
+        item.strip()
+        for item in os.getenv(name, "").split(",")
+        if item.strip()
+    )
+
+
 def _looks_like_placeholder(value: str) -> bool:
     normalized = value.strip().lower()
     markers = ("change-me", "changeme", "replace-", "generate-", "placeholder", "example")
@@ -47,12 +56,32 @@ class Settings:
     )
     operator_key: str = os.getenv("TRACEFENCE_OPERATOR_KEY", "")
     token_hash_secret: str = os.getenv("TRACEFENCE_TOKEN_HASH_SECRET", _PROCESS_LOCAL_SECRET)
+    credential_recovery_key: str = os.getenv(
+        "TRACEFENCE_CREDENTIAL_RECOVERY_KEY",
+        _PROCESS_LOCAL_RECOVERY_SECRET,
+    )
+    credential_recovery_ttl_seconds: int = _int_env(
+        "TRACEFENCE_CREDENTIAL_RECOVERY_TTL_SECONDS",
+        30,
+    )
     allow_insecure_dev: bool = _bool_env("TRACEFENCE_ALLOW_INSECURE_DEV", False)
     heartbeat_interval_seconds: int = _int_env("TRACEFENCE_HEARTBEAT_INTERVAL_SECONDS", 2)
     lease_ttl_seconds: int = _int_env("TRACEFENCE_LEASE_TTL_SECONDS", 7)
     lease_scan_interval_seconds: int = _int_env("TRACEFENCE_LEASE_SCAN_INTERVAL_SECONDS", 2)
     control_convergence_slo_seconds: int = _int_env("TRACEFENCE_CONTROL_CONVERGENCE_SLO_SECONDS", 10)
     control_plane_workers: int = _int_env("TRACEFENCE_CONTROL_PLANE_WORKERS", 8)
+    safety_queue_size: int = _int_env("TRACEFENCE_SAFETY_QUEUE_SIZE", 64)
+    safety_deadline_seconds: int = _int_env("TRACEFENCE_SAFETY_DEADLINE_SECONDS", 5)
+    external_io_workers: int = _int_env("TRACEFENCE_EXTERNAL_IO_WORKERS", 8)
+    external_io_queue_size: int = _int_env("TRACEFENCE_EXTERNAL_IO_QUEUE_SIZE", 16)
+    external_io_deadline_seconds: int = _int_env(
+        "TRACEFENCE_EXTERNAL_IO_DEADLINE_SECONDS",
+        30,
+    )
+    readiness_cache_seconds: int = _int_env(
+        "TRACEFENCE_READINESS_CACHE_SECONDS",
+        2,
+    )
     max_active_runs: int = _int_env("TRACEFENCE_MAX_ACTIVE_RUNS", 32)
     max_nodes_per_run: int = _int_env("TRACEFENCE_MAX_NODES_PER_RUN", 128)
     max_graph_depth: int = _int_env("TRACEFENCE_MAX_GRAPH_DEPTH", 12)
@@ -62,14 +91,40 @@ class Settings:
     max_proposals_per_run: int = _int_env("TRACEFENCE_MAX_PROPOSALS_PER_RUN", 256)
     proof_cache_seconds: int = _int_env("TRACEFENCE_PROOF_CACHE_SECONDS", 2)
     max_request_bytes: int = _int_env("TRACEFENCE_MAX_REQUEST_BYTES", 262144)
-    rate_limit_per_minute: int = _int_env("TRACEFENCE_RATE_LIMIT_PER_MINUTE", 600)
+    rate_limit_per_minute: int = _int_env("TRACEFENCE_RATE_LIMIT_PER_MINUTE", 10_000)
     proof_rate_limit_per_minute: int = _int_env(
         "TRACEFENCE_PROOF_RATE_LIMIT_PER_MINUTE", 60
     )
     rate_limit_max_buckets: int = _int_env("TRACEFENCE_RATE_LIMIT_MAX_BUCKETS", 10_000)
+    heartbeat_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_HEARTBEAT_RATE_LIMIT_PER_MINUTE",
+        120,
+    )
+    action_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_ACTION_RATE_LIMIT_PER_MINUTE",
+        120,
+    )
+    spawn_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_SPAWN_RATE_LIMIT_PER_MINUTE",
+        60,
+    )
+    activation_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_ACTIVATION_RATE_LIMIT_PER_MINUTE",
+        30,
+    )
+    command_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_COMMAND_RATE_LIMIT_PER_MINUTE",
+        120,
+    )
+    operator_read_rate_limit_per_minute: int = _int_env(
+        "TRACEFENCE_OPERATOR_READ_RATE_LIMIT_PER_MINUTE",
+        600,
+    )
+    trusted_proxy_hosts: tuple[str, ...] = _csv_env("TRACEFENCE_TRUSTED_PROXY_HOSTS")
     otlp_endpoint: str = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
     otel_metric_export_interval_ms: int = _int_env("TRACEFENCE_OTEL_METRIC_EXPORT_INTERVAL_MS", 2000)
     otel_export_timeout_ms: int = _int_env("TRACEFENCE_OTEL_EXPORT_TIMEOUT_MS", 5000)
+    build_commit: str = os.getenv("TRACEFENCE_BUILD_COMMIT", "")
     signoz_url: str = os.getenv("SIGNOZ_URL", "http://localhost:8080")
     signoz_mcp_url: str = os.getenv("SIGNOZ_MCP_URL", "http://localhost:8000/mcp")
     signoz_api_key: str = os.getenv("SIGNOZ_API_KEY", "")
@@ -77,8 +132,6 @@ class Settings:
     frontend_origin: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
     def validate_security(self) -> None:
-        if self.environment.lower() == "test":
-            return
         errors: list[str] = []
         if not self.operator_key:
             errors.append("TRACEFENCE_OPERATOR_KEY is required")
@@ -92,6 +145,25 @@ class Settings:
             errors.append("TRACEFENCE_TOKEN_HASH_SECRET must contain at least 32 characters")
         elif _looks_like_placeholder(self.token_hash_secret):
             errors.append("TRACEFENCE_TOKEN_HASH_SECRET must not be a placeholder value")
+        if (
+            self.credential_recovery_key == _PROCESS_LOCAL_RECOVERY_SECRET
+            and not self.allow_insecure_dev
+        ):
+            errors.append("TRACEFENCE_CREDENTIAL_RECOVERY_KEY must be explicitly configured")
+        elif len(self.credential_recovery_key) < 32:
+            errors.append(
+                "TRACEFENCE_CREDENTIAL_RECOVERY_KEY must contain at least 32 characters"
+            )
+        elif _looks_like_placeholder(self.credential_recovery_key):
+            errors.append("TRACEFENCE_CREDENTIAL_RECOVERY_KEY must not be a placeholder value")
+        elif self.credential_recovery_key in {
+            self.operator_key,
+            self.token_hash_secret,
+            self.evidence_signing_key,
+        }:
+            errors.append(
+                "TRACEFENCE_CREDENTIAL_RECOVERY_KEY must be independent from all other keys"
+            )
         if not self.evidence_signing_key:
             errors.append("TRACEFENCE_EVIDENCE_SIGNING_KEY is required")
         elif len(self.evidence_signing_key) < 32:
@@ -116,8 +188,33 @@ class Settings:
             errors.append("TRACEFENCE_LEASE_SCAN_INTERVAL_SECONDS must be positive")
         if self.control_convergence_slo_seconds <= 0:
             errors.append("TRACEFENCE_CONTROL_CONVERGENCE_SLO_SECONDS must be positive")
+        if not 5 <= self.credential_recovery_ttl_seconds <= 300:
+            errors.append(
+                "TRACEFENCE_CREDENTIAL_RECOVERY_TTL_SECONDS must be between 5 and 300"
+            )
         if not 1 <= self.control_plane_workers <= 64:
             errors.append("TRACEFENCE_CONTROL_PLANE_WORKERS must be between 1 and 64")
+        for name, value in (
+            ("TRACEFENCE_SAFETY_QUEUE_SIZE", self.safety_queue_size),
+            ("TRACEFENCE_EXTERNAL_IO_QUEUE_SIZE", self.external_io_queue_size),
+        ):
+            if not 1 <= value <= 10_000:
+                errors.append(f"{name} must be between 1 and 10000")
+        if not 1 <= self.external_io_workers <= 64:
+            errors.append("TRACEFENCE_EXTERNAL_IO_WORKERS must be between 1 and 64")
+        for name, value in (
+            ("TRACEFENCE_SAFETY_DEADLINE_SECONDS", self.safety_deadline_seconds),
+            (
+                "TRACEFENCE_EXTERNAL_IO_DEADLINE_SECONDS",
+                self.external_io_deadline_seconds,
+            ),
+        ):
+            if not 1 <= value <= 300:
+                errors.append(f"{name} must be between 1 and 300")
+        if not 1 <= self.readiness_cache_seconds <= 30:
+            errors.append(
+                "TRACEFENCE_READINESS_CACHE_SECONDS must be between 1 and 30"
+            )
         for name, value, maximum in (
             ("TRACEFENCE_MAX_ACTIVE_RUNS", self.max_active_runs, 10_000),
             ("TRACEFENCE_MAX_NODES_PER_RUN", self.max_nodes_per_run, 100_000),
@@ -144,6 +241,28 @@ class Settings:
                 "TRACEFENCE_PROOF_RATE_LIMIT_PER_MINUTE must be positive and no greater "
                 "than TRACEFENCE_RATE_LIMIT_PER_MINUTE"
             )
+        for name, value in (
+            (
+                "TRACEFENCE_HEARTBEAT_RATE_LIMIT_PER_MINUTE",
+                self.heartbeat_rate_limit_per_minute,
+            ),
+            ("TRACEFENCE_ACTION_RATE_LIMIT_PER_MINUTE", self.action_rate_limit_per_minute),
+            ("TRACEFENCE_SPAWN_RATE_LIMIT_PER_MINUTE", self.spawn_rate_limit_per_minute),
+            (
+                "TRACEFENCE_ACTIVATION_RATE_LIMIT_PER_MINUTE",
+                self.activation_rate_limit_per_minute,
+            ),
+            (
+                "TRACEFENCE_COMMAND_RATE_LIMIT_PER_MINUTE",
+                self.command_rate_limit_per_minute,
+            ),
+            (
+                "TRACEFENCE_OPERATOR_READ_RATE_LIMIT_PER_MINUTE",
+                self.operator_read_rate_limit_per_minute,
+            ),
+        ):
+            if not 1 <= value <= 100_000:
+                errors.append(f"{name} must be between 1 and 100000")
         if not 100 <= self.rate_limit_max_buckets <= 1_000_000:
             errors.append("TRACEFENCE_RATE_LIMIT_MAX_BUCKETS must be between 100 and 1000000")
         if self.otel_metric_export_interval_ms <= 0:

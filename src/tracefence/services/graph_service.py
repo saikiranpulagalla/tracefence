@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from tracefence.db.models import ControlCommand, ControlScope, Node
-from tracefence.domain.enums import NodeStatus
+from tracefence.domain.enums import NodeStatus, RunStatus
 from tracefence.domain.schemas import GraphNode, GraphResponse
 from tracefence.services.common import evaluate_scopes, get_run, iso_utc, utcnow
 
@@ -99,7 +99,7 @@ class GraphService:
 
             return GraphResponse(
                 run_id=run.id,
-                status=run.status,
+                status=RunStatus(run.status),
                 nodes=graph_nodes,
                 edges=edges,
                 commands=[
@@ -113,6 +113,7 @@ class GraphService:
                         "reason_code": command.reason_code,
                         "source_proposal_id": command.source_proposal_id,
                         "replacement_node_id": command.replacement_node_id,
+                        "replacement_status": command.replacement_status,
                         "replacement_manifest_digest": command.replacement_manifest_digest,
                         "replacement_manifest": command.replacement_manifest_json,
                         "created_at": iso_utc(command.created_at),

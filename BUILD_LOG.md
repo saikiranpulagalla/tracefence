@@ -54,3 +54,22 @@
 - Run the complete telemetry-enabled scenario against live SigNoz.
 - Provision and verify the dashboard and alerts through MCP.
 - Require telemetry and overall proof verdicts to reach `VERIFIED`.
+
+## 2026-07-24 — Adversarial runtime-integrity remediation
+
+- Added authoritative proof revisions, bounded retry, revision/lease-aware caching and a single
+  verdict severity lattice.
+- Added strict command/run/process/build telemetry adapters, exporter watermark requirements,
+  supported MCP Streamable HTTP transport and cancellation-safe proof single-flight.
+- Enforced immutable recovery manifests and invocation budgets before side effects.
+- Added heartbeat scope fencing, immutable terminal run transitions, root-expiry terminalization,
+  achievable replacement lifecycle and encrypted short-lived credential response recovery.
+- Isolated safety work from external proof I/O, made authenticated heartbeat limits
+  identity-aware, bounded invariant/outbox processing and hardened readiness.
+- Added SQLite-only enforcement, Alembic schema 17, constrained reset tooling, protected frontend
+  state clearing and worker completion/lease-loss lifecycle tests.
+- Verified 194 tests, 77.57% total branch-aware coverage, Ruff, strict mypy, Bandit, pip-audit,
+  wheel/sdist construction and clean wheel installation.
+- Generated four hash-locked dependency sets, a CycloneDX SBOM, a zero-advisory dependency report,
+  a redacted secret-scan report and a source-content `casting.yaml.lock`.
+- Live Foundry/SigNoz telemetry reconciliation remains blocked and is not reported as verified.

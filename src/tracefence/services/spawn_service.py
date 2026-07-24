@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from uuid import uuid4
 
 from opentelemetry.propagate import inject
-from sqlalchemy import func, select, text
 from pydantic import ValidationError
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from tracefence.config import settings
@@ -14,20 +14,29 @@ from tracefence.db.models import (
     CommandAcknowledgement,
     ControlCommand,
     ControlScope,
+    CredentialRecoveryEnvelope,
     Node,
     Run,
     SpawnIntent,
 )
-from tracefence.domain.enums import AckType, CommandType, NodeStatus, RunStatus, ScopeStatus
+from tracefence.domain.enums import (
+    AckType,
+    CommandType,
+    NodeStatus,
+    ReplacementStatus,
+    RunStatus,
+    ScopeStatus,
+)
 from tracefence.domain.errors import AuthorizationError, ConflictError, NotFoundError
 from tracefence.domain.schemas import (
     CheckpointResponse,
     NodeActivate,
     NodeActivated,
+    ReplacementManifest,
     SpawnCreate,
     SpawnCreated,
-    ReplacementManifest,
 )
+from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import generate_token, hash_token, payload_digest, token_matches
 from tracefence.services.common import (
     authenticate_node,
@@ -36,6 +45,13 @@ from tracefence.services.common import (
     utcnow,
     validate_node_runtime_state,
 )
+from tracefence.services.credential_recovery import (
+    find_envelope,
+    open_envelope,
+    recovery_request_digest,
+    seal_envelope,
+)
+from tracefence.services.run_lifecycle import transition_run
 from tracefence.telemetry.instruments import telemetry
 
 logger = logging.getLogger(__name__)
@@ -48,6 +64,7 @@ class SpawnService:
     async def create_spawn(
         self, parent_node_id: str, parent_token: str, request: SpawnCreate
     ) -> SpawnCreated:
+        request_digest = recovery_request_digest(request)
         with telemetry.tracer.start_as_current_span(
             "tracefence.node.spawn_authorize"
         ) as span:
@@ -57,17 +74,55 @@ class SpawnService:
                 session.execute(text("BEGIN IMMEDIATE"))
                 try:
                     parent = await authenticate_node(session, parent_node_id, parent_token)
-                    allowed, reason, _ = await validate_node_runtime_state(session, parent)
-                    if not allowed:
-                        raise ConflictError(
-                            f"Parent cannot spawn: {reason}", code=reason or "SPAWN_DENIED"
+                    recovered = False
+                    if request.operation_key is not None:
+                        envelope = find_envelope(
+                            session,
+                            operation_type="SPAWN",
+                            caller_node_id=parent.id,
+                            operation_key=request.operation_key,
+                            request_digest=request_digest,
                         )
-                    self._enforce_graph_budget(session, parent)
-                    self._enforce_parent_child_budget(session, parent)
-                    self._validate_capability_delegation(parent, request)
-                    created = self._create_spawn_locked(
-                        session, parent, request, trace_context=carrier
-                    )
+                        if envelope is not None:
+                            created = self._recover_spawn_response(
+                                session,
+                                envelope,
+                            )
+                            recovered = True
+                    if not recovered:
+                        authenticated_rate_limiter.check(
+                            "spawn",
+                            f"{parent.run_id}:{parent.id}",
+                        )
+                        allowed, reason, _ = await validate_node_runtime_state(
+                            session, parent
+                        )
+                        if not allowed:
+                            raise ConflictError(
+                                f"Parent cannot spawn: {reason}",
+                                code=reason or "SPAWN_DENIED",
+                            )
+                        self._enforce_graph_budget(session, parent)
+                        self._enforce_parent_child_budget(session, parent)
+                        self._validate_capability_delegation(parent, request)
+                        created = self._create_spawn_locked(
+                            session, parent, request, trace_context=carrier
+                        )
+                        if request.operation_key is not None:
+                            # The envelope's composite subject FK requires the
+                            # newly registered node to exist first.
+                            session.flush()
+                            seal_envelope(
+                                session,
+                                existing=None,
+                                run_id=parent.run_id,
+                                operation_type="SPAWN",
+                                caller_node_id=parent.id,
+                                subject_node_id=created.child_node_id,
+                                operation_key=request.operation_key,
+                                request_digest=request_digest,
+                                response=created,
+                            )
                     session.commit()
                 except Exception:
                     session.rollback()
@@ -83,6 +138,7 @@ class SpawnService:
         permanent_token = generate_token()
         now = utcnow()
         lease_expires_at = now + timedelta(seconds=settings.lease_ttl_seconds)
+        request_digest = recovery_request_digest(request)
 
         with self.session_factory() as session:
             # Serialize token consumption before checking consumed_at. This makes
@@ -101,10 +157,58 @@ class SpawnService:
                     raise ConflictError(
                         "Invalid activation token", code="INVALID_ACTIVATION_TOKEN"
                     )
+                if request.operation_key is not None:
+                    envelope = find_envelope(
+                        session,
+                        operation_type="ACTIVATION",
+                        caller_node_id=node.id,
+                        operation_key=request.operation_key,
+                        request_digest=request_digest,
+                    )
+                    if envelope is not None:
+                        if envelope.expires_at > now:
+                            recovered = open_envelope(envelope, NodeActivated)
+                            session.commit()
+                            return NodeActivated.model_validate(recovered)
+                        if (
+                            node.status not in {NodeStatus.ACTIVE, NodeStatus.WAITING}
+                            or node.lease_expires_at is None
+                            or node.lease_expires_at <= now
+                        ):
+                            raise ConflictError(
+                                "Expired activation recovery cannot revive an inactive node",
+                                code="CREDENTIAL_RECOVERY_EXPIRED",
+                            )
+                        permanent_token = generate_token()
+                        node.token_hash = hash_token(permanent_token)
+                        rotated = NodeActivated(
+                            node_id=node.id,
+                            run_id=node.run_id,
+                            role=node.role,
+                            node_token=permanent_token,
+                            lease_expires_at=node.lease_expires_at,
+                        )
+                        seal_envelope(
+                            session,
+                            existing=envelope,
+                            run_id=node.run_id,
+                            operation_type="ACTIVATION",
+                            caller_node_id=node.id,
+                            subject_node_id=node.id,
+                            operation_key=request.operation_key,
+                            request_digest=request_digest,
+                            response=rotated,
+                        )
+                        session.commit()
+                        return rotated
                 if intent.consumed_at is not None:
                     raise ConflictError(
                         "Activation token already used", code="ACTIVATION_TOKEN_USED"
                     )
+                authenticated_rate_limiter.check(
+                    "activation",
+                    f"{node.run_id}:{node.id}",
+                )
                 if intent.expires_at <= now:
                     raise ConflictError(
                         "Activation token expired", code="ACTIVATION_TOKEN_EXPIRED"
@@ -126,6 +230,37 @@ class SpawnService:
                 node.last_heartbeat_at = now
                 node.lease_expires_at = lease_expires_at
                 node.process_id = request.process_id
+                if node.caused_by_command_id is not None:
+                    command = session.get(ControlCommand, node.caused_by_command_id)
+                    if (
+                        command is None
+                        or command.replacement_node_id != node.id
+                        or command.replacement_status != ReplacementStatus.PENDING
+                    ):
+                        raise ConflictError(
+                            "Replacement activation lifecycle is inconsistent",
+                            code="REPLACEMENT_LIFECYCLE_INVALID",
+                        )
+                    command.replacement_status = ReplacementStatus.ACTIVE
+                activated = NodeActivated(
+                    node_id=node_id,
+                    run_id=node.run_id,
+                    role=node.role,
+                    node_token=permanent_token,
+                    lease_expires_at=lease_expires_at,
+                )
+                if request.operation_key is not None:
+                    seal_envelope(
+                        session,
+                        existing=None,
+                        run_id=node.run_id,
+                        operation_type="ACTIVATION",
+                        caller_node_id=node.id,
+                        subject_node_id=node.id,
+                        operation_key=request.operation_key,
+                        request_digest=request_digest,
+                        response=activated,
+                    )
                 session.commit()
             except Exception:
                 session.rollback()
@@ -134,43 +269,67 @@ class SpawnService:
         logger.info("node_activated node_id=%s", node_id)
         with telemetry.tracer.start_as_current_span("tracefence.node.activate") as span:
             span.set_attribute("tracefence.node.id", node_id)
-        return NodeActivated(
-            node_id=node_id,
-            run_id=node.run_id,
-            role=node.role,
-            node_token=permanent_token,
-            lease_expires_at=lease_expires_at,
-        )
+        return activated
 
     async def heartbeat(self, node_id: str, node_token: str) -> Node:
         now = utcnow()
-        expired = False
+        denial_code: str | None = None
         node: Node
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
                 node = await authenticate_node(session, node_id, node_token)
-                if node.status not in {NodeStatus.ACTIVE, NodeStatus.WAITING}:
-                    raise ConflictError("Node is not live", code="NODE_NOT_ACTIVE")
-                if node.lease_expires_at is None or node.lease_expires_at <= now:
+                authenticated_rate_limiter.check(
+                    "heartbeat",
+                    f"{node.run_id}:{node.id}",
+                )
+                run = session.get(Run, node.run_id)
+                if run is None:
+                    raise NotFoundError(f"Run {node.run_id} was not found")
+                if run.status != RunStatus.RUNNING:
+                    denial_code = "RUN_NOT_ACTIVE"
+                elif node.status not in {NodeStatus.ACTIVE, NodeStatus.WAITING}:
+                    denial_code = "NODE_NOT_ACTIVE"
+                elif node.lease_expires_at is None or node.lease_expires_at <= now:
                     node.status = NodeStatus.LEASE_EXPIRED
                     await self._record_lease_expiry_ack(session, node, now)
-                    session.commit()
-                    expired = True
+                    denial_code = "LEASE_EXPIRED"
                 else:
-                    node.last_heartbeat_at = now
-                    node.lease_expires_at = now + timedelta(
-                        seconds=settings.lease_ttl_seconds
-                    )
-                    session.commit()
+                    evaluation = await evaluate_scopes(session, node)
+                    if not evaluation.allowed:
+                        commands = await commands_for_scope_mismatches(
+                            session,
+                            evaluation.mismatches,
+                            run_id=node.run_id,
+                        )
+                        for command in commands:
+                            self._record_ack(
+                                session,
+                                node.run_id,
+                                command.id,
+                                node.id,
+                                AckType.COOPERATIVE,
+                                command.to_version,
+                                now,
+                            )
+                        node.status = evaluation.effective_status
+                        denial_code = evaluation.primary_reason or "SCOPE_INVALID"
+                    else:
+                        node.last_heartbeat_at = now
+                        node.lease_expires_at = now + timedelta(
+                            seconds=settings.lease_ttl_seconds
+                        )
+                session.commit()
             except Exception:
                 session.rollback()
                 raise
 
-        if expired:
-            telemetry.leases_expired_total.add(1)
+        if denial_code is not None:
+            if denial_code == "LEASE_EXPIRED":
+                telemetry.leases_expired_total.add(1)
             raise ConflictError(
-                "Expired lease cannot be revived by heartbeat", code="LEASE_EXPIRED"
+                f"Heartbeat denied: {denial_code}",
+                code=denial_code,
             )
         return node
 
@@ -179,6 +338,10 @@ class SpawnService:
     ) -> CheckpointResponse:
         with self.session_factory() as session, session.begin():
             node = await authenticate_node(session, node_id, node_token)
+            authenticated_rate_limiter.check(
+                "heartbeat",
+                f"{node.run_id}:{node.id}",
+            )
             allowed, reason, evaluation = await validate_node_runtime_state(session, node)
             if allowed:
                 logger.info(
@@ -233,72 +396,110 @@ class SpawnService:
             )
 
     async def complete(self, node_id: str, node_token: str) -> None:
-        with self.session_factory() as session, session.begin():
-            node = await authenticate_node(session, node_id, node_token)
-            allowed, reason, _ = await validate_node_runtime_state(session, node)
-            if not allowed:
-                raise ConflictError(
-                    f"Node cannot complete: {reason}", code=reason or "COMPLETE_DENIED"
+        with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            try:
+                node = await authenticate_node(session, node_id, node_token)
+                authenticated_rate_limiter.check(
+                    "heartbeat",
+                    f"{node.run_id}:{node.id}",
                 )
-
-            run = session.get(Run, node.run_id)
-            if run is None:
-                raise NotFoundError(f"Run {node.run_id} was not found")
-            if run.root_node_id == node.id:
-                others = session.execute(
-                    select(Node).where(Node.run_id == node.run_id, Node.id != node.id)
-                ).scalars().all()
-                live_nodes: list[str] = []
-                expired_count = 0
-                now = utcnow()
-                for other in others:
-                    if other.status in {
-                        NodeStatus.COMPLETED,
-                        NodeStatus.CANCELLED,
-                        NodeStatus.SUPERSEDED,
-                        NodeStatus.LEASE_EXPIRED,
-                    }:
-                        continue
-
-                    expired = False
-                    if other.status in {NodeStatus.ACTIVE, NodeStatus.WAITING}:
-                        expired = (
-                            other.lease_expires_at is None
-                            or other.lease_expires_at <= now
-                        )
-                    elif other.status == NodeStatus.PENDING:
-                        intent = session.execute(
-                            select(SpawnIntent).where(
-                                SpawnIntent.child_node_id == other.id,
-                                SpawnIntent.run_id == other.run_id,
-                            )
-                        ).scalar_one_or_none()
-                        expired = (
-                            intent is None
-                            or intent.consumed_at is None and intent.expires_at <= now
-                        )
-
-                    if expired:
-                        other.status = NodeStatus.LEASE_EXPIRED
-                        await self._record_lease_expiry_ack(session, other, now)
-                        expired_count += 1
-                        continue
-
-                    other_evaluation = await evaluate_scopes(session, other)
-                    if other_evaluation.allowed:
-                        live_nodes.append(other.id)
-                if expired_count:
-                    telemetry.leases_expired_total.add(expired_count)
-                if live_nodes:
+                allowed, reason, _ = await validate_node_runtime_state(session, node)
+                if not allowed:
                     raise ConflictError(
-                        "Root cannot complete while valid descendant nodes remain live",
-                        code="RUN_HAS_LIVE_NODES",
+                        f"Node cannot complete: {reason}",
+                        code=reason or "COMPLETE_DENIED",
                     )
-                run.status = RunStatus.COMPLETED
-                run.finished_at = utcnow()
 
-            node.status = NodeStatus.COMPLETED
-            node.completed_at = utcnow()
+                run = session.get(Run, node.run_id)
+                if run is None:
+                    raise NotFoundError(f"Run {node.run_id} was not found")
+                if run.root_node_id == node.id:
+                    others = session.execute(
+                        select(Node).where(
+                            Node.run_id == node.run_id,
+                            Node.id != node.id,
+                        )
+                    ).scalars().all()
+                    live_nodes: list[str] = []
+                    expired_count = 0
+                    now = utcnow()
+                    for other in others:
+                        if other.status in {
+                            NodeStatus.COMPLETED,
+                            NodeStatus.CANCELLED,
+                            NodeStatus.SUPERSEDED,
+                            NodeStatus.LEASE_EXPIRED,
+                        }:
+                            continue
+
+                        expired = False
+                        if other.status in {
+                            NodeStatus.ACTIVE,
+                            NodeStatus.WAITING,
+                        }:
+                            expired = (
+                                other.lease_expires_at is None
+                                or other.lease_expires_at <= now
+                            )
+                        elif other.status == NodeStatus.PENDING:
+                            intent = session.execute(
+                                select(SpawnIntent).where(
+                                    SpawnIntent.child_node_id == other.id,
+                                    SpawnIntent.run_id == other.run_id,
+                                )
+                            ).scalar_one_or_none()
+                            expired = (
+                                intent is None
+                                or intent.consumed_at is None
+                                and intent.expires_at <= now
+                            )
+
+                        if expired:
+                            other.status = NodeStatus.LEASE_EXPIRED
+                            await self._record_lease_expiry_ack(
+                                session,
+                                other,
+                                now,
+                            )
+                            expired_count += 1
+                            continue
+
+                        other_evaluation = await evaluate_scopes(session, other)
+                        if other_evaluation.allowed:
+                            live_nodes.append(other.id)
+                    if expired_count:
+                        telemetry.leases_expired_total.add(expired_count)
+                    if live_nodes:
+                        raise ConflictError(
+                            "Root cannot complete while valid descendant nodes remain live",
+                            code="RUN_HAS_LIVE_NODES",
+                        )
+                    transition_run(
+                        session,
+                        run,
+                        RunStatus.COMPLETED,
+                        finished_at=utcnow(),
+                    )
+
+                node.status = NodeStatus.COMPLETED
+                node.completed_at = utcnow()
+                if node.caused_by_command_id is not None:
+                    command = session.get(ControlCommand, node.caused_by_command_id)
+                    if (
+                        command is None
+                        or command.replacement_node_id != node.id
+                        or command.replacement_status != ReplacementStatus.ACTIVE
+                    ):
+                        raise ConflictError(
+                            "Replacement completion lifecycle is inconsistent",
+                            code="REPLACEMENT_LIFECYCLE_INVALID",
+                        )
+                    command.replacement_status = ReplacementStatus.COMPLETED
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
 
     async def create_replacement(
         self,
@@ -307,6 +508,10 @@ class SpawnService:
         correction_command_id: str,
         request: SpawnCreate,
     ) -> SpawnCreated:
+        request_digest = recovery_request_digest(
+            request,
+            context=correction_command_id,
+        )
         with telemetry.tracer.start_as_current_span(
             "tracefence.node.spawn_replacement"
         ) as span:
@@ -316,13 +521,49 @@ class SpawnService:
                 session.execute(text("BEGIN IMMEDIATE"))
                 try:
                     parent = await authenticate_node(session, parent_node_id, parent_token)
-                    allowed, reason, _ = await validate_node_runtime_state(session, parent)
-                    if not allowed:
-                        raise ConflictError(
-                            f"Replacement parent is not live: {reason}",
-                            code=reason or "REPLACEMENT_PARENT_DENIED",
+                    recovered = False
+                    command: ControlCommand | None = None
+                    if request.operation_key is not None:
+                        envelope = find_envelope(
+                            session,
+                            operation_type="REPLACEMENT",
+                            caller_node_id=parent.id,
+                            operation_key=request.operation_key,
+                            request_digest=request_digest,
                         )
-                    command = session.get(ControlCommand, correction_command_id)
+                        if envelope is not None:
+                            command = session.get(
+                                ControlCommand,
+                                correction_command_id,
+                            )
+                            if (
+                                command is None
+                                or command.replacement_node_id
+                                != envelope.subject_node_id
+                            ):
+                                raise ConflictError(
+                                    "Recovered replacement does not match the command",
+                                    code="CREDENTIAL_RECOVERY_SUBJECT_MISMATCH",
+                                )
+                            created = self._recover_spawn_response(
+                                session,
+                                envelope,
+                            )
+                            recovered = True
+                    if not recovered:
+                        authenticated_rate_limiter.check(
+                            "spawn",
+                            f"{parent.run_id}:{parent.id}",
+                        )
+                        allowed, reason, _ = await validate_node_runtime_state(
+                            session, parent
+                        )
+                        if not allowed:
+                            raise ConflictError(
+                                f"Replacement parent is not live: {reason}",
+                                code=reason or "REPLACEMENT_PARENT_DENIED",
+                            )
+                        command = session.get(ControlCommand, correction_command_id)
                     if command is None:
                         raise NotFoundError(
                             f"Correction command {correction_command_id} was not found"
@@ -338,13 +579,25 @@ class SpawnService:
                         raise AuthorizationError(
                             "Only the command-designated parent may create the replacement"
                         )
-                    if command.replacement_node_id is not None:
-                        raise ConflictError(
-                            "Correction command already has a replacement node",
-                            code="REPLACEMENT_ALREADY_CREATED",
+                    if not recovered and command.replacement_node_id is not None:
+                        prior_replacement = session.get(
+                            Node,
+                            command.replacement_node_id,
                         )
+                        retry_allowed = (
+                            command.replacement_status
+                            == ReplacementStatus.ACTIVATION_EXPIRED
+                            and prior_replacement is not None
+                            and prior_replacement.status == NodeStatus.LEASE_EXPIRED
+                        )
+                        if not retry_allowed:
+                            raise ConflictError(
+                                "Correction command already has a replacement node",
+                                code="REPLACEMENT_ALREADY_CREATED",
+                            )
 
-                    self._enforce_graph_budget(session, parent)
+                    if not recovered:
+                        self._enforce_graph_budget(session, parent)
 
                     old = session.get(Node, command.target_node_id)
                     scope = session.get(ControlScope, command.target_scope_id)
@@ -353,9 +606,17 @@ class SpawnService:
                             "Correction lineage is incomplete",
                             code="CORRECTION_LINEAGE_INVALID",
                         )
-                    if old.run_id != parent.run_id or old.parent_id != parent.id:
+                    run = session.get(Run, command.run_id)
+                    root_fallback = (
+                        run is not None
+                        and parent.id == run.root_node_id
+                        and command.replacement_parent_id == parent.id
+                    )
+                    if old.run_id != parent.run_id or (
+                        old.parent_id != parent.id and not root_fallback
+                    ):
                         raise ConflictError(
-                            "Replacement must share the corrected node's parent",
+                            "Replacement must use the command-authorized parent",
                             code="REPLACEMENT_PARENT_MISMATCH",
                         )
                     if old.own_scope_id != command.target_scope_id:
@@ -411,20 +672,34 @@ class SpawnService:
                         )
                     self._validate_capability_delegation(parent, request)
 
-                    created = self._create_spawn_locked(
-                        session,
-                        parent,
-                        request,
-                        supersedes_node_id=old.id,
-                        caused_by_command_id=command.id,
-                        instruction_version=old.instruction_version + 1,
-                        trace_context=carrier,
-                    )
-                    # The command's replacement FK points at the newly inserted
-                    # node. Flush the node/scope/intent first so SQLite can validate
-                    # the subsequent command update without relying on ORM ordering.
-                    session.flush()
-                    command.replacement_node_id = created.child_node_id
+                    if not recovered:
+                        created = self._create_spawn_locked(
+                            session,
+                            parent,
+                            request,
+                            supersedes_node_id=old.id,
+                            caused_by_command_id=command.id,
+                            instruction_version=old.instruction_version + 1,
+                            trace_context=carrier,
+                        )
+                        # The command's replacement FK points at the newly inserted
+                        # node. Flush the node/scope/intent first so SQLite can validate
+                        # the subsequent command update without relying on ORM ordering.
+                        session.flush()
+                        command.replacement_node_id = created.child_node_id
+                        command.replacement_status = ReplacementStatus.PENDING
+                        if request.operation_key is not None:
+                            seal_envelope(
+                                session,
+                                existing=None,
+                                run_id=parent.run_id,
+                                operation_type="REPLACEMENT",
+                                caller_node_id=parent.id,
+                                subject_node_id=created.child_node_id,
+                                operation_key=request.operation_key,
+                                request_digest=request_digest,
+                                response=created,
+                            )
                     session.commit()
                 except Exception:
                     session.rollback()
@@ -437,6 +712,55 @@ class SpawnService:
 
         self._record_spawn(parent_node_id, created.child_node_id, request.role)
         return created
+
+    @staticmethod
+    def _recover_spawn_response(
+        session: Session,
+        envelope: CredentialRecoveryEnvelope,
+    ) -> SpawnCreated:
+        now = utcnow()
+        node = session.get(Node, envelope.subject_node_id)
+        intent = session.execute(
+            select(SpawnIntent).where(
+                SpawnIntent.child_node_id == envelope.subject_node_id
+            )
+        ).scalar_one_or_none()
+        if (
+            node is None
+            or intent is None
+            or node.status != NodeStatus.PENDING
+            or intent.consumed_at is not None
+            or intent.expires_at <= now
+        ):
+            raise ConflictError(
+                "Spawn credential is no longer recoverable",
+                code="CREDENTIAL_RECOVERY_EXPIRED",
+            )
+        if envelope.expires_at > now:
+            recovered = open_envelope(envelope, SpawnCreated)
+            return SpawnCreated.model_validate(recovered)
+
+        activation_token = generate_token()
+        intent.activation_token_hash = hash_token(activation_token)
+        intent.expires_at = utcnow() + timedelta(seconds=60)
+        recovered = SpawnCreated(
+            child_node_id=node.id,
+            activation_token=activation_token,
+            expires_at=intent.expires_at,
+            trace_context=dict(intent.trace_context_json or {}),
+        )
+        seal_envelope(
+            session,
+            existing=envelope,
+            run_id=envelope.run_id,
+            operation_type=envelope.operation_type,
+            caller_node_id=envelope.caller_node_id,
+            subject_node_id=envelope.subject_node_id,
+            operation_key=envelope.operation_key,
+            request_digest=envelope.request_payload_digest,
+            response=recovered,
+        )
+        return recovered
 
     def _create_spawn_locked(
         self,

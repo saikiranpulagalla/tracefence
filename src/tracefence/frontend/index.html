@@ -22,7 +22,7 @@
       <h1>TraceFence</h1>
       <p>Runtime-enforced cancellation and correction for dynamic agent graphs.</p>
     </div>
-    <span class="badge" id="health">checking control plane…</span>
+    <span class="badge" id="health" role="status" aria-live="polite">checking control plane…</span>
   </section>
 
   <section class="toolbar">
@@ -59,7 +59,7 @@
     <aside>
       <article class="panel">
         <h2>Selected node</h2>
-        <div id="nodeInspector" class="notice">Select a graph node.</div>
+        <div id="nodeInspector" class="notice" aria-live="polite">Select a graph node.</div>
         <h3>Issue control command</h3>
         <label class="field">Command<select id="commandType"><option>CORRECT_SUBTREE</option><option>CANCEL_SUBTREE</option></select></label>
         <label class="field" style="margin-top:9px">Reason code<input id="reasonCode" value="WRONG_ROOT_CAUSE"></label>
@@ -68,7 +68,7 @@
         <label class="field" style="margin-top:9px">Expected recovery tool<input id="replacementTool" value="reset_redis_pool"></label>
         <label class="field" style="margin-top:9px">Stability window (seconds)<input id="recoveryStability" type="number" min="0" max="300" value="5"></label>
         <button class="btn danger" id="commandBtn" style="margin-top:12px">Apply to selected subtree</button>
-        <div id="commandFeedback" class="muted" style="margin-top:9px;font-size:12px"></div>
+        <div id="commandFeedback" class="muted" role="status" aria-live="polite" style="margin-top:9px;font-size:12px"></div>
       </article>
 
       <article class="panel">

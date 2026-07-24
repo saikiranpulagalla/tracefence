@@ -39,7 +39,10 @@ def operator_fingerprint(operator_key: str) -> str:
 def operator_key_matches(candidate: str | None) -> bool:
     if candidate is None or not settings.operator_key:
         return False
-    return hmac.compare_digest(candidate, settings.operator_key)
+    return hmac.compare_digest(
+        candidate.encode("utf-8"),
+        settings.operator_key.encode("utf-8"),
+    )
 
 
 def payload_digest(payload: Any) -> str:

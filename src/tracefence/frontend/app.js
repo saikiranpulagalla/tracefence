@@ -11,11 +11,35 @@ const state = {
   proofCommandId: null,
   proofFetchedAt: 0,
   refreshController: null,
+  commandSubmitting: false,
 };
 
 const $ = id => document.getElementById(id);
 const short = id => id ? `${id.slice(0, 8)}…` : "—";
 const operatorKey = () => $('operatorKey').value.trim();
+
+function clearProtectedState({clearRun = true} = {}) {
+  state.refreshController?.abort();
+  state.refreshSequence += 1;
+  state.refreshInFlight = false;
+  if (clearRun) state.runId = null;
+  state.graph = null;
+  state.actions = [];
+  state.services = [];
+  state.violations = [];
+  state.selectedNode = null;
+  state.proof = null;
+  state.proofCommandId = null;
+  state.proofFetchedAt = 0;
+  $('nodeInspector').textContent = 'Select a graph node.';
+  renderGraph();
+  renderTimeline();
+  renderActions();
+  renderServices();
+  renderViolations();
+  renderProof();
+  renderMetrics();
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, char => ({
@@ -40,7 +64,10 @@ async function api(path, options = {}, {auth = true, signal} = {}) {
     try { body = await response.json(); }
     catch { body = {detail: await response.text()}; }
     const detail = body?.error?.message ?? body?.detail ?? `HTTP ${response.status}`;
-    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    const error = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    error.status = response.status;
+    if (response.status === 401 && auth) clearProtectedState();
+    throw error;
   }
   return response.status === 204 ? null : response.json();
 }
@@ -76,9 +103,9 @@ async function loadRuns(signal) {
   select.innerHTML = runs.length
     ? runs.map(run => `<option value="${escapeHtml(run.id)}">${escapeHtml(run.name)} · ${short(run.id)}</option>`).join('')
     : '<option value="">No runs</option>';
-  state.runId = previous && runs.some(run => run.id === previous)
-    ? previous
-    : (runs[0]?.id ?? null);
+  const previousAvailable = previous && runs.some(run => run.id === previous);
+  if (previous && !previousAvailable) clearProtectedState();
+  state.runId = previousAvailable ? previous : (runs[0]?.id ?? null);
   select.value = state.runId ?? '';
 }
 
@@ -156,6 +183,7 @@ function drawGraphEdges() {
 }
 
 function renderGraph() {
+  const focusedNode = document.activeElement?.dataset?.node ?? null;
   const graph = state.graph;
   if (!graph) {
     $('graph').innerHTML = '<p class="muted">No graph.</p>';
@@ -221,6 +249,9 @@ function renderGraph() {
   document.querySelectorAll('[data-node]').forEach(button => {
     button.addEventListener('click', () => selectNode(button.dataset.node));
   });
+  if (focusedNode) {
+    document.querySelector(`[data-node="${CSS.escape(focusedNode)}"]`)?.focus();
+  }
   requestAnimationFrame(drawGraphEdges);
 }
 
@@ -356,7 +387,10 @@ async function refresh({forceProof = false, supersede = false} = {}) {
       state.actions = actions;
       state.services = services;
       state.violations = violations;
-      if (state.selectedNode && !graph.nodes.some(node => node.id === state.selectedNode)) state.selectedNode = null;
+      if (state.selectedNode && !graph.nodes.some(node => node.id === state.selectedNode)) {
+        state.selectedNode = null;
+        $('nodeInspector').textContent = 'Select a graph node.';
+      }
       await maybeLoadProof(controller.signal, forceProof);
     }
     renderGraph(); renderTimeline(); renderActions(); renderServices(); renderViolations(); renderProof(); renderMetrics();
@@ -364,6 +398,7 @@ async function refresh({forceProof = false, supersede = false} = {}) {
     if (error.name !== 'AbortError') {
       $('health').textContent = error.message.includes('operator key') ? 'operator authentication required' : 'control plane unavailable';
       $('health').classList.add('error');
+      if (error.status === 401) clearProtectedState();
       console.error(error);
     }
   } finally {
@@ -374,20 +409,22 @@ async function refresh({forceProof = false, supersede = false} = {}) {
   }
 }
 
+$('operatorKey').addEventListener('input', () => clearProtectedState());
 $('operatorKey').addEventListener('change', () => refresh({forceProof: true, supersede: true}));
 $('runSelect').addEventListener('change', event => {
+  clearProtectedState();
   state.runId = event.target.value || null;
-  state.selectedNode = null;
-  state.proof = null;
-  state.proofCommandId = null;
   refresh({forceProof: true, supersede: true});
 });
 $('refreshBtn').addEventListener('click', () => refresh({forceProof: true, supersede: true}));
 $('commandBtn').addEventListener('click', async () => {
+  if (state.commandSubmitting) return;
   if (!state.selectedNode) {
     $('commandFeedback').textContent = 'Select a target node first.';
     return;
   }
+  state.commandSubmitting = true;
+  $('commandBtn').disabled = true;
   try {
     const isCorrection = $('commandType').value === 'CORRECT_SUBTREE';
     const replacementInstruction = isCorrection ? JSON.parse($('replacement').value) : null;
@@ -419,6 +456,9 @@ $('commandBtn').addEventListener('click', async () => {
     await refresh({forceProof: true});
   } catch (error) {
     $('commandFeedback').textContent = error.message;
+  } finally {
+    state.commandSubmitting = false;
+    $('commandBtn').disabled = false;
   }
 });
 

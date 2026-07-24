@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, Header
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, Query
 
 from tracefence.api.dependencies import (
     call_blocking_service,
@@ -55,8 +57,18 @@ async def review_proposal(
     "/runs/{run_id}/proposals",
     dependencies=[Depends(require_operator)],
 )
-async def list_proposals(run_id: str) -> list[dict]:
-    return await call_blocking_service(lambda: proposal_service.list_for_run(run_id))
+async def list_proposals(
+    run_id: str,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[dict]:
+    return await call_blocking_service(
+        lambda: proposal_service.list_for_run(
+            run_id,
+            limit=limit,
+            offset=offset,
+        )
+    )
 
 
 @router.post("/commands", response_model=CommandIssued, status_code=201)

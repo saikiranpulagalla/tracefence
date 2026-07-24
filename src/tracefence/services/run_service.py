@@ -16,7 +16,6 @@ from tracefence.services.common import iso_utc, utcnow
 from tracefence.services.tool_registry import TOOL_REGISTRY
 from tracefence.telemetry.instruments import telemetry
 
-
 _ALLOWED_NON_TOOL_CAPABILITIES = {"control:descendants", "tool:propose_correction"}
 
 
@@ -125,9 +124,23 @@ class RunService:
             status=RunStatus.RUNNING,
         )
 
-    async def list_runs(self) -> list[dict]:
+    async def list_runs(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
         with self.session_factory() as session:
-            rows = session.execute(select(Run).order_by(Run.created_at.desc())).scalars().all()
+            rows = (
+                session.execute(
+                    select(Run)
+                    .order_by(Run.created_at.desc())
+                    .limit(limit)
+                    .offset(offset)
+                )
+                .scalars()
+                .all()
+            )
             return [
                 {
                     "id": row.id,

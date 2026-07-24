@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import math
 import time
 from collections import OrderedDict, deque
@@ -136,32 +137,60 @@ class RateLimitMiddleware:
         requests_per_minute: int,
         proof_requests_per_minute: int,
         max_buckets: int,
+        trusted_proxy_hosts: set[str] | None = None,
     ) -> None:
         self.app = app
         self.requests_per_minute = requests_per_minute
         self.proof_requests_per_minute = proof_requests_per_minute
         self.max_buckets = max_buckets
+        self.trusted_proxy_hosts = frozenset(trusted_proxy_hosts or ())
         self._buckets: OrderedDict[str, deque[float]] = OrderedDict()
         self._lock = Lock()
 
+    def _client_host(self, scope: Scope) -> str:
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        client = scope.get("client")
+        direct_host = client[0] if isinstance(client, tuple) and client else "unknown"
+        if direct_host in self.trusted_proxy_hosts:
+            forwarded = headers.get(b"x-forwarded-for", b"").split(b",", 1)[0].strip()
+            try:
+                return str(ipaddress.ip_address(forwarded.decode("ascii")))
+            except (UnicodeDecodeError, ValueError):
+                pass
+        return str(direct_host)
+
     @staticmethod
-    def _principal_key(scope: Scope) -> str:
+    def _operator_key(scope: Scope) -> str | None:
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
         operator_raw = headers.get(b"x-operator-key")
         if operator_raw is not None:
-            operator = operator_raw.decode("utf-8", errors="replace")
+            try:
+                operator = operator_raw.decode("ascii")
+            except UnicodeDecodeError:
+                return None
             if operator_key_matches(operator):
                 digest = hashlib.sha256(operator_raw).hexdigest()[:24]
                 return "operator:" + digest
+        return None
 
-        # Node credentials cannot be authenticated safely in middleware without a
-        # database lookup. Keying on caller-supplied node IDs or token strings would
-        # let an attacker rotate arbitrary values to evade limits and churn the LRU
-        # bucket map. Unauthenticated and node traffic is therefore bounded by the
-        # network principal until route-level authentication succeeds.
-        client = scope.get("client")
-        host = client[0] if isinstance(client, tuple) and client else "unknown"
-        return "client:" + str(host)
+    def _consume(self, key: str, limit: int, now: float) -> int:
+        cutoff = now - 60.0
+        retry_after = 0
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            if len(self._buckets) >= self.max_buckets:
+                self._buckets.popitem(last=False)
+            bucket = deque()
+            self._buckets[key] = bucket
+        else:
+            self._buckets.move_to_end(key)
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            retry_after = max(1, math.ceil(60.0 - (now - bucket[0])))
+        else:
+            bucket.append(now)
+        return retry_after
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -173,30 +202,26 @@ class RateLimitMiddleware:
             return
 
         is_proof = path.startswith("/v1/commands/") and path.endswith("/proof")
-        limit = (
-            self.proof_requests_per_minute if is_proof else self.requests_per_minute
-        )
-        namespace = "proof" if is_proof else "api"
-        key = f"{namespace}:{self._principal_key(scope)}"
         now = time.monotonic()
-        cutoff = now - 60.0
         retry_after = 0
 
         with self._lock:
-            bucket = self._buckets.get(key)
-            if bucket is None:
-                if len(self._buckets) >= self.max_buckets:
-                    self._buckets.popitem(last=False)
-                bucket = deque()
-                self._buckets[key] = bucket
-            else:
-                self._buckets.move_to_end(key)
-            while bucket and bucket[0] <= cutoff:
-                bucket.popleft()
-            if len(bucket) >= limit:
-                retry_after = max(1, math.ceil(60.0 - (now - bucket[0])))
-            else:
-                bucket.append(now)
+            retry_after = self._consume(
+                f"ip-abuse:{self._client_host(scope)}",
+                self.requests_per_minute,
+                now,
+            )
+            operator = self._operator_key(scope)
+            if not retry_after and operator is not None:
+                retry_after = self._consume(
+                    f"{'proof' if is_proof else 'operator'}:{operator}",
+                    (
+                        self.proof_requests_per_minute
+                        if is_proof
+                        else self.requests_per_minute
+                    ),
+                    now,
+                )
 
         if retry_after:
             response = JSONResponse(
@@ -228,6 +253,7 @@ class SecurityHeadersMiddleware:
         async def secure_send(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
+                path = str(scope.get("path", ""))
                 headers.extend(
                     [
                         (
@@ -241,6 +267,14 @@ class SecurityHeadersMiddleware:
                         (b"cross-origin-opener-policy", b"same-origin"),
                     ]
                 )
+                if path == "/health" or path.startswith("/v1/"):
+                    if not any(
+                        key.lower() == b"cache-control"
+                        for key, _value in headers
+                    ):
+                        headers.append(
+                            (b"cache-control", b"no-store, private")
+                        )
                 message["headers"] = headers
             await send(message)
 

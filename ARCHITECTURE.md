@@ -270,6 +270,7 @@ validate live scopes
 → verify postcondition
 ```
 
-Production should also replace SQLite with PostgreSQL, add formal migrations, use an identity
-provider and per-run authorization, deploy a shared rate limiter, and cryptographically bind
+TraceFence now ships formal Alembic migrations for its supported SQLite schema. Production-scale
+evolution would require a separately implemented and tested PostgreSQL/HA persistence layer, an
+identity provider and per-run authorization, a shared rate limiter, and cryptographic binding of
 worker runtime/image versions when remote attestation is available.

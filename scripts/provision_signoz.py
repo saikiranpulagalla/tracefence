@@ -10,8 +10,10 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from tracefence.evidence import _atomic_private_write
+
 DASHBOARD_TITLE = "TraceFence Control Integrity"
-ALERT_CHANNEL_TOKEN = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
+ALERT_CHANNEL_PLACEHOLDER = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
 REQUIRED_TOOLS = {
     "signoz_list_metrics",
     "signoz_list_dashboards",
@@ -217,7 +219,10 @@ def _validate_alerts(alerts: list[dict[str, Any]]) -> None:
         thresholds = alert["condition"].get("thresholds", {}).get("spec", [])
         if not thresholds:
             raise ValueError(f"Alert {name} has no threshold tier")
-        if not any(ALERT_CHANNEL_TOKEN in tier.get("channels", []) for tier in thresholds):
+        if not any(
+            ALERT_CHANNEL_PLACEHOLDER in tier.get("channels", [])
+            for tier in thresholds
+        ):
             raise ValueError(f"Alert {name} must use the notification-channel placeholder")
 
 
@@ -226,7 +231,7 @@ def _substitute_channel(value: Any, channel: str) -> Any:
         return {key: _substitute_channel(item, channel) for key, item in value.items()}
     if isinstance(value, list):
         return [_substitute_channel(item, channel) for item in value]
-    return channel if value == ALERT_CHANNEL_TOKEN else value
+    return channel if value == ALERT_CHANNEL_PLACEHOLDER else value
 
 
 def _prepare_alert_payload(
@@ -286,8 +291,12 @@ async def provision(
         return 1
 
     mcp_url = os.getenv("SIGNOZ_MCP_URL", "http://localhost:8000/mcp")
-    dashboard = json.loads(dashboard_path.read_text())
-    alerts = json.loads(alerts_path.read_text())
+    dashboard_text, alerts_text = await asyncio.gather(
+        asyncio.to_thread(dashboard_path.read_text),
+        asyncio.to_thread(alerts_path.read_text),
+    )
+    dashboard = json.loads(dashboard_text)
+    alerts = json.loads(alerts_text)
     _validate_dashboard(dashboard)
     _validate_alerts(alerts)
 
@@ -469,8 +478,10 @@ async def provision(
                         }
                     )
 
-    evidence_path.parent.mkdir(parents=True, exist_ok=True)
-    evidence_path.write_text(json.dumps(evidence, indent=2, default=str) + "\n")
+    _atomic_private_write(
+        evidence_path,
+        (json.dumps(evidence, indent=2, default=str) + "\n").encode("utf-8"),
+    )
     print(f"PASS Dashboard: {evidence['dashboard']['status']}")
     for alert in evidence["alerts"]:
         print(f"PASS Alert {alert['name']}: {alert['status']}")

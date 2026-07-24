@@ -6,12 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.helpers import create_seeded_run
 from tracefence.api.middleware import RateLimitMiddleware
 from tracefence.domain.errors import NotFoundError
 from tracefence.evidence import EvidenceIntegrityError, resolve_evidence_path, write_evidence_bundle
 from tracefence.services.graph_service import GraphService
 from tracefence.services.proposal_service import ProposalService
-from tests.helpers import create_seeded_run
 
 
 async def _asgi_request(
@@ -298,11 +298,18 @@ async def test_readiness_requires_empty_outbox_when_otlp_is_configured(monkeypat
 
     monkeypatch.setattr(health, "settings", replace(settings, otlp_endpoint="http://otel"))
     monkeypatch.setattr(health, "_database_ready", lambda: True)
+    monkeypatch.setattr(health, "_database_readable", lambda: True)
+    monkeypatch.setattr(health, "_database_writable", lambda: True)
     monkeypatch.setattr(health.control_plane_runtime, "probe", healthy_probe)
     monkeypatch.setattr(
         health,
         "telemetry_health",
-        lambda: {"status": "READY", "configured": True, "errors": []},
+        lambda: {
+            "status": "READY",
+            "configured": True,
+            "errors": [],
+            "last_successful_flush_at": datetime.now(UTC).isoformat(),
+        },
     )
     request = SimpleNamespace(
         app=SimpleNamespace(
@@ -505,3 +512,154 @@ def test_evidence_verifier_resolves_replacement_from_final_graph_state():
     }
     command, replacement = _resolve_command_replacement(graph, "command-1")
     assert command["replacement_node_id"] == replacement["id"]
+
+
+def test_evidence_requires_complete_artifact_set(tmp_path: Path, monkeypatch):
+    from tracefence.evidence import _manifest_signature, verify_manifest
+
+    key = "f" * 32
+    monkeypatch.setattr(
+        "tracefence.evidence._git_metadata",
+        lambda _repo: {"commit": "a" * 40, "dirty": False},
+    )
+    pointer = write_evidence_bundle(
+        tmp_path,
+        _minimal_bundle(),
+        repo_dir=tmp_path,
+        signing_key=key,
+    )
+    pointer_value = json.loads(pointer.read_text(encoding="utf-8"))
+    bundle_dir = tmp_path / pointer_value["bundle_dir"]
+    manifest = json.loads(
+        (bundle_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    manifest["files"].pop("run.json")
+    manifest["signature"]["value"] = _manifest_signature(
+        manifest,
+        key.encode(),
+    )
+
+    with pytest.raises(EvidenceIntegrityError, match="complete fixed artifact set"):
+        verify_manifest(bundle_dir, manifest, signing_key=key)
+
+
+def test_evidence_cross_checks_artifacts_against_bundle(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from tracefence.evidence import (
+        _manifest_signature,
+        sha256_file,
+        verify_manifest,
+    )
+
+    key = "g" * 32
+    monkeypatch.setattr(
+        "tracefence.evidence._git_metadata",
+        lambda _repo: {"commit": "a" * 40, "dirty": False},
+    )
+    pointer = write_evidence_bundle(
+        tmp_path,
+        _minimal_bundle(),
+        repo_dir=tmp_path,
+        signing_key=key,
+    )
+    pointer_value = json.loads(pointer.read_text(encoding="utf-8"))
+    bundle_dir = tmp_path / pointer_value["bundle_dir"]
+    manifest = json.loads(
+        (bundle_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    (bundle_dir / "run.json").write_text(
+        json.dumps({"run_id": "different-run"}),
+        encoding="utf-8",
+    )
+    manifest["files"]["run.json"] = sha256_file(bundle_dir / "run.json")
+    manifest["signature"]["value"] = _manifest_signature(
+        manifest,
+        key.encode(),
+    )
+
+    with pytest.raises(EvidenceIntegrityError, match="does not match bundle"):
+        verify_manifest(bundle_dir, manifest, signing_key=key)
+
+
+def test_evidence_files_are_private_and_secret_flags_are_absent(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import os
+    import stat
+
+    monkeypatch.setattr(
+        "tracefence.evidence._git_metadata",
+        lambda _repo: {"commit": "a" * 40, "dirty": False},
+    )
+    pointer = write_evidence_bundle(
+        tmp_path,
+        _minimal_bundle(),
+        repo_dir=tmp_path,
+        signing_key="h" * 32,
+    )
+    pointer_value = json.loads(pointer.read_text(encoding="utf-8"))
+    bundle_dir = tmp_path / pointer_value["bundle_dir"]
+    for artifact in (*bundle_dir.iterdir(), pointer):
+        mode = artifact.stat().st_mode
+        if os.name != "nt":
+            assert mode & stat.S_IROTH == 0
+            assert mode & stat.S_IWOTH == 0
+
+    root = Path(__file__).resolve().parents[2]
+    for script in (
+        root / "scripts" / "run_scenario.py",
+        root / "scripts" / "verify_end_to_end.py",
+        root / "scripts" / "verify_signoz.py",
+    ):
+        source = script.read_text(encoding="utf-8")
+        assert "--operator-key" not in source
+        assert "--evidence-signing-key" not in source
+
+
+def test_evidence_rejects_inherited_git_and_wrong_live_api(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from tracefence.evidence import validate_evidence_generation
+
+    source_only = tmp_path / "source-only"
+    source_only.mkdir()
+    with pytest.raises(EvidenceIntegrityError, match="Git repository"):
+        validate_evidence_generation(
+            source_only,
+            signing_key="i" * 32,
+        )
+
+    monkeypatch.setattr(
+        "tracefence.evidence._git_metadata",
+        lambda _repo: {"commit": "a" * 40, "dirty": False},
+    )
+    pointer = write_evidence_bundle(
+        tmp_path / "evidence",
+        _minimal_bundle(),
+        repo_dir=tmp_path,
+        signing_key="i" * 32,
+        live_api_url="https://tracefence.example",
+    )
+    with pytest.raises(EvidenceIntegrityError, match="live API"):
+        resolve_evidence_path(
+            pointer,
+            signing_key="i" * 32,
+            expected_live_api_url="https://other.example",
+        )
+
+
+def test_make_release_verification_binds_fresh_commit_and_live_api():
+    makefile = (
+        Path(__file__).resolve().parents[2] / "Makefile"
+    ).read_text(encoding="utf-8")
+
+    assert "TRACEFENCE_EXPECTED_EVIDENCE_COMMIT=$(EXPECTED_COMMIT)" in makefile
+    assert (
+        "TRACEFENCE_EVIDENCE_MAX_AGE_SECONDS=$(EVIDENCE_MAX_AGE_SECONDS)"
+        in makefile
+    )
+    assert "--api-url $(API_URL)" in makefile

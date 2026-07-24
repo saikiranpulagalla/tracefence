@@ -6,10 +6,19 @@ from uuid import uuid4
 from sqlalchemy import select, text
 from sqlalchemy.orm import sessionmaker
 
-from tracefence.db.models import ActionAttempt, ActionCommandMatch, CommandAcknowledgement, Node, SpawnIntent
 from tracefence.config import settings
-from tracefence.domain.enums import AckType, NodeStatus
+from tracefence.db.models import (
+    ActionAttempt,
+    ActionCommandMatch,
+    CommandAcknowledgement,
+    ControlCommand,
+    Node,
+    Run,
+    SpawnIntent,
+)
+from tracefence.domain.enums import AckType, NodeStatus, ReplacementStatus, RunStatus
 from tracefence.services.common import commands_for_scope_mismatches, evaluate_scopes, utcnow
+from tracefence.services.run_lifecycle import transition_run
 from tracefence.telemetry.instruments import telemetry, update_runtime_gauges
 
 logger = logging.getLogger(__name__)
@@ -49,6 +58,31 @@ class LeaseService:
 
                 for node in [*nodes, *pending_nodes]:
                     node.status = NodeStatus.LEASE_EXPIRED
+                    if node.caused_by_command_id is not None:
+                        command = session.get(
+                            ControlCommand,
+                            node.caused_by_command_id,
+                        )
+                        if (
+                            command is not None
+                            and command.replacement_node_id == node.id
+                            and command.replacement_status == ReplacementStatus.PENDING
+                        ):
+                            command.replacement_status = (
+                                ReplacementStatus.ACTIVATION_EXPIRED
+                            )
+                    run = session.get(Run, node.run_id)
+                    if (
+                        run is not None
+                        and run.root_node_id == node.id
+                        and run.status == RunStatus.RUNNING
+                    ):
+                        transition_run(
+                            session,
+                            run,
+                            RunStatus.FAILED,
+                            finished_at=now,
+                        )
                     evaluation = await evaluate_scopes(session, node)
                     commands = await commands_for_scope_mismatches(
                         session, evaluation.mismatches, run_id=node.run_id

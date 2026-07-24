@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import shutil
-import subprocess
+import subprocess  # nosec B404
+import tempfile
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -13,9 +15,39 @@ from typing import Any
 from tracefence.config import settings
 from tracefence.db.engine import SCHEMA_VERSION
 
+# Security: Git is resolved with shutil.which and receives fixed internal arguments.
+
 
 class EvidenceIntegrityError(RuntimeError):
     pass
+
+
+REQUIRED_ARTIFACTS = frozenset(
+    {
+        "actions.json",
+        "bundle.json",
+        "command.json",
+        "graph.json",
+        "proof.json",
+        "recovery.json",
+        "run.json",
+        "services.json",
+        "sibling-check.json",
+        "violations.json",
+        "worker-output.txt",
+    }
+)
+_BUNDLE_ARTIFACTS = {
+    "actions.json": "actions",
+    "command.json": "command",
+    "graph.json": "graph",
+    "proof.json": "proof",
+    "recovery.json": "recovery",
+    "run.json": "run",
+    "services.json": "services",
+    "sibling-check.json": "sibling_check",
+    "violations.json": "violations",
+}
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -42,12 +74,17 @@ def sha256_file(path: Path) -> str:
 
 def _git_metadata(repo_dir: Path) -> dict[str, Any]:
     git = shutil.which("git")
+    repo_dir = repo_dir.resolve()
+    provenance = repo_dir / ".git"
+    if not provenance.exists():
+        return {"commit": None, "dirty": None}
 
     def run(*args: str) -> str | None:
         if git is None:
             return None
         try:
-            completed = subprocess.run(  # nosec B603 - executable resolved via shutil.which; args are internal constants
+            # Security: executable is resolved via shutil.which; arguments are constants.
+            completed = subprocess.run(  # nosec B603
                 [git, *args],
                 cwd=repo_dir,
                 check=True,
@@ -59,6 +96,9 @@ def _git_metadata(repo_dir: Path) -> dict[str, Any]:
             return None
         return completed.stdout.strip()
 
+    top_level = run("rev-parse", "--show-toplevel")
+    if top_level is None or Path(top_level).resolve() != repo_dir:
+        return {"commit": None, "dirty": None}
     commit = run("rev-parse", "HEAD")
     status = run("status", "--porcelain")
     return {
@@ -114,12 +154,46 @@ def _pointer_signature(pointer: dict[str, Any], key: bytes) -> str:
     return hmac.new(key, canonical_json_bytes(unsigned), hashlib.sha256).hexdigest()
 
 
+def _atomic_private_write(path: Path, content: bytes) -> None:
+    """Write an evidence artifact durably without exposing a partial file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.chmod(temporary_path, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        os.chmod(path, 0o600)
+        if os.name != "nt":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def write_evidence_bundle(
     output_dir: Path,
     bundle: dict[str, Any],
     *,
     repo_dir: Path | None = None,
     signing_key: str | None = None,
+    live_api_url: str | None = None,
 ) -> Path:
     git_metadata, key = validate_evidence_generation(
         repo_dir or Path.cwd(),
@@ -133,7 +207,8 @@ def write_evidence_bundle(
     while bundle_dir.exists():
         suffix += 1
         bundle_dir = output_dir / f"{directory_name}-{suffix}"
-    bundle_dir.mkdir(parents=True, exist_ok=False)
+    bundle_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+    os.chmod(bundle_dir, 0o700)
 
     artifacts: dict[str, Any] = {
         "run.json": bundle["run"],
@@ -148,9 +223,13 @@ def write_evidence_bundle(
         "bundle.json": bundle,
     }
     for filename, value in artifacts.items():
-        (bundle_dir / filename).write_bytes(canonical_json_bytes(value) + b"\n")
-    (bundle_dir / "worker-output.txt").write_text(
-        str(bundle.get("worker_output", "")), encoding="utf-8"
+        _atomic_private_write(
+            bundle_dir / filename,
+            canonical_json_bytes(value) + b"\n",
+        )
+    _atomic_private_write(
+        bundle_dir / "worker-output.txt",
+        str(bundle.get("worker_output", "")).encode("utf-8"),
     )
 
     files = sorted(path.name for path in bundle_dir.iterdir() if path.is_file())
@@ -159,6 +238,7 @@ def write_evidence_bundle(
         "generated_at": generated_at.isoformat(),
         "application_version": _application_version(),
         "schema_version": SCHEMA_VERSION,
+        "live_api_url": live_api_url.rstrip("/") if live_api_url else None,
         "run_id": bundle["run"]["run_id"],
         "command_id": bundle["command"]["command_id"],
         "git": git_metadata,
@@ -170,7 +250,10 @@ def write_evidence_bundle(
         "value": _manifest_signature(manifest, key),
     }
     manifest_path = bundle_dir / "manifest.json"
-    manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+    _atomic_private_write(
+        manifest_path,
+        canonical_json_bytes(manifest) + b"\n",
+    )
 
     pointer = {
         "pointer_version": 2,
@@ -183,9 +266,10 @@ def write_evidence_bundle(
         "key_id": sha256_bytes(key)[:16],
         "value": _pointer_signature(pointer, key),
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(output_dir, 0o700)
     latest_path = output_dir / "latest.json"
-    latest_path.write_bytes(canonical_json_bytes(pointer) + b"\n")
+    _atomic_private_write(latest_path, canonical_json_bytes(pointer) + b"\n")
     return latest_path
 
 
@@ -196,6 +280,7 @@ def resolve_evidence_path(
     signing_key: str | None = None,
     expected_commit: str | None = None,
     max_age_seconds: int | None = None,
+    expected_live_api_url: str | None = None,
 ) -> tuple[Path, dict[str, Any] | None]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(value, dict) and value.get("pointer_version") == 2:
@@ -234,6 +319,7 @@ def resolve_evidence_path(
             signing_key=signing_key,
             expected_commit=expected_commit,
             max_age_seconds=max_age_seconds,
+            expected_live_api_url=expected_live_api_url,
         )
         bundle_path = bundle_dir / "bundle.json"
         if sha256_file(bundle_path) != value.get("bundle_sha256"):
@@ -253,6 +339,7 @@ def verify_manifest(
     signing_key: str | None = None,
     expected_commit: str | None = None,
     max_age_seconds: int | None = None,
+    expected_live_api_url: str | None = None,
 ) -> None:
     if manifest.get("manifest_version") != 2:
         raise EvidenceIntegrityError("Unsupported or unsigned evidence manifest version")
@@ -260,6 +347,16 @@ def verify_manifest(
         raise EvidenceIntegrityError(
             "Evidence schema version does not match the running application"
         )
+    if manifest.get("application_version") != _application_version():
+        raise EvidenceIntegrityError(
+            "Evidence application version does not match the running application"
+        )
+    if expected_live_api_url is not None:
+        expected_url = expected_live_api_url.rstrip("/")
+        if manifest.get("live_api_url") != expected_url:
+            raise EvidenceIntegrityError(
+                "Evidence live API does not match the authenticated verification target"
+            )
     generated_at_raw = manifest.get("generated_at")
     if not isinstance(generated_at_raw, str):
         raise EvidenceIntegrityError("Evidence manifest generation time is missing")
@@ -303,6 +400,10 @@ def verify_manifest(
     files = manifest.get("files")
     if not isinstance(files, dict) or "bundle.json" not in files:
         raise EvidenceIntegrityError("Evidence manifest has no file digest map")
+    if set(files) != REQUIRED_ARTIFACTS:
+        raise EvidenceIntegrityError(
+            "Evidence manifest does not contain the complete fixed artifact set"
+        )
     for filename, expected in files.items():
         if not isinstance(filename, str) or Path(filename).name != filename:
             raise EvidenceIntegrityError("Evidence manifest contains an unsafe filename")
@@ -314,6 +415,25 @@ def verify_manifest(
             raise EvidenceIntegrityError(f"Evidence artifact digest mismatch: {filename}")
 
     bundle = json.loads((bundle_dir / "bundle.json").read_text(encoding="utf-8"))
+    for filename, bundle_key in _BUNDLE_ARTIFACTS.items():
+        artifact = json.loads(
+            (bundle_dir / filename).read_text(encoding="utf-8")
+        )
+        expected_value = bundle.get(
+            bundle_key,
+            [] if bundle_key == "violations" else None,
+        )
+        if artifact != expected_value:
+            raise EvidenceIntegrityError(
+                f"Evidence artifact {filename} does not match bundle.json"
+            )
+    worker_output = (bundle_dir / "worker-output.txt").read_text(
+        encoding="utf-8"
+    )
+    if worker_output != str(bundle.get("worker_output", "")):
+        raise EvidenceIntegrityError(
+            "Evidence artifact worker-output.txt does not match bundle.json"
+        )
     if bundle.get("run", {}).get("run_id") != manifest.get("run_id"):
         raise EvidenceIntegrityError("Manifest run ID does not match bundle")
     if bundle.get("command", {}).get("command_id") != manifest.get("command_id"):

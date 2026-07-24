@@ -47,6 +47,29 @@ def _resolve_command_replacement(
     return graph_command, replacement
 
 
+def _verify_telemetry_gate(
+    proof: dict[str, Any],
+    *,
+    require_telemetry: bool,
+) -> None:
+    telemetry_verdict = proof["telemetry_verdict"]
+    overall_verdict = proof["overall_verdict"]
+    if require_telemetry:
+        check(telemetry_verdict == "VERIFIED", "SigNoz telemetry proof is verified")
+        check(overall_verdict == "VERIFIED", "overall proof is verified")
+        check(bool(proof["trace_ids"]), "SigNoz trace IDs are present")
+        return
+
+    check(
+        telemetry_verdict in {"UNAVAILABLE", "PARTIAL", "VERIFIED"},
+        "telemetry has no contradictory or incomplete evidence",
+    )
+    check(
+        overall_verdict == telemetry_verdict,
+        "overall proof follows the canonical verdict lattice",
+    )
+
+
 def _verify_internal_consistency(bundle: dict[str, Any], require_telemetry: bool) -> None:
     proof = bundle["proof"]
     actions = bundle["actions"]
@@ -182,15 +205,7 @@ def _verify_internal_consistency(bundle: dict[str, Any], require_telemetry: bool
         "recovery postconditions are causally bound to the authorized action",
     )
 
-    if require_telemetry:
-        check(proof["telemetry_verdict"] == "VERIFIED", "SigNoz telemetry proof is verified")
-        check(proof["overall_verdict"] == "VERIFIED", "overall proof is verified")
-        check(bool(proof["trace_ids"]), "SigNoz trace IDs are present")
-    else:
-        check(
-            proof["overall_verdict"] in {"PARTIAL", "VERIFIED"},
-            "overall proof truthfully reflects telemetry availability",
-        )
+    _verify_telemetry_gate(proof, require_telemetry=require_telemetry)
 
 
 def _load_bundle(
@@ -199,12 +214,14 @@ def _load_bundle(
     *,
     expected_commit: str | None,
     max_age_seconds: int | None,
+    expected_live_api_url: str | None,
 ) -> dict[str, Any]:
     resolved, manifest = resolve_evidence_path(
         path,
         signing_key=signing_key,
         expected_commit=expected_commit,
         max_age_seconds=max_age_seconds,
+        expected_live_api_url=expected_live_api_url,
     )
     if manifest is not None:
         print(f"PASS evidence manifest integrity ({manifest['generated_at']})")
@@ -250,6 +267,7 @@ def verify(
         evidence_signing_key,
         expected_commit=expected_commit,
         max_age_seconds=max_age_seconds,
+        expected_live_api_url=api_url,
     )
     _verify_internal_consistency(bundle, require_telemetry)
     if api_url is not None:
@@ -268,12 +286,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle", type=Path, default=Path("evidence/latest.json"))
     parser.add_argument("--require-telemetry", action="store_true")
-    parser.add_argument("--api-url")
-    parser.add_argument("--operator-key", default=os.getenv("TRACEFENCE_OPERATOR_KEY", ""))
-    parser.add_argument(
-        "--evidence-signing-key",
-        default=os.getenv("TRACEFENCE_EVIDENCE_SIGNING_KEY", ""),
-    )
+    parser.add_argument("--api-url", required=True)
     parser.add_argument(
         "--expected-commit",
         default=os.getenv("TRACEFENCE_EXPECTED_EVIDENCE_COMMIT", "") or None,
@@ -285,12 +298,23 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
+        if not args.expected_commit:
+            raise VerificationError(
+                "TRACEFENCE_EXPECTED_EVIDENCE_COMMIT is required"
+            )
+        if args.max_age_seconds is None:
+            raise VerificationError(
+                "TRACEFENCE_EVIDENCE_MAX_AGE_SECONDS is required"
+            )
         verify(
             args.bundle,
             args.require_telemetry,
             api_url=args.api_url,
-            operator_key=args.operator_key,
-            evidence_signing_key=args.evidence_signing_key,
+            operator_key=os.getenv("TRACEFENCE_OPERATOR_KEY", ""),
+            evidence_signing_key=os.getenv(
+                "TRACEFENCE_EVIDENCE_SIGNING_KEY",
+                "",
+            ),
             expected_commit=args.expected_commit,
             max_age_seconds=args.max_age_seconds,
         )

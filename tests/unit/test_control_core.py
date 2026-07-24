@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from tests.helpers import activate, create_seeded_run
+from tracefence.db.models import ActionAttempt
 from tracefence.domain.enums import ActionDecision, CommandType, IssuerType, ProofVerdict
 from tracefence.domain.schemas import ActionExecute, CommandCreate, Principal, SpawnCreate
-from tracefence.db.models import ActionAttempt
 from tracefence.services.action_gateway import ActionGateway
 from tracefence.services.control_service import ControlService
 from tracefence.services.graph_service import GraphService
@@ -10,7 +11,6 @@ from tracefence.services.proof_service import ProofService
 from tracefence.services.spawn_service import SpawnService
 from tracefence.services.state_service import StateService
 from tracefence.signoz.mcp_client import TelemetryProof
-from tests.helpers import activate, create_seeded_run
 
 
 async def test_hierarchical_scope_blocks_stale_descendant_and_preserves_sibling(
@@ -192,7 +192,7 @@ async def test_correction_replacement_and_recovery_are_proven(session_factory):
     assert proof.recovery_outcome_verdict == ProofVerdict.VERIFIED
     assert proof.runtime_verdict == ProofVerdict.VERIFIED
     assert proof.telemetry_verdict == ProofVerdict.UNAVAILABLE
-    assert proof.overall_verdict == ProofVerdict.PARTIAL
+    assert proof.overall_verdict == ProofVerdict.UNAVAILABLE
     assert proof.affected_registered_nodes == 2
     assert proof.classifications["ACKNOWLEDGED"] == 1
     assert proof.classifications["BLOCKED_AT_GATEWAY"] == 1

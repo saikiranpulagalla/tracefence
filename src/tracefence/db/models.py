@@ -74,6 +74,12 @@ class Run(Base):
     run_scope_id: Mapped[str] = mapped_column(String(36), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    proof_revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
 
 
 class Node(Base):
@@ -123,9 +129,9 @@ class Node(Base):
             "status != 'COMPLETED' OR completed_at IS NOT NULL",
             name="ck_node_completion_shape",
         ),
-        UniqueConstraint("caused_by_command_id", name="uq_node_replacement_command"),
         Index("ix_nodes_run", "run_id"),
         Index("ix_nodes_parent", "parent_id"),
+        Index("ix_nodes_caused_by_command", "caused_by_command_id"),
         Index("ix_nodes_lineage", "lineage_path"),
         Index("ix_nodes_lease", "lease_expires_at"),
         Index("ix_nodes_status", "status"),
@@ -216,6 +222,45 @@ class SpawnIntent(Base):
     trace_context_json: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class CredentialRecoveryEnvelope(Base):
+    __tablename__ = "credential_recovery_envelopes"
+    __table_args__ = (
+        UniqueConstraint(
+            "operation_type",
+            "caller_node_id",
+            "operation_key",
+            name="uq_credential_recovery_operation",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "caller_node_id"],
+            ["nodes.run_id", "nodes.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "subject_node_id"],
+            ["nodes.run_id", "nodes.id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "operation_type IN ('SPAWN','REPLACEMENT','ACTIVATION')",
+            name="ck_credential_recovery_operation_type",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    operation_type: Mapped[str] = mapped_column(String(24))
+    caller_node_id: Mapped[str] = mapped_column(String(36))
+    subject_node_id: Mapped[str] = mapped_column(String(36))
+    operation_key: Mapped[str] = mapped_column(String(160))
+    request_payload_digest: Mapped[str] = mapped_column(String(64))
+    nonce: Mapped[str] = mapped_column(String(24))
+    ciphertext: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class CorrectionProposal(Base):
@@ -337,12 +382,18 @@ class ControlCommand(Base):
         CheckConstraint(
             "(command_type = 'CORRECT_SUBTREE' AND replacement_parent_id IS NOT NULL "
             "AND replacement_instruction_json IS NOT NULL "
-            "AND replacement_manifest_json IS NOT NULL AND replacement_manifest_digest IS NOT NULL) OR "
+            "AND replacement_manifest_json IS NOT NULL AND replacement_manifest_digest IS NOT NULL "
+            "AND replacement_status IS NOT NULL) OR "
             "(command_type != 'CORRECT_SUBTREE' AND replacement_parent_id IS NULL "
             "AND replacement_instruction_json IS NULL AND replacement_expected_tool IS NULL "
             "AND replacement_manifest_json IS NULL AND replacement_manifest_digest IS NULL "
-            "AND replacement_node_id IS NULL)",
+            "AND replacement_node_id IS NULL AND replacement_status IS NULL)",
             name="ck_command_replacement_shape",
+        ),
+        CheckConstraint(
+            "replacement_status IS NULL OR replacement_status IN "
+            "('PENDING','ACTIVATION_EXPIRED','ACTIVE','COMPLETED','FAILED')",
+            name="ck_command_replacement_status",
         ),
     )
 
@@ -371,6 +422,7 @@ class ControlCommand(Base):
     )
     replacement_manifest_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     replacement_node_id: Mapped[str | None] = mapped_column(String(36), nullable=True, unique=True)
+    replacement_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -580,7 +632,13 @@ class TelemetryOutbox(Base):
             "(delivered_at IS NULL) OR (attempts >= 1 AND last_error IS NULL)",
             name="ck_outbox_delivery_shape",
         ),
+        CheckConstraint(
+            "(claim_owner IS NULL AND claim_expires_at IS NULL) OR "
+            "(claim_owner IS NOT NULL AND claim_expires_at IS NOT NULL)",
+            name="ck_outbox_claim_shape",
+        ),
         Index("ix_telemetry_outbox_pending", "delivered_at", "created_at"),
+        Index("ix_telemetry_outbox_claim", "delivered_at", "next_attempt_at", "claim_expires_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -592,6 +650,10 @@ class TelemetryOutbox(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    claim_owner: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class ServiceState(Base):

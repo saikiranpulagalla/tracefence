@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from tests.helpers import activate, create_seeded_run
 from tracefence.db.models import ServiceState
 from tracefence.domain.enums import CommandType, IssuerType, ProofVerdict
 from tracefence.domain.errors import ConflictError
@@ -12,7 +13,6 @@ from tracefence.services.control_service import ControlService
 from tracefence.services.proof_service import ProofService
 from tracefence.services.spawn_service import SpawnService
 from tracefence.services.state_service import StateService
-from tests.helpers import activate, create_seeded_run
 
 
 async def _corrected_recovery(session_factory, *, key: str = "proof-contract"):
@@ -94,9 +94,9 @@ async def test_recovery_proof_rechecks_current_authoritative_postconditions(sess
 
     second = await proofs.build(command.command_id)
     assert second.recovery_action_verdict == ProofVerdict.VERIFIED
-    assert second.recovery_postcondition_verdict == ProofVerdict.INCOMPLETE
-    assert second.recovery_outcome_verdict == ProofVerdict.INCOMPLETE
-    assert second.runtime_verdict == ProofVerdict.INCOMPLETE
+    assert second.recovery_postcondition_verdict == ProofVerdict.INCONSISTENT
+    assert second.recovery_outcome_verdict == ProofVerdict.INCONSISTENT
+    assert second.runtime_verdict == ProofVerdict.INCONSISTENT
     assert any("Recovery postcondition failed" in item for item in second.discrepancies)
 
 

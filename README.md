@@ -65,7 +65,8 @@ Detailed design: [`ARCHITECTURE.md`](ARCHITECTURE.md). Security model:
 ## Implemented safety properties
 
 - All protected operator endpoints require `X-Operator-Key`.
-- Node and activation credentials are returned once and stored only as HMAC-SHA256 digests.
+- Node and activation credentials are stored only as HMAC-SHA256 digests; exact
+  idempotent retries can recover them from short-lived AES-GCM response envelopes.
 - Activation-token consumption is serialized and succeeds at most once under concurrency.
 - Expired leases and expired unactivated spawn intents cannot be revived.
 - `CANCEL_RUN` is restricted to the human operator or root coordinator and must target the root.
@@ -85,7 +86,7 @@ Detailed design: [`ARCHITECTURE.md`](ARCHITECTURE.md). Security model:
 - A supervised invariant auditor persists stale-commit violations and an at-least-once
   telemetry outbox independently of proof requests.
 - Request-body size and process-local rate limits are enforced before route execution.
-- Database schema version **13** validates required tables, columns, indexes, foreign keys and
+- Database schema version **17** validates required tables, columns, indexes, foreign keys and
   check constraints and fails closed on incompatible databases.
 - Missing, ambiguous or contradictory SigNoz evidence cannot become `VERIFIED`.
 
@@ -121,10 +122,11 @@ make install-full    # runtime + test/static tools + MCP/OTel instrumentation
 cp .env.example .env
 python -c "import secrets; print(secrets.token_urlsafe(32))"  # operator key
 python -c "import secrets; print(secrets.token_urlsafe(48))"  # token hash secret
+python -c "import secrets; print(secrets.token_urlsafe(48))"  # credential recovery key
 python -c "import secrets; print(secrets.token_urlsafe(48))"  # evidence signing key
 ```
 
-Use three independently generated values. Export the file in each terminal:
+Use four independently generated values. Export the file in each terminal:
 
 ```bash
 set -a
@@ -137,6 +139,18 @@ Outside `TRACEFENCE_ENV=test`, startup fails closed when secrets are missing, to
 placeholder-like or reused across trust domains. Invalid boolean/integer environment values
 also fail closed.
 
+Credential-bearing spawn, replacement and activation requests should always supply a stable
+`operation_key`. Before commit, a failure rolls back the node, token digest and envelope
+together. After commit but before the response, or after a response is lost, an authenticated
+exact retry returns the same encrypted response while the envelope is live. A different
+payload under the key conflicts. After envelope expiry, a still-pending activation credential
+or a live node credential is rotated atomically; an inactive or terminal subject is not
+revived. An activation-expired replacement remains terminal; its designated live parent must
+use a new operation key to register a new pending attempt under the same immutable correction
+manifest. The database stores only credential digests and authenticated ciphertext. Recovery
+uses `TRACEFENCE_CREDENTIAL_RECOVERY_KEY`, independently generated from operator, token-hash
+and evidence keys, with the bounded `TRACEFENCE_CREDENTIAL_RECOVERY_TTL_SECONDS` lifetime.
+
 Reset an incompatible local database explicitly:
 
 ```bash
@@ -148,6 +162,13 @@ make reset
 ```bash
 make api
 ```
+
+The worker keeps per-request HTTP deadlines below the lease TTL, stops work when heartbeat
+authority is lost, requires checkpoint JSON to contain `allowed: true`, and completes
+cooperative work explicitly. Worker exit statuses are: `0` completed, `2` action rejected,
+`3` lease lost, `4` transport/internal failure, `5` checkpoint denied, `6` completion
+rejected, and `7` activation rejected. Activation and node credentials are supplied through
+stdin/HTTP only and never through process arguments.
 
 The server binds to loopback by default:
 
@@ -189,10 +210,11 @@ Generated evidence is placed under an immutable timestamped directory with a sig
 make audit
 ```
 
-The current source passes **99 tests** and **73.81% branch coverage** in the available runner,
-plus Python compilation, JavaScript syntax, whitespace, wheel-content and installed-service
-checks. CI additionally runs Ruff, strict mypy, Bandit, pip-audit, wheel/sdist construction and
-clean-wheel installation.
+The current source passes **194 tests** and **77.57% total branch-aware coverage** in the
+available runner, plus Python compilation, JavaScript syntax, Ruff, strict mypy, Bandit,
+pip-audit, wheel/sdist construction, hash-locked installation and clean-wheel service checks.
+`make audit` executes the compile, JavaScript syntax, static, security, dependency and coverage
+gates shown by `make help`; it does not perform live SigNoz verification.
 
 ## SigNoz deployment and verification
 
@@ -202,8 +224,10 @@ Install the checked-in Foundry configuration:
 make signoz
 ```
 
-This must create a real `casting.yaml.lock` on the target machine. Never fabricate or copy a
-lock from another environment.
+The checked-in `casting.yaml.lock` binds the reviewed `casting.yaml` source bytes only. A real
+Foundry installation must replace or augment that source lock with the deployment tool's own
+environment-specific lock/receipt. The checked-in lock is not evidence that Foundry or SigNoz
+was deployed.
 
 Configure a real service-account key and existing notification channel:
 
@@ -261,14 +285,43 @@ metrics. The overall verdict is:
   provider idempotency key, durable execution outbox and reconciliation workflow.
 - The invariant telemetry outbox is implemented for durable safety-event delivery; it is not a
   full external-tool execution outbox.
-- SQLite is suitable for this bounded single-process hackathon MVP. Production should use
-  PostgreSQL, formal migrations and explicit row/advisory locking.
+- Persistence is intentionally SQLite-only. Any non-SQLite URL is rejected before a driver is
+  loaded; PostgreSQL and high-availability operation remain production backlog items.
 - The process-local rate limiter must be replaced by a shared limiter in multi-replica use.
 - TraceFence controls registered nodes only while protected side effects remain behind the
   gateway. It cannot revoke independent external credentials held by an arbitrary process.
 - The MVP uses a single operator credential with fingerprinted audit records, not an identity
   provider or per-user RBAC.
 - Live SigNoz/Foundry verification remains an external environmental gate.
+
+## SQLite migrations and durability
+
+TraceFence ships an Alembic baseline at `001_schema_v17`. New installations can be initialized
+explicitly with:
+
+```bash
+TRACEFENCE_DATABASE_URL=sqlite+pysqlite:///./data/tracefence.db \
+  python -m alembic upgrade head
+```
+
+Application bootstrap records both schema version 17 and the Alembic head, validates columns,
+primary keys, named and unnamed foreign keys, unique/check constraints, indexes and mandatory
+proof-revision triggers. A failed first bootstrap that began from an empty database is returned
+to an empty retryable state. Existing unknown or structurally incomplete databases fail closed
+with `SCHEMA_MIGRATION_REQUIRED`; back them up before migration.
+
+Every connection enables foreign keys, WAL mode, a five-second busy timeout and
+`synchronous=FULL`. WAL improves reader/writer concurrency but the `-wal` file can grow while
+long-lived readers prevent checkpoints. Monitor free disk and WAL size, reserve at least twice
+the combined database/WAL working set, and investigate readers before issuing a controlled
+`PRAGMA wal_checkpoint(TRUNCATE)`.
+
+For backups, use SQLite's online backup API or the `sqlite3 .backup` command against a quiesced
+or coordinated writer. Do not copy only the main database file while WAL writes are active.
+Restore into a separate path, run `PRAGMA integrity_check`, apply `alembic upgrade head`, start
+TraceFence, and validate `/readyz` before replacing the original. Keep at least one tested,
+offline backup and rehearse restoration; TraceFence does not provide automated disaster
+recovery.
 
 ## Provenance
 

@@ -3,16 +3,26 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import asdict
+from typing import Protocol
 from uuid import uuid4
 
+from opentelemetry.util.types import AttributeValue
+from pydantic import ValidationError
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from tracefence.config import settings
-from tracefence.db.models import ActionAttempt, ActionCommandMatch, CommandAcknowledgement
+from tracefence.db.models import (
+    ActionAttempt,
+    ActionCommandMatch,
+    CommandAcknowledgement,
+    ControlCommand,
+    Node,
+)
 from tracefence.domain.enums import AckType, ActionDecision
 from tracefence.domain.errors import ConflictError
-from tracefence.domain.schemas import ActionExecute, ActionResult
+from tracefence.domain.schemas import ActionExecute, ActionResult, ReplacementManifest
+from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import payload_digest, token_matches
 from tracefence.services.common import (
     commands_for_scope_mismatches,
@@ -21,12 +31,16 @@ from tracefence.services.common import (
     get_run,
     utcnow,
 )
-from tracefence.services.tool_registry import get_tool_spec
+from tracefence.services.tool_registry import ToolSpec, get_tool_spec
 from tracefence.telemetry.instruments import telemetry
 
 logger = logging.getLogger(__name__)
 
 STALE_REASONS = {"SCOPE_CANCELLED", "SCOPE_SUPERSEDED", "SCOPE_VERSION_MISMATCH"}
+
+
+class _Span(Protocol):
+    def set_attribute(self, key: str, value: AttributeValue) -> None: ...
 
 
 class ActionGateway:
@@ -51,12 +65,6 @@ class ActionGateway:
 
                     raise AuthenticationError("Invalid node token")
 
-                # Tool existence and argument-shape errors are evaluated only after
-                # node authentication so the gateway does not become a tool/capability
-                # oracle for unauthenticated callers.
-                spec = get_tool_spec(request.tool_name)
-                spec.validate_arguments(request.arguments)
-
                 existing = session.execute(
                     select(ActionAttempt).where(
                         ActionAttempt.node_id == node_id,
@@ -71,7 +79,16 @@ class ActionGateway:
                         )
                     session.commit()
                     return self._result(existing, duplicate=True)
+                authenticated_rate_limiter.check(
+                    "action",
+                    f"{node.run_id}:{node.id}",
+                )
 
+                # Tool existence and argument-shape errors are evaluated only after
+                # node authentication and exact replay handling, so the gateway
+                # cannot become an unauthenticated tool oracle and a committed
+                # response remains recoverable if policy changes later.
+                spec = get_tool_spec(request.tool_name)
                 action_count = session.scalar(
                     select(func.count(ActionAttempt.id)).where(
                         ActionAttempt.run_id == node.run_id
@@ -95,8 +112,20 @@ class ActionGateway:
                     denial_reason = "LEASE_EXPIRED"
                 elif not evaluation.allowed:
                     denial_reason = evaluation.primary_reason or "SCOPE_INVALID"
-                elif spec.capability not in set(node.capabilities_json or []):
-                    denial_reason = "TOOL_NOT_ALLOWED"
+                else:
+                    denial_reason = self._recovery_contract_denial(
+                        session,
+                        node,
+                        request,
+                        spec,
+                    )
+                    if (
+                        denial_reason is None
+                        and spec.capability not in set(node.capabilities_json or [])
+                    ):
+                        denial_reason = "TOOL_NOT_ALLOWED"
+                    if denial_reason is None:
+                        spec.validate_arguments(request.arguments)
 
                 commands = []
                 command = None
@@ -208,8 +237,13 @@ class ActionGateway:
                                 "action_id": attempt.id,
                                 "tool_name": request.tool_name,
                                 "reason_code": denial_reason,
+                                "denial_reason": denial_reason,
                                 "command_id": attempt.matched_command_id,
                                 "scope_id": attempt.matched_scope_id,
+                                "target_scope_id": attempt.matched_scope_id,
+                                "snapshot_version": attempt.matched_snapshot_version,
+                                "live_version": attempt.matched_live_version,
+                                "live_status": attempt.matched_live_status,
                             },
                         )
                     return self._result(attempt)
@@ -258,6 +292,73 @@ class ActionGateway:
                 raise
 
     @staticmethod
+    def _recovery_contract_denial(
+        session: Session,
+        node: Node,
+        request: ActionExecute,
+        spec: ToolSpec,
+    ) -> str | None:
+        if node.caused_by_command_id is None:
+            return None
+        command = session.get(ControlCommand, node.caused_by_command_id)
+        if (
+            command is None
+            or command.command_type != "CORRECT_SUBTREE"
+            or command.run_id != node.run_id
+        ):
+            return "RECOVERY_COMMAND_MISMATCH"
+        if (
+            command.replacement_node_id != node.id
+            or node.caused_by_command_id != command.id
+        ):
+            return "RECOVERY_NODE_MISMATCH"
+        manifest_json = command.replacement_manifest_json
+        if (
+            manifest_json is None
+            or command.replacement_manifest_digest is None
+            or command.replacement_manifest_digest != payload_digest(manifest_json)
+        ):
+            return "RECOVERY_MANIFEST_INVALID"
+        try:
+            manifest = ReplacementManifest.model_validate(manifest_json)
+        except ValidationError:
+            return "RECOVERY_MANIFEST_INVALID"
+        if node.role != manifest.role:
+            return "RECOVERY_ROLE_MISMATCH"
+        if node.behavior != manifest.behavior:
+            return "RECOVERY_BEHAVIOR_MISMATCH"
+        if sorted(node.capabilities_json or []) != manifest.capabilities_exact:
+            return "RECOVERY_CAPABILITIES_MISMATCH"
+        if payload_digest(node.instruction_json) != manifest.instruction_digest:
+            return "RECOVERY_INSTRUCTION_MISMATCH"
+        if node.instruction_version != manifest.instruction_version:
+            return "RECOVERY_INSTRUCTION_VERSION_MISMATCH"
+
+        contract = manifest.recovery_contract
+        if contract.allowed_environment != settings.environment:
+            return "RECOVERY_ENVIRONMENT_MISMATCH"
+        if (
+            request.tool_name != contract.expected_tool
+            or command.replacement_expected_tool != contract.expected_tool
+        ):
+            return "RECOVERY_TOOL_MISMATCH"
+        if sorted(spec.resources) != contract.allowed_resources:
+            return "RECOVERY_RESOURCE_MISMATCH"
+        if payload_digest(request.arguments) != contract.expected_arguments_digest:
+            return "RECOVERY_ARGUMENTS_MISMATCH"
+        committed = session.scalar(
+            select(func.count(ActionAttempt.id)).where(
+                ActionAttempt.run_id == node.run_id,
+                ActionAttempt.node_id == node.id,
+                ActionAttempt.decision == ActionDecision.ALLOW,
+                ActionAttempt.committed_at.is_not(None),
+            )
+        ) or 0
+        if committed >= contract.max_committed_invocations:
+            return "RECOVERY_INVOCATION_LIMIT_EXCEEDED"
+        return None
+
+    @staticmethod
     def _record_gateway_ack(
         session: Session, run_id: str, command_id: str, node_id: str, observed_version: int
     ) -> None:
@@ -294,30 +395,31 @@ class ActionGateway:
 
     @staticmethod
     def _set_span(
-        span: object, node: object, request: ActionExecute, attempt: ActionAttempt
+        span: _Span, node: Node, request: ActionExecute, attempt: ActionAttempt
     ) -> None:
-        span.set_attribute("tracefence.run.id", node.run_id)  # type: ignore[attr-defined]
-        span.set_attribute("tracefence.node.id", node.id)  # type: ignore[attr-defined]
-        span.set_attribute("tracefence.node.role", node.role)  # type: ignore[attr-defined]
-        span.set_attribute("tracefence.action.tool", request.tool_name)  # type: ignore[attr-defined]
-        span.set_attribute("tracefence.action.side_effecting", attempt.side_effecting)  # type: ignore[attr-defined]
-        span.set_attribute("tracefence.action.decision", attempt.decision)  # type: ignore[attr-defined]
+        span.set_attribute("tracefence.run.id", node.run_id)
+        span.set_attribute("tracefence.node.id", node.id)
+        span.set_attribute("tracefence.node.role", node.role)
+        span.set_attribute("tracefence.action.id", attempt.id)
+        span.set_attribute("tracefence.action.tool", request.tool_name)
+        span.set_attribute("tracefence.action.side_effecting", attempt.side_effecting)
+        span.set_attribute("tracefence.action.decision", attempt.decision)
         if attempt.denial_reason:
-            span.set_attribute("tracefence.action.denial_reason", attempt.denial_reason)  # type: ignore[attr-defined]
+            span.set_attribute("tracefence.action.denial_reason", attempt.denial_reason)
         if attempt.matched_command_id:
-            span.set_attribute("tracefence.command.id", attempt.matched_command_id)  # type: ignore[attr-defined]
+            span.set_attribute("tracefence.command.id", attempt.matched_command_id)
         if attempt.matched_scope_id:
-            span.set_attribute("tracefence.scope.id", attempt.matched_scope_id)  # type: ignore[attr-defined]
+            span.set_attribute("tracefence.scope.id", attempt.matched_scope_id)
         if attempt.matched_snapshot_version is not None:
             span.set_attribute(
                 "tracefence.scope.snapshot_version", attempt.matched_snapshot_version
-            )  # type: ignore[attr-defined]
+            )
         if attempt.matched_live_version is not None:
             span.set_attribute(
                 "tracefence.scope.live_version", attempt.matched_live_version
-            )  # type: ignore[attr-defined]
+            )
         if attempt.matched_live_status:
-            span.set_attribute("tracefence.scope.status", attempt.matched_live_status)  # type: ignore[attr-defined]
+            span.set_attribute("tracefence.scope.status", attempt.matched_live_status)
 
     @staticmethod
     def _record_metrics(request: ActionExecute, reason: str, started: float) -> None:

@@ -77,13 +77,21 @@ class StateService:
                     )
                 )
 
-    async def list_states(self, run_id: str) -> list[dict]:
+    async def list_states(
+        self,
+        run_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
         with self.session_factory() as session:
             await get_run(session, run_id)
             rows = session.execute(
                 select(ServiceState)
                 .where(ServiceState.run_id == run_id)
                 .order_by(ServiceState.service_name)
+                .limit(limit)
+                .offset(offset)
             ).scalars()
             return [
                 {
@@ -98,13 +106,21 @@ class StateService:
                 for row in rows
             ]
 
-    async def list_actions(self, run_id: str) -> list[dict]:
+    async def list_actions(
+        self,
+        run_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
         with self.session_factory() as session:
             await get_run(session, run_id)
             rows = session.execute(
                 select(ActionAttempt)
                 .where(ActionAttempt.run_id == run_id)
                 .order_by(ActionAttempt.attempted_at)
+                .limit(limit)
+                .offset(offset)
             ).scalars()
             return [
                 {
@@ -131,13 +147,21 @@ class StateService:
                 }
                 for row in rows
             ]
-    async def list_violations(self, run_id: str) -> list[dict]:
+    async def list_violations(
+        self,
+        run_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
         with self.session_factory() as session:
             await get_run(session, run_id)
             rows = session.execute(
                 select(InvariantViolation)
                 .where(InvariantViolation.run_id == run_id)
                 .order_by(InvariantViolation.detected_at)
+                .limit(limit)
+                .offset(offset)
             ).scalars()
             return [
                 {

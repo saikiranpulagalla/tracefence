@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from datetime import datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from tracefence.config import settings
 from tracefence.db.models import ServiceState, utcnow
 from tracefence.domain.errors import ConflictError
+from tracefence.domain.schemas import RecoveryContract
 from tracefence.security import payload_digest
 
 ToolExecutor = Callable[[Session, str, str, dict[str, Any]], dict[str, Any]]
 RecoveryContractBuilder = Callable[[Session, str, str, dict[str, Any], int], dict[str, Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class PostconditionEvaluation:
+    discrepancies: tuple[str, ...]
+    postconditions_inconsistent: bool
+    postconditions_incomplete: bool
+    stability_incomplete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +32,7 @@ class ToolSpec:
     capability: str
     side_effecting: bool
     allowed_argument_keys: frozenset[str]
+    resources: frozenset[str]
     executor: ToolExecutor
     recommended_replacement_role: str | None = None
     recovery_contract_builder: RecoveryContractBuilder | None = None
@@ -54,16 +67,78 @@ class ToolSpec:
                 "schema_version": 1,
                 "expected_tool": self.name,
                 "expected_arguments_digest": payload_digest(arguments),
+                "allowed_environment": settings.environment,
+                "allowed_resources": sorted(self.resources),
                 "max_committed_invocations": 1,
                 "stability_window_seconds": stability_window_seconds,
                 "postconditions": [],
             }
-        return self.recovery_contract_builder(
+        contract = self.recovery_contract_builder(
             session,
             run_id,
             self.name,
             arguments,
             stability_window_seconds,
+        )
+        contract["allowed_environment"] = settings.environment
+        contract["allowed_resources"] = sorted(self.resources)
+        return contract
+
+    def verify_postconditions(
+        self,
+        session: Session,
+        run_id: str,
+        action_id: str,
+        contract: RecoveryContract,
+        stable_before: datetime,
+    ) -> PostconditionEvaluation:
+        discrepancies: list[str] = []
+        inconsistent = False
+        incomplete = False
+        stability_incomplete = False
+        for postcondition in contract.postconditions:
+            state = session.get(ServiceState, (run_id, postcondition.service_name))
+            if state is None:
+                discrepancies.append(
+                    "Recovery postcondition service is missing: "
+                    f"{postcondition.service_name}"
+                )
+                incomplete = True
+                stability_incomplete = True
+                continue
+            actual = getattr(state, postcondition.field)
+            if actual != postcondition.expected:
+                discrepancies.append(
+                    f"Recovery postcondition failed: {postcondition.service_name}."
+                    f"{postcondition.field} expected {postcondition.expected!r}, "
+                    f"found {actual!r}"
+                )
+                incomplete = True
+                stability_incomplete = True
+                continue
+            if postcondition.require_recovery_action and state.last_action_id != action_id:
+                discrepancies.append(
+                    f"Recovery postcondition {postcondition.service_name}."
+                    f"{postcondition.field} is not causally bound to the authorized "
+                    "recovery action"
+                )
+                inconsistent = True
+                continue
+            if (
+                contract.stability_window_seconds > 0
+                and state.updated_at > stable_before
+            ):
+                discrepancies.append(
+                    f"Recovery postcondition {postcondition.service_name}."
+                    f"{postcondition.field} has not remained stable for "
+                    f"{contract.stability_window_seconds} seconds"
+                )
+                stability_incomplete = True
+        return PostconditionEvaluation(
+            discrepancies=tuple(discrepancies),
+            postconditions_inconsistent=inconsistent,
+            postconditions_incomplete=incomplete,
+            stability_incomplete=stability_incomplete,
         )
 
 
@@ -79,7 +154,6 @@ def _state(session: Session, run_id: str, service_name: str, default_status: str
             updated_at=utcnow(),
         )
         session.add(state)
-        session.flush()
     return state
 
 
@@ -226,6 +300,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         capability="tool:read_metrics",
         side_effecting=False,
         allowed_argument_keys=frozenset(),
+        resources=frozenset({"metrics"}),
         executor=_read_metrics,
     ),
     "restart_postgres": ToolSpec(
@@ -233,6 +308,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         capability="tool:restart_postgres",
         side_effecting=True,
         allowed_argument_keys=frozenset(),
+        resources=frozenset({"postgres"}),
         executor=_restart_postgres,
         recommended_replacement_role="postgres_recovery",
         recovery_contract_builder=_restart_postgres_contract,
@@ -242,6 +318,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         capability="tool:reset_redis_pool",
         side_effecting=True,
         allowed_argument_keys=frozenset(),
+        resources=frozenset({"checkout", "postgres", "redis"}),
         executor=_reset_redis_pool,
         recommended_replacement_role="redis_recovery",
         recovery_contract_builder=_reset_redis_contract,

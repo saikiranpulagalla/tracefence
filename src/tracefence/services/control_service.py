@@ -8,12 +8,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from tracefence.config import settings
-from tracefence.db.models import CorrectionProposal, ControlCommand, ControlScope, Node
+from tracefence.db.models import ControlCommand, ControlScope, CorrectionProposal, Node
 from tracefence.domain.enums import (
     CommandType,
     IssuerType,
     ProposalStatus,
     ProposalType,
+    ReplacementStatus,
     RunStatus,
     ScopeStatus,
 )
@@ -22,9 +23,11 @@ from tracefence.domain.schemas import (
     CommandCreate,
     CommandIssued,
     Principal,
+    RecoveryContract,
     ReplacementManifest,
     command_authorization_payload,
 )
+from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import payload_digest
 from tracefence.services.authority_service import AuthorityService
 from tracefence.services.common import (
@@ -36,6 +39,7 @@ from tracefence.services.common import (
     validate_node_runtime_state,
 )
 from tracefence.services.proposal_service import proposal_payload
+from tracefence.services.run_lifecycle import transition_run
 from tracefence.services.tool_registry import get_tool_spec
 from tracefence.telemetry.instruments import telemetry
 
@@ -69,9 +73,6 @@ class ControlService:
                     if principal.node_id is None or node_token is None:
                         raise AuthorizationError("Agent principal requires a node token")
                     issuer_node = await authenticate_node(session, principal.node_id, node_token)
-                    allowed, reason, _ = await validate_node_runtime_state(session, issuer_node)
-                    if not allowed:
-                        raise AuthorizationError(f"Issuer is not live: {reason}")
                     issuer_fingerprint = f"agent:{issuer_node.id}"
                 else:
                     issuer_fingerprint = principal.principal_id or "human:operator"
@@ -116,6 +117,28 @@ class ControlService:
                         )
                     session.commit()
                     return self._to_response(existing, duplicate=True)
+
+                authenticated_rate_limiter.check(
+                    "command",
+                    (
+                        f"{issuer_node.run_id}:{issuer_node.id}"
+                        if issuer_node is not None
+                        else issuer_fingerprint
+                    ),
+                )
+                if issuer_node is not None:
+                    allowed, reason, _ = await validate_node_runtime_state(
+                        session,
+                        issuer_node,
+                    )
+                    if not allowed:
+                        raise AuthorizationError(f"Issuer is not live: {reason}")
+
+                if run.status != RunStatus.RUNNING:
+                    raise ConflictError(
+                        "Terminal runs cannot accept new commands",
+                        code="RUN_TERMINAL_STATE",
+                    )
 
                 command_count = session.scalar(
                     select(func.count(ControlCommand.id)).where(
@@ -238,6 +261,8 @@ class ControlService:
                             "schema_version": 1,
                             "expected_tool": None,
                             "expected_arguments_digest": payload_digest({}),
+                            "allowed_environment": settings.environment,
+                            "allowed_resources": [],
                             "max_committed_invocations": 0,
                             "stability_window_seconds": request.recovery_stability_seconds,
                             "postconditions": [],
@@ -257,7 +282,9 @@ class ControlService:
                         instruction_version=target.instruction_version + 1,
                         capabilities_exact=requested_capabilities,
                         max_children=max_children,
-                        recovery_contract=recovery_contract,
+                        recovery_contract=RecoveryContract.model_validate(
+                            recovery_contract
+                        ),
                     ).model_dump(mode="json")
 
                 if request.command_type == CommandType.CANCEL_RUN:
@@ -265,11 +292,32 @@ class ControlService:
                     replacement_parent_id = None
                 else:
                     target_scope_id = target.own_scope_id
-                    replacement_parent_id = (
-                        target.parent_id
-                        if request.command_type == CommandType.CORRECT_SUBTREE
-                        else None
-                    )
+                    replacement_parent_id = None
+                    if request.command_type == CommandType.CORRECT_SUBTREE:
+                        intended_parent = (
+                            session.get(Node, target.parent_id)
+                            if target.parent_id is not None
+                            else None
+                        )
+                        if intended_parent is not None:
+                            intended_live, _, _ = await validate_node_runtime_state(
+                                session, intended_parent
+                            )
+                            if intended_live:
+                                replacement_parent_id = intended_parent.id
+                        if replacement_parent_id is None:
+                            root = session.get(Node, run.root_node_id)
+                            root_live = False
+                            if root is not None and root.id != target.id:
+                                root_live, _, _ = await validate_node_runtime_state(
+                                    session, root
+                                )
+                            if not root_live:
+                                raise ConflictError(
+                                    "No live authorized replacement parent is available",
+                                    code="REPLACEMENT_PARENT_UNAVAILABLE",
+                                )
+                            replacement_parent_id = root.id
 
                 scope = session.get(ControlScope, target_scope_id)
                 if scope is None or scope.run_id != run.id:
@@ -289,8 +337,12 @@ class ControlService:
                 scope.updated_at = utcnow()
 
                 if request.command_type == CommandType.CANCEL_RUN:
-                    run.status = RunStatus.CANCELLED
-                    run.finished_at = utcnow()
+                    transition_run(
+                        session,
+                        run,
+                        RunStatus.CANCELLED,
+                        finished_at=utcnow(),
+                    )
 
                 command = ControlCommand(
                     id=str(uuid4()),
@@ -318,6 +370,11 @@ class ControlService:
                         else None
                     ),
                     replacement_node_id=None,
+                    replacement_status=(
+                        ReplacementStatus.PENDING
+                        if request.command_type == CommandType.CORRECT_SUBTREE
+                        else None
+                    ),
                     created_at=utcnow(),
                 )
                 session.add(command)
@@ -395,5 +452,10 @@ class ControlService:
             replacement_instruction=command.replacement_instruction_json,
             replacement_expected_tool=command.replacement_expected_tool,
             replacement_manifest=command.replacement_manifest_json,
+            replacement_status=(
+                ReplacementStatus(command.replacement_status)
+                if command.replacement_status is not None
+                else None
+            ),
             duplicate=duplicate,
         )
