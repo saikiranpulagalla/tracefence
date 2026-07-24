@@ -1,6 +1,6 @@
 [project]
 name = "tracefence"
-version = "0.2.0"
+version = "0.2.1rc2"
 description = "Runtime-enforced cancellation and correction for dynamic AI-agent graphs"
 readme = "README.md"
 requires-python = ">=3.12"

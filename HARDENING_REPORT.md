@@ -1,7 +1,7 @@
 # TraceFence Hardening and Release Verification Report
 
 Date: 2026-07-24
-Release candidate: `0.2.0`
+Release candidate: `0.2.1rc2`
 Required database schema: **17**
 
 ## Executive result
