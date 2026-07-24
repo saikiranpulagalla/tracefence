@@ -210,7 +210,7 @@ Generated evidence is placed under an immutable timestamped directory with a sig
 make audit
 ```
 
-The current source passes **192 tests** and **77.41% total branch-aware coverage** in the
+The current source passes **192 tests** and **77.57% total branch-aware coverage** in the
 available runner, plus Python compilation, JavaScript syntax, Ruff, strict mypy, Bandit,
 pip-audit, wheel/sdist construction, hash-locked installation and clean-wheel service checks.
 `make audit` executes the compile, JavaScript syntax, static, security, dependency and coverage

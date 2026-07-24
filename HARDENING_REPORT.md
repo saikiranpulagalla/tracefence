@@ -14,7 +14,7 @@ Current pre-release local gate:
 
 ```text
 192 automated tests passed
-branch-aware total coverage             77.41% (required >= 70%)
+branch-aware total coverage             77.57% (required >= 70%)
 Python compileall                       PASS
 frontend JavaScript syntax              PASS
 Ruff                                    PASS
