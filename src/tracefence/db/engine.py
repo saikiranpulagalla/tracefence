@@ -259,7 +259,10 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
         actual_ix = {
             (
                 bool(item.get("unique")),
-                tuple(item.get("column_names") or ()),
+                tuple(
+                    name if isinstance(name, str) else "<unknown>"
+                    for name in (item.get("column_names") or ())
+                ),
             )
             for item in inspector.get_indexes(table_name)
         }

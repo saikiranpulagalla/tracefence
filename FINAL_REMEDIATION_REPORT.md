@@ -2,7 +2,7 @@
 
 Date: 2026-07-24  
 Branch: `fix/proof-and-runtime-integrity`  
-Release candidate source version: `0.2.0`  
+Release candidate source version: `0.2.1rc2`  
 Schema: `17`
 
 ## Verdict
@@ -104,8 +104,8 @@ PYTHONPATH=src TRACEFENCE_ENV=test pytest -q --cov=tracefence --cov-branch \
 Total coverage: 77.57%
 
 python -m build
-Successfully built tracefence-0.2.0.tar.gz and
-tracefence-0.2.0-py3-none-any.whl
+Successfully built tracefence-0.2.1rc2.tar.gz and
+tracefence-0.2.1rc2-py3-none-any.whl
 ```
 
 The clean-wheel environment installed `requirements-lock/runtime.txt` with
@@ -127,7 +127,8 @@ concurrent recovery budget, credential response-loss and process-worker tests: a
 - `reports/sbom.cdx.json`: reproducible validated CycloneDX JSON.
 - `reports/secret-scan.json`: PASS, no high-confidence secret findings, and no secret values
   included in the report.
-- `casting.yaml.lock` is a source-content integrity lock, not a Foundry deployment receipt.
+- `casting.source.lock.json` is a source-content integrity lock. The ignored
+  `casting.yaml.lock` is reserved for the real Foundry deployment receipt.
 
 ## Database migration
 

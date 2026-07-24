@@ -6,13 +6,21 @@ if ! command -v foundryctl >/dev/null 2>&1; then
   exit 1
 fi
 
-foundryctl gauge -f casting.yaml
-foundryctl cast -f casting.yaml
+python_bin="${PYTHON:-python3}"
+source_lock="casting.source.lock.json"
+deployment_receipt="casting.yaml.lock"
+before_receipt="$(
+  "$python_bin" scripts/verify_foundry_receipt.py snapshot \
+    --receipt "$deployment_receipt"
+)"
 
-if [[ ! -f casting.yaml.lock ]]; then
-  echo "Foundry completed without producing casting.yaml.lock; do not submit until this is resolved." >&2
-  exit 1
-fi
+foundryctl gauge -f casting.yaml
+foundryctl cast --no-gauge -f casting.yaml
+
+"$python_bin" scripts/verify_foundry_receipt.py validate \
+  --receipt "$deployment_receipt" \
+  --source-lock "$source_lock" \
+  --before "$before_receipt"
 
 curl -fsS http://localhost:8080 >/dev/null
 curl -fsS http://localhost:8000/livez >/dev/null

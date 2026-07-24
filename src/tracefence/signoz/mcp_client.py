@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -354,8 +356,18 @@ class SigNozMCPClient:
                 "blocked_traces": _normalize_tool_result(blocked_result),
                 "blocked_logs": _normalize_tool_result(log_result),
                 "export_watermarks": _normalize_tool_result(watermark_result),
-                "attempts_metric": _normalize_tool_result(attempts_metric),
-                "committed_metric": _normalize_tool_result(committed_metric),
+                "attempts_metric": _normalize_tool_result(
+                    attempts_metric,
+                    defaults={
+                        "metric_name": "tracefence_stale_action_attempts_total"
+                    },
+                ),
+                "committed_metric": _normalize_tool_result(
+                    committed_metric,
+                    defaults={
+                        "metric_name": "tracefence_stale_actions_committed_total"
+                    },
+                ),
             }
         except MCPToolResultError as exc:
             _record_mcp_health(
@@ -445,7 +457,88 @@ def _command_filter(context: TelemetryVerificationContext) -> str:
     )
 
 
-def _normalize_tool_result(result: Any) -> dict[str, Any]:
+_PAGINATION_NOTE = re.compile(
+    r"^note: returned \d+ rows \(limit \d+\) .+"
+    r"all matching results returned \(hasMore=false\)\.$"
+)
+
+_FIELD_ALIASES = {
+    "trace_id": "trace_id",
+    "traceID": "trace_id",
+    "traceId": "trace_id",
+    "command_id": "command_id",
+    "tracefence.command.id": "command_id",
+    "attribute.tracefence.command.id": "command_id",
+    "run_id": "run_id",
+    "tracefence.run.id": "run_id",
+    "attribute.tracefence.run.id": "run_id",
+    "action_id": "action_id",
+    "tracefence.action.id": "action_id",
+    "attribute.tracefence.action.id": "action_id",
+    "node_id": "node_id",
+    "tracefence.node.id": "node_id",
+    "attribute.tracefence.node.id": "node_id",
+    "target_scope_id": "target_scope_id",
+    "tracefence.target_scope.id": "target_scope_id",
+    "attribute.tracefence.target_scope.id": "target_scope_id",
+    "snapshot_version": "snapshot_version",
+    "tracefence.snapshot.version": "snapshot_version",
+    "attribute.tracefence.snapshot.version": "snapshot_version",
+    "live_version": "live_version",
+    "tracefence.live.version": "live_version",
+    "attribute.tracefence.live.version": "live_version",
+    "live_status": "live_status",
+    "tracefence.live.status": "live_status",
+    "attribute.tracefence.live.status": "live_status",
+    "denial_reason": "denial_reason",
+    "tracefence.denial.reason": "denial_reason",
+    "attribute.tracefence.denial.reason": "denial_reason",
+    "operation": "operation",
+    "name": "operation",
+    "event_name": "event_name",
+    "event.name": "event_name",
+    "timestamp_ms": "timestamp_ms",
+    "service_name": "service_name",
+    "service.name": "service_name",
+    "resource.service.name": "service_name",
+    "service_instance_id": "service_instance_id",
+    "service.instance.id": "service_instance_id",
+    "resource.service.instance.id": "service_instance_id",
+    "process_instance_id": "process_instance_id",
+    "tracefence.process.instance.id": "process_instance_id",
+    "attribute.tracefence.process.instance.id": "process_instance_id",
+    "build_commit": "build_commit",
+    "tracefence.build.commit": "build_commit",
+    "attribute.tracefence.build.commit": "build_commit",
+    "schema_version": "schema_version",
+    "tracefence.schema.version": "schema_version",
+    "attribute.tracefence.schema.version": "schema_version",
+    "exported_at_ms": "exported_at_ms",
+    "tracefence.exported_at_ms": "exported_at_ms",
+    "attribute.tracefence.exported_at_ms": "exported_at_ms",
+    "sequence": "sequence",
+    "tracefence.export.sequence": "sequence",
+    "attribute.tracefence.export.sequence": "sequence",
+    "metric_name": "metric_name",
+    "metric.name": "metric_name",
+    "value": "value",
+    "__result": "value",
+}
+
+
+def _normalize_tool_result(
+    result: Any,
+    *,
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize SDK structured results or the official SigNoz JSON-first contract.
+
+    SigNoz search/query tools return raw backend JSON in content block zero and
+    append human-readable advisory blocks. Only a complete pagination note or a
+    warning-free metrics decision note is admissible. Backend warnings,
+    truncation, multiple JSON blocks, and unknown advisory text fail closed.
+    """
+
     if bool(getattr(result, "isError", False) or getattr(result, "is_error", False)):
         raise MCPToolResultError("MCP tool returned isError=true")
 
@@ -462,16 +555,212 @@ def _normalize_tool_result(result: Any) -> dict[str, Any]:
             raise ResponseSchemaError("MCP structured evidence must be an object")
         return structured
 
-    if isinstance(content, list) and len(content) == 1:
-        text = getattr(content[0], "text", None)
-        if isinstance(text, str):
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as exc:
-                raise ResponseSchemaError("MCP textual result was not valid JSON") from exc
-            if isinstance(parsed, dict):
-                return parsed
-    raise ResponseSchemaError("MCP result has no unambiguous structured result container")
+    if not isinstance(content, list) or not content:
+        raise ResponseSchemaError(
+            "MCP result has no unambiguous structured result container"
+        )
+    texts: list[str] = []
+    for block in content:
+        block_type = getattr(block, "type", "text")
+        text = getattr(block, "text", None)
+        if block_type != "text" or not isinstance(text, str):
+            raise ResponseSchemaError("MCP result contained unexpected executable content")
+        texts.append(text)
+    try:
+        parsed = json.loads(texts[0])
+    except json.JSONDecodeError as exc:
+        raise ResponseSchemaError("MCP first text block was not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ResponseSchemaError("MCP first JSON content block must be an object")
+    for advisory in texts[1:]:
+        try:
+            json.loads(advisory)
+        except json.JSONDecodeError:
+            _validate_advisory(advisory)
+        else:
+            raise ResponseSchemaError(
+                "MCP result contained ambiguous multiple JSON content blocks"
+            )
+    if set(parsed) == {"results"}:
+        return parsed
+    return _adapt_query_builder_payload(parsed, defaults=defaults or {})
+
+
+def _validate_advisory(advisory: str) -> None:
+    text = advisory.strip()
+    lower = text.lower()
+    if _PAGINATION_NOTE.fullmatch(text):
+        return
+    if text.startswith("[Decisions applied]\n"):
+        if any(marker in lower for marker in ("warning:", "unknown", "assumed")):
+            raise ResponseSchemaError(
+                "SigNoz decision advisory contains a warning or assumption"
+            )
+        lines = text.splitlines()[1:]
+        if lines and all(line.startswith("  ") and ":" in line for line in lines):
+            return
+        raise ResponseSchemaError("SigNoz metrics decision advisory is malformed")
+    if lower.startswith("note: signoz backend returned non-fatal warnings:"):
+        raise ResponseSchemaError("SigNoz backend warning makes evidence ambiguous")
+    if "hasmore=true" in lower or "more results" in lower or "result limited" in lower:
+        raise ResponseSchemaError("SigNoz evidence page is incomplete")
+    raise ResponseSchemaError("MCP result contained an unknown advisory content block")
+
+
+def _adapt_query_builder_payload(
+    payload: dict[str, Any],
+    *,
+    defaults: dict[str, Any],
+) -> dict[str, Any]:
+    if set(payload) != {"status", "data"}:
+        raise ResponseSchemaError(
+            "SigNoz response contains an ambiguous result container"
+        )
+    if payload.get("status") != "success":
+        raise ResponseSchemaError("SigNoz Query Builder response was not successful")
+    outer = payload.get("data")
+    if not isinstance(outer, dict):
+        raise ResponseSchemaError("SigNoz Query Builder data envelope must be an object")
+    allowed_outer_keys = {"type", "data", "meta", "warning"}
+    if not set(outer).issubset(allowed_outer_keys):
+        raise ResponseSchemaError(
+            "SigNoz data envelope contains an ambiguous result container"
+        )
+    if not isinstance(outer.get("type"), str):
+        raise ResponseSchemaError("SigNoz Query Builder response lacks a result type")
+    if "meta" in outer and not isinstance(outer["meta"], dict):
+        raise ResponseSchemaError("SigNoz Query Builder metadata is malformed")
+    warning = outer.get("warning")
+    if warning is not None:
+        if not isinstance(warning, dict) or set(warning) != {"warnings"}:
+            raise ResponseSchemaError("SigNoz warning envelope is malformed")
+        warnings = warning["warnings"]
+        if not isinstance(warnings, list):
+            raise ResponseSchemaError("SigNoz warning list is malformed")
+        if warnings:
+            raise ResponseSchemaError("SigNoz backend warning makes evidence ambiguous")
+    query_data = outer.get("data")
+    if not isinstance(query_data, dict) or set(query_data) != {"results"}:
+        raise ResponseSchemaError(
+            "SigNoz Query Builder response must contain data.data.results"
+        )
+    result_sets = query_data["results"]
+    if result_sets is None:
+        result_sets = []
+    if not isinstance(result_sets, list):
+        raise ResponseSchemaError("SigNoz Query Builder results must be an array")
+
+    normalized: list[dict[str, Any]] = []
+    query_names: set[str] = set()
+    for result_set in result_sets:
+        if not isinstance(result_set, dict):
+            raise ResponseSchemaError("SigNoz Query Builder result set must be an object")
+        if not set(result_set).issubset({"queryName", "rows", "columns"}):
+            raise ResponseSchemaError(
+                "SigNoz result set contains an ambiguous row container"
+            )
+        query_name = result_set.get("queryName")
+        if not isinstance(query_name, str) or not query_name:
+            raise ResponseSchemaError("SigNoz Query Builder result set lacks queryName")
+        if query_name in query_names:
+            raise ResponseSchemaError("SigNoz Query Builder queryName is duplicated")
+        query_names.add(query_name)
+        rows = result_set.get("rows")
+        if rows is None:
+            rows = []
+        if not isinstance(rows, list):
+            raise ResponseSchemaError("SigNoz Query Builder rows must be an array")
+        columns = _parse_column_aliases(result_set.get("columns"))
+        for row in rows:
+            normalized.append(
+                _adapt_query_builder_row(row, columns=columns, defaults=defaults)
+            )
+    return {"results": normalized}
+
+
+def _parse_column_aliases(raw_columns: Any) -> list[str] | None:
+    if raw_columns is None:
+        return None
+    if not isinstance(raw_columns, list) or not raw_columns:
+        raise ResponseSchemaError("SigNoz Query Builder columns must be a non-empty array")
+    aliases: list[str] = []
+    for column in raw_columns:
+        if isinstance(column, str) and column:
+            alias = column
+        elif isinstance(column, dict):
+            alias_value = column.get("alias") or column.get("name")
+            if not isinstance(alias_value, str) or not alias_value:
+                raise ResponseSchemaError("SigNoz Query Builder column lacks an alias")
+            alias = alias_value
+        else:
+            raise ResponseSchemaError("SigNoz Query Builder column metadata is malformed")
+        aliases.append(alias)
+    if len(set(aliases)) != len(aliases):
+        raise ResponseSchemaError("SigNoz Query Builder column aliases are duplicated")
+    return aliases
+
+
+def _adapt_query_builder_row(
+    row: Any,
+    *,
+    columns: list[str] | None,
+    defaults: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        raise ResponseSchemaError("SigNoz Query Builder row must be an object")
+    if not set(row).issubset({"timestamp", "data"}):
+        raise ResponseSchemaError("SigNoz row contains an ambiguous data container")
+    raw_data = row.get("data")
+    if isinstance(raw_data, dict):
+        items = list(raw_data.items())
+    elif isinstance(raw_data, list):
+        if columns is None or len(columns) != len(raw_data):
+            raise ResponseSchemaError(
+                "Positional SigNoz row requires matching column aliases"
+            )
+        items = list(zip(columns, raw_data, strict=True))
+    else:
+        raise ResponseSchemaError("SigNoz Query Builder row data is malformed")
+
+    normalized = dict(defaults)
+    for source_name, value in items:
+        canonical = _FIELD_ALIASES.get(source_name)
+        if canonical is None:
+            continue
+        _put_unambiguous(normalized, canonical, value)
+    if "timestamp" in row:
+        _put_unambiguous(
+            normalized,
+            "timestamp_ms",
+            _timestamp_to_milliseconds(row["timestamp"]),
+        )
+    return normalized
+
+
+def _put_unambiguous(target: dict[str, Any], key: str, value: Any) -> None:
+    if key in target and target[key] != value:
+        raise ResponseSchemaError(f"Conflicting SigNoz aliases for {key}")
+    target[key] = value
+
+
+def _timestamp_to_milliseconds(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ResponseSchemaError("SigNoz timestamp is malformed")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ResponseSchemaError("SigNoz timestamp is malformed")
+        return int(value)
+    if not isinstance(value, str):
+        raise ResponseSchemaError("SigNoz timestamp is malformed")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ResponseSchemaError("SigNoz timestamp is malformed") from exc
+    if parsed.tzinfo is None:
+        raise ResponseSchemaError("SigNoz timestamp lacks a timezone")
+    return int(parsed.timestamp() * 1000)
 
 
 def _parse_rows[EvidenceModel: _StrictEvidenceModel](

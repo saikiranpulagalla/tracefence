@@ -12,7 +12,7 @@ from tracefence.db.models import Node, Run, ServiceState
 from tracefence.domain.enums import ProofVerdict
 from tracefence.services.common import utcnow
 from tracefence.services.proof_service import ProofService
-from tracefence.signoz.mcp_client import TelemetryProof
+from tracefence.signoz.mcp_client import ExportWatermark, TelemetryProof
 
 
 class _MutatingMCPClient:
@@ -70,6 +70,26 @@ class _BlockingVerifiedMCPClient:
         return TelemetryProof(
             verdict=ProofVerdict.VERIFIED,
             trace_ids=["c" * 32],
+            discrepancies=[],
+            evidence={},
+        )
+
+
+class _OverlappingVerifiedMCPClient:
+    def __init__(self, first_command_id: str) -> None:
+        self.first_command_id = first_command_id
+        self.first_started = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.watermarks: dict[str, ExportWatermark | None] = {}
+
+    async def verify_command(self, *, context) -> TelemetryProof:
+        self.watermarks[context.command_id] = context.export_watermark
+        if context.command_id == self.first_command_id:
+            self.first_started.set()
+            await self.release_first.wait()
+        return TelemetryProof(
+            verdict=ProofVerdict.VERIFIED,
+            trace_ids=["d" * 32],
             discrepancies=[],
             evidence={},
         )
@@ -153,11 +173,22 @@ async def test_nearest_lease_expiry_bounds_cached_proof(
         assert root is not None
         root.lease_expires_at = utcnow() + timedelta(milliseconds=500)
 
+    watermark = ExportWatermark(
+        service_name="tracefence-control-plane",
+        service_instance_id="service-a",
+        process_instance_id="process-a",
+        build_commit="build-a",
+        schema_version=1,
+        run_id=run.run_id,
+        command_id=command.command_id,
+        exported_at_ms=1_005_000,
+        sequence=1,
+    )
+    monkeypatch.setattr(proof_module, "force_flush_telemetry", lambda **_kwargs: True)
     monkeypatch.setattr(
         proof_module,
-        "telemetry_export_watermark",
-        lambda: "test-export-watermark",
-        raising=False,
+        "telemetry_export_context",
+        lambda _run_id, _command_id: watermark,
     )
     mcp = _CountingVerifiedMCPClient()
     proofs = ProofService(session_factory, mcp_client=mcp)
@@ -215,13 +246,25 @@ async def test_cancelling_follower_does_not_cancel_owner_or_shared_cache(
     session_factory,
     monkeypatch,
 ):
-    _run, _old, command, _replacement, _action = await _corrected_recovery(
+    run, _old, command, _replacement, _action = await _corrected_recovery(
         session_factory, key="proof-follower-cancellation"
     )
+    watermark = ExportWatermark(
+        service_name="tracefence-control-plane",
+        service_instance_id="service-a",
+        process_instance_id="process-a",
+        build_commit="build-a",
+        schema_version=1,
+        run_id=run.run_id,
+        command_id=command.command_id,
+        exported_at_ms=1_005_000,
+        sequence=1,
+    )
+    monkeypatch.setattr(proof_module, "force_flush_telemetry", lambda **_kwargs: True)
     monkeypatch.setattr(
         proof_module,
-        "telemetry_export_watermark",
-        lambda: "stable-test-watermark",
+        "telemetry_export_context",
+        lambda _run_id, _command_id: watermark,
     )
     mcp = _BlockingVerifiedMCPClient()
     proofs = ProofService(session_factory, mcp_client=mcp)
@@ -242,3 +285,72 @@ async def test_cancelling_follower_does_not_cancel_owner_or_shared_cache(
     assert owner_result.overall_verdict == ProofVerdict.VERIFIED
     assert cached_result == owner_result
     assert mcp.calls == 1
+
+
+async def test_overlapping_commands_cache_the_exact_reconciled_export_watermark(
+    session_factory,
+    monkeypatch,
+):
+    run_a, _old_a, command_a, _replacement_a, _action_a = await _corrected_recovery(
+        session_factory, key="proof-watermark-a"
+    )
+    run_b, _old_b, command_b, _replacement_b, _action_b = await _corrected_recovery(
+        session_factory, key="proof-watermark-b"
+    )
+    sequence = 0
+    watermarks: dict[str, ExportWatermark] = {}
+    latest_identity: str | None = None
+
+    def fake_flush(*, run_id: str, command_id: str, **_kwargs) -> bool:
+        nonlocal sequence, latest_identity
+        sequence += 1
+        watermark = ExportWatermark(
+            service_name="tracefence-control-plane",
+            service_instance_id="service-a",
+            process_instance_id="process-a",
+            build_commit="build-a",
+            schema_version=1,
+            run_id=run_id,
+            command_id=command_id,
+            exported_at_ms=1_000_000 + sequence,
+            sequence=sequence,
+        )
+        watermarks[command_id] = watermark
+        latest_identity = f"global:{sequence}:{command_id}"
+        return True
+
+    monkeypatch.setattr(proof_module, "force_flush_telemetry", fake_flush)
+    monkeypatch.setattr(
+        proof_module,
+        "telemetry_export_context",
+        lambda _run_id, command_id: watermarks.get(command_id),
+    )
+    monkeypatch.setattr(
+        proof_module,
+        "telemetry_export_watermark",
+        lambda: latest_identity,
+        raising=False,
+    )
+    mcp = _OverlappingVerifiedMCPClient(command_a.command_id)
+    proofs = ProofService(session_factory, mcp_client=mcp)
+
+    first = asyncio.create_task(proofs.build(command_a.command_id))
+    await asyncio.wait_for(mcp.first_started.wait(), timeout=1)
+    second = await asyncio.wait_for(proofs.build(command_b.command_id), timeout=2)
+    mcp.release_first.set()
+    first_result = await asyncio.wait_for(first, timeout=2)
+
+    assert first_result.command_id == command_a.command_id
+    assert second.command_id == command_b.command_id
+    exact_identity = proof_module._export_watermark_identity
+    cached_identities = {
+        key.command_id: key.export_watermark for key in proofs._cache
+    }
+    assert cached_identities == {
+        command_a.command_id: exact_identity(mcp.watermarks[command_a.command_id]),
+        command_b.command_id: exact_identity(mcp.watermarks[command_b.command_id]),
+    }
+    assert cached_identities[command_a.command_id] != cached_identities[
+        command_b.command_id
+    ]
+    assert run_a.run_id != run_b.run_id

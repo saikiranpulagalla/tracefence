@@ -1,0 +1,13 @@
+{
+  "isError": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"status\":\"success\",\"data\":{\"type\":\"raw\",\"warning\":{\"warnings\":[]},\"data\":{\"results\":[]},\"meta\":{}}}"
+    },
+    {
+      "type": "text",
+      "text": "note: returned 0 rows (limit 100) — all matching results returned (hasMore=false)."
+    }
+  ]
+}

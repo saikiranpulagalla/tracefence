@@ -1,7 +1,7 @@
 # TraceFence Hardening and Release Verification Report
 
 Date: 2026-07-24
-Release candidate: `0.2.0`
+Release candidate: `0.2.1rc2`
 Required database schema: **17**
 
 ## Executive result
@@ -56,7 +56,7 @@ Redis pool reset count                  1
 checkout status                         healthy
 committed side effects                  exactly 1
 telemetry proof                         UNAVAILABLE
-overall proof                           PARTIAL
+overall proof                           UNAVAILABLE
 ```
 
 The second execution used a different run ID and command ID while sharing the same application
@@ -228,7 +228,8 @@ The 194-test suite covers, among other cases:
 On the target WSL/Docker environment:
 
 1. create and preserve a real environment-specific Foundry deployment lock/receipt (the
-   checked-in `casting.yaml.lock` is only a source-content lock);
+   checked-in `casting.source.lock.json` is only a source-content lock and
+   Foundry's ignored `casting.yaml.lock` is required as deployment evidence);
 2. install MCP and OpenTelemetry instrumentation extras;
 3. start SigNoz and confirm traces, metrics and logs arrive;
 4. configure a real notification channel;

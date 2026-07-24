@@ -36,6 +36,7 @@ from tracefence.services.common import descendants_including_self, evaluate_scop
 from tracefence.services.invariant_service import InvariantService
 from tracefence.services.tool_registry import get_tool_spec
 from tracefence.signoz.mcp_client import (
+    ExportWatermark,
     RuntimeBlockedAction,
     SigNozMCPClient,
     TelemetryVerificationContext,
@@ -44,7 +45,6 @@ from tracefence.telemetry.instruments import telemetry
 from tracefence.telemetry.setup import (
     force_flush_telemetry,
     telemetry_export_context,
-    telemetry_export_watermark,
     telemetry_process_identity,
 )
 
@@ -100,6 +100,24 @@ class _CacheEntry:
     response: ProofResponse
 
 
+def _export_watermark_identity(watermark: ExportWatermark | None) -> str | None:
+    if watermark is None:
+        return None
+    return payload_digest(
+        {
+            "service_name": watermark.service_name,
+            "service_instance_id": watermark.service_instance_id,
+            "process_instance_id": watermark.process_instance_id,
+            "build_commit": watermark.build_commit,
+            "schema_version": watermark.schema_version,
+            "run_id": watermark.run_id,
+            "command_id": watermark.command_id,
+            "exported_at_ms": watermark.exported_at_ms,
+            "sequence": watermark.sequence,
+        }
+    )
+
+
 class ProofService:
     def __init__(
         self,
@@ -122,7 +140,9 @@ class ProofService:
         callers await the identical immutable result.
         """
         initial_context = self._current_context(command_id)
-        initial_watermark = telemetry_export_watermark()
+        initial_watermark = _export_watermark_identity(
+            telemetry_export_context(initial_context.run_id, command_id)
+        )
         initial_key = (
             self._cache_key(command_id, initial_context, initial_watermark)
             if initial_watermark is not None
@@ -156,17 +176,25 @@ class ProofService:
         try:
             last_response: ProofResponse | None = None
             for _attempt in range(_MAX_PROOF_STABILITY_ATTEMPTS):
-                response, context = await self._build_uncached(command_id)
+                response, context, reconciled_watermark = await self._build_uncached(
+                    command_id
+                )
                 last_response = response
                 if self._read_revision(context.run_id) != context.revision:
                     continue
 
-                watermark = telemetry_export_watermark()
                 expires_at = self._cache_expiry(context.nearest_lease_expiry)
                 stored = response.model_copy(deep=True)
                 with self._state_lock:
-                    if watermark is not None and expires_at > time.monotonic():
-                        key = self._cache_key(command_id, context, watermark)
+                    if (
+                        reconciled_watermark is not None
+                        and expires_at > time.monotonic()
+                    ):
+                        key = self._cache_key(
+                            command_id,
+                            context,
+                            reconciled_watermark,
+                        )
                         self._cache[key] = _CacheEntry(
                             expires_at=expires_at,
                             response=stored,
@@ -264,7 +292,7 @@ class ProofService:
     async def _build_uncached(
         self,
         command_id: str,
-    ) -> tuple[ProofResponse, _ProofContext]:
+    ) -> tuple[ProofResponse, _ProofContext, str | None]:
         started = time.perf_counter()
         discrepancies: list[str] = []
 
@@ -553,6 +581,7 @@ class ProofService:
                 revision=proof_revision,
                 nearest_lease_expiry=nearest_lease_expiry,
             ),
+            _export_watermark_identity(export_watermark),
         )
 
     @staticmethod

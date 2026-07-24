@@ -111,7 +111,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="TraceFence",
-    version="0.2.0",
+    version="0.2.1rc2",
     description="Runtime-enforced cancellation and correction for dynamic AI-agent graphs",
     lifespan=lifespan,
 )
