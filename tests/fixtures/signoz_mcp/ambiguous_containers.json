@@ -3,7 +3,7 @@
   "content": [
     {
       "type": "text",
-      "text": "{\"status\":\"success\",\"data\":{\"type\":\"raw\",\"warning\":{\"warnings\":[]},\"data\":{\"results\":[{\"queryName\":\"A\",\"rows\":[]},{\"queryName\":\"B\",\"rows\":[]}]},\"meta\":{}}}"
+      "text": "{\"status\":\"success\",\"results\":[],\"data\":{\"type\":\"raw\",\"data\":{\"results\":[]},\"meta\":{}}}"
     },
     {
       "type": "text",

@@ -3,7 +3,7 @@
   "content": [
     {
       "type": "text",
-      "text": "{\"status\":\"success\",\"data\":{\"type\":\"raw\",\"warning\":{\"warnings\":[{\"message\":\"Key service.name is ambiguous; using resource context\"}]},\"data\":{\"results\":[]}},\"meta\":{}}"
+      "text": "{\"status\":\"success\",\"data\":{\"type\":\"raw\",\"warning\":{\"warnings\":[{\"message\":\"Key service.name is ambiguous; using resource context\"}]},\"data\":{\"results\":[]},\"meta\":{}}}"
     },
     {
       "type": "text",

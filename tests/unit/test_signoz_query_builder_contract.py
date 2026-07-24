@@ -54,6 +54,11 @@ def test_multiple_json_content_blocks_are_rejected_as_ambiguous():
         _normalize_tool_result(load_tool_result("malformed_ambiguous.json"))
 
 
+def test_competing_query_builder_result_containers_are_rejected():
+    with pytest.raises(ResponseSchemaError, match="container"):
+        _normalize_tool_result(load_tool_result("ambiguous_containers.json"))
+
+
 def test_metric_raw_payload_uses_column_aliases_and_valid_decision_note():
     result = _normalize_tool_result(
         load_tool_result("metric_query.json"),
