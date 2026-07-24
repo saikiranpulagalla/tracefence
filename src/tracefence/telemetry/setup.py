@@ -17,6 +17,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from tracefence.config import settings
 from tracefence.logging_config import JsonFormatter
 from tracefence.signoz.mcp_client import ExportWatermark
+from tracefence.telemetry.instruments import telemetry
 
 _logger = logging.getLogger(__name__)
 _provider_lock = Lock()
@@ -249,6 +250,8 @@ def force_flush_telemetry(
                     exported_at_ms=int(proposed_at.timestamp() * 1000),
                     sequence=proposed_sequence,
                 )
+    else:
+        telemetry.exporter_failures_total.add(1)
     return success
 
 

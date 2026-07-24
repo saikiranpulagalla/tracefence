@@ -119,6 +119,9 @@ class Telemetry:
     actions_denied_total: metrics.Counter
     stale_attempts_total: metrics.Counter
     stale_committed_total: metrics.Counter
+    exporter_failures_total: metrics.Counter
+    proof_inconsistent_total: metrics.Counter
+    recovery_postcondition_failures_total: metrics.Counter
     leases_expired_total: metrics.Counter
     action_gateway_duration_ms: metrics.Histogram
     scope_validation_duration_ms: metrics.Histogram
@@ -173,6 +176,15 @@ def build_telemetry() -> Telemetry:
         actions_denied_total=meter.create_counter("tracefence_actions_denied_total"),
         stale_attempts_total=meter.create_counter("tracefence_stale_action_attempts_total"),
         stale_committed_total=meter.create_counter("tracefence_stale_actions_committed_total"),
+        exporter_failures_total=meter.create_counter(
+            "tracefence_exporter_failures_total"
+        ),
+        proof_inconsistent_total=meter.create_counter(
+            "tracefence_proof_inconsistent_total"
+        ),
+        recovery_postcondition_failures_total=meter.create_counter(
+            "tracefence_recovery_postcondition_failures_total"
+        ),
         leases_expired_total=meter.create_counter("tracefence_leases_expired_total"),
         action_gateway_duration_ms=meter.create_histogram(
             "tracefence_action_gateway_duration_ms", unit="ms"

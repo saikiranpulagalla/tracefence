@@ -44,6 +44,23 @@ def test_checked_in_signoz_assets_are_strictly_valid():
     alerts = json.loads((ROOT / "observability" / "alerts.json").read_text())
     module._validate_dashboard(dashboard)
     module._validate_alerts(alerts)
+    alert_names = {item["alert"] for item in alerts}
+    assert {
+        "TraceFence Exporter Delivery Failure",
+        "TraceFence Proof Inconsistency",
+        "TraceFence Recovery Postcondition Failure",
+    } <= alert_names
+    alert_metrics = {
+        aggregation["metricName"]
+        for alert in alerts
+        for query in alert["condition"]["compositeQuery"]["queries"]
+        for aggregation in query["spec"]["aggregations"]
+    }
+    assert {
+        "tracefence_exporter_failures_total",
+        "tracefence_proof_inconsistent_total",
+        "tracefence_recovery_postcondition_failures_total",
+    } <= alert_metrics
     assert all(item["x"] + item["w"] <= 12 for item in dashboard["layout"])
     assert {
         aggregation["metricName"]

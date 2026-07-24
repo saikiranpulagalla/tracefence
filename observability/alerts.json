@@ -262,5 +262,221 @@
       "description": "Durable TraceFence safety telemetry has remained pending. Current value: {{$value}}.",
       "summary": "TraceFence telemetry outbox backlog crossed {{$threshold}}"
     }
+  },
+  {
+    "alert": "TraceFence Exporter Delivery Failure",
+    "alertType": "METRIC_BASED_ALERT",
+    "description": "A configured TraceFence telemetry exporter failed a bounded flush.",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "none",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "tracefence_exporter_failures_total",
+                  "timeAggregation": "increase",
+                  "spaceAggregation": "sum"
+                }
+              ],
+              "limit": 100,
+              "order": [{"key": {"name": "__result"}, "direction": "desc"}],
+              "filter": {"expression": ""},
+              "groupBy": [],
+              "legend": "TraceFence Exporter Delivery Failure"
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 0,
+            "channels": ["${TRACEFENCE_NOTIFICATION_CHANNEL}"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": {"evalWindow": "5m", "frequency": "1m"}
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "renotify": {
+        "enabled": false,
+        "interval": "30m",
+        "alertStates": ["firing"]
+      },
+      "usePolicy": false
+    },
+    "labels": {
+      "severity": "critical",
+      "team": "tracefence",
+      "component": "telemetry-exporter"
+    },
+    "annotations": {
+      "description": "A configured exporter failed to flush. Current value: {{$value}}.",
+      "summary": "TraceFence exporter failures crossed {{$threshold}}"
+    }
+  },
+  {
+    "alert": "TraceFence Proof Inconsistency",
+    "alertType": "METRIC_BASED_ALERT",
+    "description": "Authoritative runtime state or telemetry evidence was contradictory.",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "none",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "tracefence_proof_inconsistent_total",
+                  "timeAggregation": "increase",
+                  "spaceAggregation": "sum"
+                }
+              ],
+              "limit": 100,
+              "order": [{"key": {"name": "__result"}, "direction": "desc"}],
+              "filter": {"expression": ""},
+              "groupBy": [],
+              "legend": "TraceFence Proof Inconsistency"
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 0,
+            "channels": ["${TRACEFENCE_NOTIFICATION_CHANNEL}"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": {"evalWindow": "5m", "frequency": "1m"}
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "renotify": {
+        "enabled": false,
+        "interval": "30m",
+        "alertStates": ["firing"]
+      },
+      "usePolicy": false
+    },
+    "labels": {
+      "severity": "critical",
+      "team": "tracefence",
+      "component": "proof"
+    },
+    "annotations": {
+      "description": "A proof reached INCONSISTENT. Current value: {{$value}}.",
+      "summary": "TraceFence proof inconsistency crossed {{$threshold}}"
+    }
+  },
+  {
+    "alert": "TraceFence Recovery Postcondition Failure",
+    "alertType": "METRIC_BASED_ALERT",
+    "description": "A committed recovery action no longer satisfies its required postcondition.",
+    "ruleType": "threshold_rule",
+    "version": "v5",
+    "schemaVersion": "v2alpha1",
+    "condition": {
+      "compositeQuery": {
+        "queryType": "builder",
+        "panelType": "graph",
+        "unit": "none",
+        "queries": [
+          {
+            "type": "builder_query",
+            "spec": {
+              "name": "A",
+              "signal": "metrics",
+              "stepInterval": 60,
+              "aggregations": [
+                {
+                  "metricName": "tracefence_recovery_postcondition_failures_total",
+                  "timeAggregation": "increase",
+                  "spaceAggregation": "sum"
+                }
+              ],
+              "limit": 100,
+              "order": [{"key": {"name": "__result"}, "direction": "desc"}],
+              "filter": {"expression": ""},
+              "groupBy": [],
+              "legend": "TraceFence Recovery Postcondition Failure"
+            }
+          }
+        ]
+      },
+      "selectedQueryName": "A",
+      "thresholds": {
+        "kind": "basic",
+        "spec": [
+          {
+            "name": "critical",
+            "op": "above",
+            "matchType": "at_least_once",
+            "target": 0,
+            "channels": ["${TRACEFENCE_NOTIFICATION_CHANNEL}"]
+          }
+        ]
+      }
+    },
+    "evaluation": {
+      "kind": "rolling",
+      "spec": {"evalWindow": "5m", "frequency": "1m"}
+    },
+    "notificationSettings": {
+      "groupBy": [],
+      "renotify": {
+        "enabled": false,
+        "interval": "30m",
+        "alertStates": ["firing"]
+      },
+      "usePolicy": false
+    },
+    "labels": {
+      "severity": "critical",
+      "team": "tracefence",
+      "component": "recovery"
+    },
+    "annotations": {
+      "description": "A recovery postcondition failed. Current value: {{$value}}.",
+      "summary": "TraceFence recovery postcondition failures crossed {{$threshold}}"
+    }
   }
 ]

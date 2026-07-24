@@ -503,6 +503,20 @@ class ProofService:
             runtime_verdict,
             telemetry_proof.verdict,
         )
+        metric_attributes = {
+            "tracefence.run.id": command.run_id,
+            "tracefence.command.id": command.id,
+        }
+        if overall == ProofVerdict.INCONSISTENT:
+            telemetry.proof_inconsistent_total.add(
+                1,
+                attributes=metric_attributes,
+            )
+        if recovery_postcondition_verdict == ProofVerdict.INCONSISTENT:
+            telemetry.recovery_postcondition_failures_total.add(
+                1,
+                attributes=metric_attributes,
+            )
 
         discrepancies.extend(telemetry_proof.discrepancies)
         if unclassified:
