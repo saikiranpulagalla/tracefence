@@ -742,7 +742,9 @@ class SpawnService:
 
         activation_token = generate_token()
         intent.activation_token_hash = hash_token(activation_token)
-        intent.expires_at = utcnow() + timedelta(seconds=60)
+        intent.expires_at = utcnow() + timedelta(
+            seconds=settings.spawn_intent_ttl_seconds
+        )
         recovered = SpawnCreated(
             child_node_id=node.id,
             activation_token=activation_token,
@@ -776,7 +778,9 @@ class SpawnService:
         child_id = str(uuid4())
         child_scope_id = str(uuid4())
         activation_token = generate_token()
-        expires_at = utcnow() + timedelta(seconds=60)
+        expires_at = utcnow() + timedelta(
+            seconds=settings.spawn_intent_ttl_seconds
+        )
         now = utcnow()
 
         session.add(
