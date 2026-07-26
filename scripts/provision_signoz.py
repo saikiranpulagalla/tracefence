@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 from collections.abc import Iterator
 from contextlib import AsyncExitStack
@@ -12,12 +13,28 @@ from pathlib import Path
 from typing import Any
 
 from tracefence.evidence import _atomic_private_write
+from tracefence.signoz.mcp_client import (
+    MCPToolResultError,
+    ResponseSchemaError,
+    normalize_metric_catalog_names,
+    normalize_metric_query_values,
+)
 from tracefence.signoz.mcp_transport import create_mcp_http_client
+from tracefence.telemetry.schema import (
+    MetricDiscoveryError,
+    MetricDiscoveryObservation,
+    MetricPreflight,
+    MetricReference,
+    extract_metric_references,
+    validate_metric_references,
+    wait_for_metric_discovery,
+)
 
 DASHBOARD_TITLE = "TraceFence Control Integrity"
 ALERT_CHANNEL_PLACEHOLDER = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
 REQUIRED_TOOLS = {
     "signoz_list_metrics",
+    "signoz_query_metrics",
     "signoz_list_dashboards",
     "signoz_get_dashboard",
     "signoz_create_dashboard",
@@ -34,6 +51,14 @@ RESOURCE_URIS = (
     "signoz://alert/instructions",
     "signoz://alert/examples",
 )
+METRIC_DISCOVERY_DEADLINE_SECONDS = 60.0
+METRIC_DISCOVERY_POLL_SECONDS = 2.0
+_STARTUP_SIGNAL_METRIC = "tracefence_active_nodes"
+_BUILD_COMMIT_PATTERN = re.compile(r"^[0-9A-Za-z._-]{7,128}$")
+
+
+class _MetricDiscoverySchemaError(RuntimeError):
+    """A metric-discovery response was syntactically unsafe to trust."""
 
 
 def _json_digest(value: Any) -> str:
@@ -195,10 +220,10 @@ def _validate_dashboard(dashboard: dict[str, Any]) -> None:
         }:
             raise ValueError(f"Unsupported panel type on {widget.get('id')}")
         query = widget.get("query")
-        if not isinstance(query, dict) or query.get("queryType") not in {
-            "builder", "promql", "clickhouse_sql"
-        }:
-            raise ValueError(f"Widget {widget.get('id')} has no valid query envelope")
+        if not isinstance(query, dict) or query.get("queryType") != "builder":
+            raise ValueError(
+                f"Widget {widget.get('id')} must use the catalog-validated builder query envelope"
+            )
 
 
 def _validate_alerts(alerts: list[dict[str, Any]]) -> None:
@@ -226,6 +251,27 @@ def _validate_alerts(alerts: list[dict[str, Any]]) -> None:
             for tier in thresholds
         ):
             raise ValueError(f"Alert {name} must use the notification-channel placeholder")
+        composite = alert["condition"].get("compositeQuery")
+        if not isinstance(composite, dict):
+            raise ValueError(f"Alert {name} has no valid composite query")
+        queries = composite.get("queries")
+        if not isinstance(queries, list) or not queries:
+            raise ValueError(f"Alert {name} has no catalog-validated metric query")
+        for query in queries:
+            if not isinstance(query, dict) or query.get("type") != "builder_query":
+                raise ValueError(f"Alert {name} must use a builder metric query")
+            spec = query.get("spec")
+            aggregations = spec.get("aggregations") if isinstance(spec, dict) else None
+            if not isinstance(aggregations, list) or not aggregations:
+                raise ValueError(f"Alert {name} has no metric aggregation")
+
+
+def _metric_references(
+    dashboard: dict[str, Any], alerts: list[dict[str, Any]]
+) -> tuple[MetricReference, ...]:
+    references = extract_metric_references(dashboard, alerts)
+    validate_metric_references(references)
+    return references
 
 
 def _substitute_channel(value: Any, channel: str) -> Any:
@@ -264,6 +310,100 @@ async def _read_resources(session: Any) -> dict[str, str]:
     return resources
 
 
+async def _list_tracefence_metric_names(session: Any) -> set[str]:
+    result = await session.call_tool(
+        "signoz_list_metrics",
+        arguments={"searchText": "tracefence_", "limit": 100, "timeRange": "1h"},
+    )
+    if _tool_failed(result):
+        raise RuntimeError("signoz_list_metrics returned an MCP error")
+    try:
+        return normalize_metric_catalog_names(result)
+    except (MCPToolResultError, ResponseSchemaError) as exc:
+        raise _MetricDiscoverySchemaError(
+            "signoz_list_metrics returned an invalid metric catalog response"
+        ) from exc
+
+
+def _required_build_commit() -> str:
+    build_commit = os.getenv("TRACEFENCE_BUILD_COMMIT", "").strip()
+    if not _BUILD_COMMIT_PATTERN.fullmatch(build_commit):
+        raise RuntimeError(
+            "TRACEFENCE_BUILD_COMMIT is required and must be a safe build identity "
+            "for SigNoz metric discovery"
+        )
+    return build_commit
+
+
+def _startup_metric_filter() -> str:
+    return (
+        "service.name = 'tracefence-control-plane' AND "
+        f"tracefence.build.commit = '{_required_build_commit()}'"
+    )
+
+
+async def _current_startup_metric_query_succeeded(session: Any) -> bool:
+    result = await session.call_tool(
+        "signoz_query_metrics",
+        arguments={
+            "searchContext": "TraceFence current startup telemetry preflight",
+            "metricName": _STARTUP_SIGNAL_METRIC,
+            "metricType": "gauge",
+            "isMonotonic": False,
+            "temporality": "unspecified",
+            "timeAggregation": "latest",
+            "spaceAggregation": "max",
+            "requestType": "scalar",
+            "reduceTo": "last",
+            "timeRange": "5m",
+            "filter": _startup_metric_filter(),
+        },
+    )
+    if _tool_failed(result):
+        raise RuntimeError("signoz_query_metrics returned an MCP error")
+    try:
+        return bool(
+            normalize_metric_query_values(
+                result,
+                expected_metric_name=_STARTUP_SIGNAL_METRIC,
+            )
+        )
+    except (MCPToolResultError, ResponseSchemaError) as exc:
+        raise _MetricDiscoverySchemaError(
+            "signoz_query_metrics returned an invalid startup telemetry response"
+        ) from exc
+
+
+async def _preflight_metric_discovery(
+    session: Any, references: tuple[MetricReference, ...]
+) -> MetricPreflight:
+    async def fetch() -> MetricDiscoveryObservation:
+        metric_names = await _list_tracefence_metric_names(session)
+        live_metric_query_succeeded = await _current_startup_metric_query_succeeded(session)
+        return MetricDiscoveryObservation(
+            observed_metric_names=frozenset(metric_names),
+            live_metric_query_succeeded=live_metric_query_succeeded,
+        )
+
+    return await wait_for_metric_discovery(
+        fetch,
+        references,
+        deadline_seconds=METRIC_DISCOVERY_DEADLINE_SECONDS,
+        poll_seconds=METRIC_DISCOVERY_POLL_SECONDS,
+    )
+
+
+def _record_metric_preflight(evidence: dict[str, Any], preflight: MetricPreflight) -> None:
+    evidence.update(preflight.as_evidence())
+
+
+def _write_evidence(evidence_path: Path, evidence: dict[str, Any]) -> None:
+    _atomic_private_write(
+        evidence_path,
+        (json.dumps(evidence, indent=2, default=str) + "\n").encode("utf-8"),
+    )
+
+
 async def provision(
     dashboard_path: Path,
     alerts_path: Path,
@@ -283,6 +423,7 @@ async def provision(
     if not api_key:
         print("FAIL SIGNOZ_API_KEY is required", file=sys.stderr)
         return 1
+    _required_build_commit()
     channel = os.getenv("TRACEFENCE_NOTIFICATION_CHANNEL", "").strip()
     if not skip_alerts and not channel:
         print(
@@ -301,6 +442,7 @@ async def provision(
     alerts = json.loads(alerts_text)
     _validate_dashboard(dashboard)
     _validate_alerts(alerts)
+    metric_references = _metric_references(dashboard, alerts)
 
     spec_digest = _json_digest({"dashboard": dashboard, "alerts": alerts})
     dashboard = json.loads(json.dumps(dashboard))
@@ -336,28 +478,45 @@ async def provision(
                 raise RuntimeError(f"Missing SigNoz MCP tools: {', '.join(missing)}")
             evidence["available_tools"] = sorted(tools)
             evidence["resources"] = await _read_resources(session)
-
-            metric_result = await session.call_tool(
-                "signoz_list_metrics",
-                arguments={"searchText": "tracefence_", "limit": 100, "timeRange": "1h"},
-            )
-            metric_names = _collect_strings(
-                _normalize_result(metric_result), {"metricName", "metric_name", "name"}
-            )
-            expected_metrics = {
-                agg["metricName"]
-                for widget in dashboard["widgets"]
-                for query in widget["query"].get("builder", {}).get("queryData", [])
-                for agg in query.get("aggregations", [])
-                if agg.get("metricName")
-            }
-            missing_metrics = sorted(expected_metrics - metric_names)
-            if missing_metrics:
-                raise RuntimeError(
-                    "TraceFence telemetry is not visible in SigNoz yet; missing metrics: "
-                    + ", ".join(missing_metrics)
+            try:
+                metric_preflight = await _preflight_metric_discovery(session, metric_references)
+            except MetricDiscoveryError:
+                evidence["metric_discovery_error_code"] = (
+                    "METRIC_DISCOVERY_DEADLINE_EXCEEDED"
                 )
-            evidence["metrics"] = sorted(metric_names)
+                _write_evidence(evidence_path, evidence)
+                raise
+            except _MetricDiscoverySchemaError:
+                evidence["metric_discovery_error_code"] = "MCP_METRIC_DISCOVERY_SCHEMA_ERROR"
+                _write_evidence(evidence_path, evidence)
+                raise
+            except RuntimeError:
+                evidence["metric_discovery_error_code"] = "MCP_METRIC_DISCOVERY_FAILED"
+                _write_evidence(evidence_path, evidence)
+                raise
+            _record_metric_preflight(evidence, metric_preflight)
+            if metric_preflight.startup_required_missing:
+                _write_evidence(evidence_path, evidence)
+                raise RuntimeError(
+                    "startup telemetry is not visible; missing startup-required metrics: "
+                    + ", ".join(metric_preflight.startup_required_missing)
+                )
+            if not metric_preflight.live_metric_query_succeeded:
+                _write_evidence(evidence_path, evidence)
+                raise RuntimeError(
+                    "startup telemetry is not visible; the current TraceFence metric query "
+                    "returned no data"
+                )
+            if metric_preflight.event_driven_not_yet_observed:
+                print(
+                    "INFO Declared event-driven metrics have not emitted yet: "
+                    + ", ".join(metric_preflight.event_driven_not_yet_observed)
+                )
+            if metric_preflight.failure_only_not_yet_observed:
+                print(
+                    "INFO Declared failure-only metrics are absent as expected: "
+                    + ", ".join(metric_preflight.failure_only_not_yet_observed)
+                )
 
             dashboard_list = await session.call_tool(
                 "signoz_list_dashboards", arguments={"limit": "1000", "offset": "0"}
@@ -482,10 +641,7 @@ async def provision(
                         }
                     )
 
-    _atomic_private_write(
-        evidence_path,
-        (json.dumps(evidence, indent=2, default=str) + "\n").encode("utf-8"),
-    )
+    _write_evidence(evidence_path, evidence)
     print(f"PASS Dashboard: {evidence['dashboard']['status']}")
     for alert in evidence["alerts"]:
         print(f"PASS Alert {alert['name']}: {alert['status']}")

@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 from collections.abc import Iterator
 from contextlib import AsyncExitStack
@@ -14,19 +15,21 @@ from typing import Any
 import httpx
 
 from tracefence.evidence import EvidenceIntegrityError, resolve_evidence_path
+from tracefence.signoz.mcp_client import (
+    MCPToolResultError,
+    ResponseSchemaError,
+    normalize_metric_catalog_names,
+    normalize_metric_query_values,
+)
 from tracefence.signoz.mcp_transport import create_mcp_http_client
+from tracefence.telemetry.schema import (
+    MetricDiscoveryObservation,
+    MetricReference,
+    extract_metric_references,
+    validate_metric_references,
+    wait_for_metric_discovery,
+)
 
-REQUIRED_METRICS = {
-    "tracefence_active_nodes",
-    "tracefence_unacknowledged_live_nodes",
-    "tracefence_orphan_nodes",
-    "tracefence_telemetry_outbox_pending",
-    "tracefence_control_commands_total",
-    "tracefence_actions_denied_total",
-    "tracefence_stale_action_attempts_total",
-    "tracefence_stale_actions_committed_total",
-    "tracefence_action_gateway_duration_ms",
-}
 REQUIRED_TOOLS = {
     "signoz_list_metrics",
     "signoz_search_traces",
@@ -45,6 +48,14 @@ ALERT_NAMES = {
 
 ALERT_CHANNEL_PLACEHOLDER = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
 ROOT = Path(__file__).resolve().parents[1]
+METRIC_DISCOVERY_DEADLINE_SECONDS = 60.0
+METRIC_DISCOVERY_POLL_SECONDS = 2.0
+_STARTUP_SIGNAL_METRIC = "tracefence_active_nodes"
+_BUILD_COMMIT_PATTERN = re.compile(r"^[0-9A-Za-z._-]{7,128}$")
+
+
+class _MetricDiscoverySchemaError(RuntimeError):
+    """A metric-discovery response was syntactically unsafe to trust."""
 
 
 def _json_digest(value: Any) -> str:
@@ -75,10 +86,10 @@ def _extract_ids(value: Any) -> list[dict[str, str]]:
     return rows
 
 
-def _local_spec() -> tuple[str, list[dict[str, Any]]]:
+def _local_spec() -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     dashboard = json.loads((ROOT / "observability" / "dashboard.json").read_text())
     alerts = json.loads((ROOT / "observability" / "alerts.json").read_text())
-    return _json_digest({"dashboard": dashboard, "alerts": alerts}), alerts
+    return _json_digest({"dashboard": dashboard, "alerts": alerts}), dashboard, alerts
 
 
 def _normalize(result: Any) -> Any:
@@ -168,6 +179,118 @@ def _strings(value: Any, keys: set[str]) -> set[str]:
     return result
 
 
+def _metric_references(
+    dashboard: dict[str, Any], alerts: list[dict[str, Any]]
+) -> tuple[MetricReference, ...]:
+    references = extract_metric_references(dashboard, alerts)
+    validate_metric_references(references)
+    return references
+
+
+async def _list_tracefence_metric_names(session: Any) -> set[str]:
+    metrics = await session.call_tool(
+        "signoz_list_metrics",
+        arguments={"searchText": "tracefence_", "limit": 100, "timeRange": "1h"},
+    )
+    if _tool_failed(metrics):
+        raise RuntimeError("signoz_list_metrics returned an MCP error")
+    try:
+        return normalize_metric_catalog_names(metrics)
+    except (MCPToolResultError, ResponseSchemaError) as exc:
+        raise _MetricDiscoverySchemaError(
+            "signoz_list_metrics returned an invalid metric catalog response"
+        ) from exc
+
+
+def _required_build_commit() -> str:
+    build_commit = os.getenv("TRACEFENCE_BUILD_COMMIT", "").strip()
+    if not _BUILD_COMMIT_PATTERN.fullmatch(build_commit):
+        raise RuntimeError(
+            "TRACEFENCE_BUILD_COMMIT is required and must be a safe build identity "
+            "for SigNoz metric discovery"
+        )
+    return build_commit
+
+
+def _startup_metric_filter() -> str:
+    return (
+        "service.name = 'tracefence-control-plane' AND "
+        f"tracefence.build.commit = '{_required_build_commit()}'"
+    )
+
+
+async def _current_startup_metric_query_succeeded(session: Any) -> bool:
+    result = await session.call_tool(
+        "signoz_query_metrics",
+        arguments={
+            "searchContext": "TraceFence current startup telemetry verification",
+            "metricName": _STARTUP_SIGNAL_METRIC,
+            "metricType": "gauge",
+            "isMonotonic": False,
+            "temporality": "unspecified",
+            "timeAggregation": "latest",
+            "spaceAggregation": "max",
+            "requestType": "scalar",
+            "reduceTo": "last",
+            "timeRange": "5m",
+            "filter": _startup_metric_filter(),
+        },
+    )
+    if _tool_failed(result):
+        raise RuntimeError("signoz_query_metrics returned an MCP error")
+    try:
+        return bool(
+            normalize_metric_query_values(
+                result,
+                expected_metric_name=_STARTUP_SIGNAL_METRIC,
+            )
+        )
+    except (MCPToolResultError, ResponseSchemaError) as exc:
+        raise _MetricDiscoverySchemaError(
+            "signoz_query_metrics returned an invalid startup telemetry response"
+        ) from exc
+
+
+async def _verify_metric_preflight(
+    session: Any, references: tuple[MetricReference, ...], failures: list[str]
+) -> None:
+    async def fetch() -> MetricDiscoveryObservation:
+        metric_names = await _list_tracefence_metric_names(session)
+        live_metric_query_succeeded = await _current_startup_metric_query_succeeded(session)
+        return MetricDiscoveryObservation(
+            observed_metric_names=frozenset(metric_names),
+            live_metric_query_succeeded=live_metric_query_succeeded,
+        )
+
+    preflight = await wait_for_metric_discovery(
+        fetch,
+        references,
+        deadline_seconds=METRIC_DISCOVERY_DEADLINE_SECONDS,
+        poll_seconds=METRIC_DISCOVERY_POLL_SECONDS,
+    )
+    if preflight.startup_required_missing:
+        failures.append(
+            "startup telemetry is not visible; missing startup-required metrics: "
+            + ", ".join(preflight.startup_required_missing)
+        )
+    else:
+        print("PASS Startup-required TraceFence metrics are queryable")
+    if not preflight.live_metric_query_succeeded:
+        failures.append(
+            "startup telemetry is not visible; the current TraceFence metric query returned no data"
+        )
+    if preflight.event_driven_not_yet_observed:
+        print(
+            "INFO Declared event-driven metrics have not emitted yet: "
+            + ", ".join(preflight.event_driven_not_yet_observed)
+        )
+    if preflight.failure_only_not_yet_observed:
+        print(
+            "INFO Declared failure-only metrics are absent as expected: "
+            + ", ".join(preflight.failure_only_not_yet_observed)
+        )
+
+
 async def verify(
     signoz_url: str,
     mcp_url: str,
@@ -177,6 +300,12 @@ async def verify(
     evidence_signing_key: str | None,
 ) -> int:
     failures: list[str] = []
+    try:
+        spec_digest, dashboard_spec, alert_templates = _local_spec()
+        metric_references = _metric_references(dashboard_spec, alert_templates)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"FAIL Checked-in observability specification is invalid: {exc}", file=sys.stderr)
+        return 1
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         probes = [
             ("SigNoz UI", signoz_url),
@@ -197,6 +326,10 @@ async def verify(
         failures.append("SIGNOZ_API_KEY is not configured")
     else:
         print("PASS SIGNOZ_API_KEY configured")
+    try:
+        _required_build_commit()
+    except RuntimeError as exc:
+        failures.append(str(exc))
 
     if not failures:
         try:
@@ -222,27 +355,16 @@ async def verify(
                     else:
                         print("PASS Required SigNoz MCP tools available")
 
-                    metrics = await session.call_tool(
-                        "signoz_list_metrics",
-                        arguments={"searchText": "tracefence_", "limit": 100, "timeRange": "1h"},
-                    )
-                    if _tool_failed(metrics):
-                        failures.append("signoz_list_metrics returned an MCP error")
-                    metric_names = _strings(
-                        _normalize(metrics), {"name", "metricName", "metric_name"}
-                    )
-                    missing_metrics = sorted(REQUIRED_METRICS - metric_names)
-                    if missing_metrics:
-                        failures.append("Missing TraceFence metrics: " + ", ".join(missing_metrics))
-                    else:
-                        print("PASS All required TraceFence metrics are queryable")
+                    try:
+                        await _verify_metric_preflight(session, metric_references, failures)
+                    except RuntimeError as exc:
+                        failures.append(str(exc))
 
                     dashboards = await session.call_tool(
                         "signoz_list_dashboards", arguments={"limit": "1000", "offset": "0"}
                     )
                     if _tool_failed(dashboards):
                         failures.append("signoz_list_dashboards returned an MCP error")
-                    spec_digest, alert_templates = _local_spec()
                     dashboard_rows = _extract_ids(_normalize(dashboards))
                     dashboard_row = next(
                         (row for row in dashboard_rows if row["title"] == DASHBOARD_TITLE),
