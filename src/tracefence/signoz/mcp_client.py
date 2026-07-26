@@ -85,6 +85,30 @@ class ResponseSchemaError(ValueError):
     pass
 
 
+class _AdvisoryKind(StrEnum):
+    NO_PAGINATION = "NO_PAGINATION"
+    PAGE_COMPLETE = "PAGE_COMPLETE"
+    PAGE_INCOMPLETE = "PAGE_INCOMPLETE"
+    METRICS_DECISION = "METRICS_DECISION"
+    DECISION_WARNING = "DECISION_WARNING"
+    MALFORMED_METRICS_DECISION = "MALFORMED_METRICS_DECISION"
+    BACKEND_WARNING = "BACKEND_WARNING"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True)
+class _AdvisoryState:
+    kind: _AdvisoryKind
+
+
+@dataclass(frozen=True, slots=True)
+class _QueryBuilderPage:
+    query_name: str
+    rows: list[Any]
+    columns: list[str] | None
+    next_cursor: str | None
+
+
 _health_lock = threading.Lock()
 _last_success_at: str | None = None
 _last_status = "never_observed"
@@ -461,6 +485,10 @@ _PAGINATION_NOTE = re.compile(
     r"^note: returned \d+ rows \(limit \d+\) .+"
     r"all matching results returned \(hasMore=false\)\.$"
 )
+_INCOMPLETE_PAGINATION_NOTE = re.compile(
+    r"^note: returned \d+ rows \(limit \d+\) .+"
+    r"(?:\(hasMore=true\)|more results exist|result limited|results limited|results truncated)\.$"
+)
 
 _FIELD_ALIASES = {
     "trace_id": "trace_id",
@@ -572,45 +600,68 @@ def _normalize_tool_result(
         raise ResponseSchemaError("MCP first text block was not valid JSON") from exc
     if not isinstance(parsed, dict):
         raise ResponseSchemaError("MCP first JSON content block must be an object")
-    for advisory in texts[1:]:
+    advisory_state = _validate_advisories(texts[1:])
+    if set(parsed) == {"results"}:
+        return parsed
+    return _adapt_query_builder_payload(
+        parsed,
+        defaults=defaults or {},
+        advisory_state=advisory_state,
+    )
+
+
+def _validate_advisories(advisories: list[str]) -> _AdvisoryState:
+    pagination_state = _AdvisoryState(_AdvisoryKind.NO_PAGINATION)
+    for advisory in advisories:
         try:
             json.loads(advisory)
         except json.JSONDecodeError:
-            _validate_advisory(advisory)
+            advisory_state = _validate_advisory(advisory)
         else:
             raise ResponseSchemaError(
                 "MCP result contained ambiguous multiple JSON content blocks"
             )
-    if set(parsed) == {"results"}:
-        return parsed
-    return _adapt_query_builder_payload(parsed, defaults=defaults or {})
-
-
-def _validate_advisory(advisory: str) -> None:
-    text = advisory.strip()
-    lower = text.lower()
-    if _PAGINATION_NOTE.fullmatch(text):
-        return
-    if text.startswith("[Decisions applied]\n"):
-        if any(marker in lower for marker in ("warning:", "unknown", "assumed")):
+        if advisory_state.kind is _AdvisoryKind.BACKEND_WARNING:
+            raise ResponseSchemaError("SigNoz backend warning makes evidence ambiguous")
+        if advisory_state.kind is _AdvisoryKind.DECISION_WARNING:
             raise ResponseSchemaError(
                 "SigNoz decision advisory contains a warning or assumption"
             )
+        if advisory_state.kind is _AdvisoryKind.MALFORMED_METRICS_DECISION:
+            raise ResponseSchemaError("SigNoz metrics decision advisory is malformed")
+        if advisory_state.kind is _AdvisoryKind.PAGE_INCOMPLETE:
+            raise ResponseSchemaError("SigNoz evidence page is incomplete")
+        if advisory_state.kind is _AdvisoryKind.UNKNOWN:
+            raise ResponseSchemaError("MCP result contained an unknown advisory content block")
+        if advisory_state.kind is _AdvisoryKind.PAGE_COMPLETE:
+            pagination_state = advisory_state
+    return pagination_state
+
+
+def _validate_advisory(advisory: str) -> _AdvisoryState:
+    text = advisory.strip()
+    lower = text.lower()
+    if _PAGINATION_NOTE.fullmatch(text):
+        return _AdvisoryState(_AdvisoryKind.PAGE_COMPLETE)
+    if _INCOMPLETE_PAGINATION_NOTE.fullmatch(text):
+        return _AdvisoryState(_AdvisoryKind.PAGE_INCOMPLETE)
+    if text.startswith("[Decisions applied]\n"):
+        if any(marker in lower for marker in ("warning:", "unknown", "assumed")):
+            return _AdvisoryState(_AdvisoryKind.DECISION_WARNING)
         lines = text.splitlines()[1:]
         if lines and all(line.startswith("  ") and ":" in line for line in lines):
-            return
-        raise ResponseSchemaError("SigNoz metrics decision advisory is malformed")
+            return _AdvisoryState(_AdvisoryKind.METRICS_DECISION)
+        return _AdvisoryState(_AdvisoryKind.MALFORMED_METRICS_DECISION)
     if lower.startswith("note: signoz backend returned non-fatal warnings:"):
-        raise ResponseSchemaError("SigNoz backend warning makes evidence ambiguous")
-    if "hasmore=true" in lower or "more results" in lower or "result limited" in lower:
-        raise ResponseSchemaError("SigNoz evidence page is incomplete")
-    raise ResponseSchemaError("MCP result contained an unknown advisory content block")
+        return _AdvisoryState(_AdvisoryKind.BACKEND_WARNING)
+    return _AdvisoryState(_AdvisoryKind.UNKNOWN)
 
 
 def _adapt_query_builder_payload(
     payload: dict[str, Any],
     *,
     defaults: dict[str, Any],
+    advisory_state: _AdvisoryState,
 ) -> dict[str, Any]:
     if set(payload) != {"status", "data"}:
         raise ResponseSchemaError(
@@ -652,30 +703,46 @@ def _adapt_query_builder_payload(
 
     normalized: list[dict[str, Any]] = []
     query_names: set[str] = set()
+    has_nonempty_cursor = False
     for result_set in result_sets:
-        if not isinstance(result_set, dict):
-            raise ResponseSchemaError("SigNoz Query Builder result set must be an object")
-        if not set(result_set).issubset({"queryName", "rows", "columns"}):
-            raise ResponseSchemaError(
-                "SigNoz result set contains an ambiguous row container"
-            )
-        query_name = result_set.get("queryName")
-        if not isinstance(query_name, str) or not query_name:
-            raise ResponseSchemaError("SigNoz Query Builder result set lacks queryName")
-        if query_name in query_names:
+        page = _parse_query_builder_page(result_set)
+        if page.query_name in query_names:
             raise ResponseSchemaError("SigNoz Query Builder queryName is duplicated")
-        query_names.add(query_name)
-        rows = result_set.get("rows")
-        if rows is None:
-            rows = []
-        if not isinstance(rows, list):
-            raise ResponseSchemaError("SigNoz Query Builder rows must be an array")
-        columns = _parse_column_aliases(result_set.get("columns"))
-        for row in rows:
+        query_names.add(page.query_name)
+        has_nonempty_cursor = has_nonempty_cursor or bool(page.next_cursor)
+        for row in page.rows:
             normalized.append(
-                _adapt_query_builder_row(row, columns=columns, defaults=defaults)
+                _adapt_query_builder_row(row, columns=page.columns, defaults=defaults)
             )
+    if has_nonempty_cursor and advisory_state.kind is not _AdvisoryKind.PAGE_COMPLETE:
+        raise ResponseSchemaError("SigNoz evidence page is incomplete")
     return {"results": normalized}
+
+
+def _parse_query_builder_page(result_set: Any) -> _QueryBuilderPage:
+    if not isinstance(result_set, dict):
+        raise ResponseSchemaError("SigNoz Query Builder result set must be an object")
+    if not set(result_set).issubset({"queryName", "rows", "columns", "nextCursor"}):
+        raise ResponseSchemaError("SigNoz result set contains an ambiguous row container")
+    query_name = result_set.get("queryName")
+    if not isinstance(query_name, str) or not query_name:
+        raise ResponseSchemaError("SigNoz Query Builder result set lacks queryName")
+    rows = result_set.get("rows")
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list):
+        raise ResponseSchemaError("SigNoz Query Builder rows must be an array")
+    next_cursor = result_set.get("nextCursor")
+    if next_cursor is not None and not isinstance(next_cursor, str):
+        raise ResponseSchemaError("SigNoz Query Builder nextCursor must be a string")
+    if "nextCursor" in result_set and next_cursor is None:
+        raise ResponseSchemaError("SigNoz Query Builder nextCursor must be a string")
+    return _QueryBuilderPage(
+        query_name=query_name,
+        rows=rows,
+        columns=_parse_column_aliases(result_set.get("columns")),
+        next_cursor=next_cursor,
+    )
 
 
 def _parse_column_aliases(raw_columns: Any) -> list[str] | None:
