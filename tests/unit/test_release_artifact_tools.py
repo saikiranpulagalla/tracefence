@@ -140,3 +140,14 @@ def test_lock_normalizer_restores_upstream_windows_marker(tmp_path: Path) -> Non
     assert 'pywin32==312 ; sys_platform == "win32"' in lock.read_text(
         encoding="utf-8"
     )
+
+
+def test_cyclonedx_cli_is_declared_and_hash_locked_for_release_artifacts() -> None:
+    root = Path(__file__).resolve().parents[2]
+    build_input = (root / "requirements-build.in").read_text(encoding="utf-8")
+    build_lock = (root / "requirements-lock" / "build.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "cyclonedx-bom==7.3.1" in build_input
+    assert "cyclonedx-bom==7.3.1" in build_lock

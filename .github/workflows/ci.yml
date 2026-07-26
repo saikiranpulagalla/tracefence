@@ -64,3 +64,15 @@ jobs:
           assert root.joinpath('index.html').is_file()
           assert root.joinpath('app.js').is_file()
           PY
+      - name: Verify release-artifact tooling in a clean environment
+        run: |
+          python -m venv /tmp/tracefence-release-tools
+          /tmp/tracefence-release-tools/bin/python -m pip install --require-hashes \
+            -r requirements-lock/development.txt \
+            -r requirements-lock/full.txt \
+            -r requirements-lock/build.txt
+          /tmp/tracefence-release-tools/bin/python -m pip install -e . --no-deps
+          test -x /tmp/tracefence-release-tools/bin/cyclonedx-py
+          PATH="/tmp/tracefence-release-tools/bin:$PATH" \
+            PYTHON=/tmp/tracefence-release-tools/bin/python \
+            make release-artifacts
