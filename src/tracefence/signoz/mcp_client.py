@@ -845,8 +845,14 @@ def _parse_query_builder_page(result_set: Any) -> _QueryBuilderPage:
             raise ResponseSchemaError("SigNoz metric Query Builder data must be an array")
         columns = _parse_column_aliases(result_set["columns"])
         if columns is None:
-            raise ResponseSchemaError("SigNoz metric Query Builder data requires columns")
-        rows = [{"data": row} for row in raw_data]
+            # SigNoz uses columns=null for an otherwise empty scalar page.
+            if raw_data:
+                raise ResponseSchemaError(
+                    "SigNoz metric Query Builder data requires columns"
+                )
+            rows = []
+        else:
+            rows = [{"data": row} for row in raw_data]
         next_cursor = None
     else:
         raise ResponseSchemaError("SigNoz result set contains an ambiguous row container")
