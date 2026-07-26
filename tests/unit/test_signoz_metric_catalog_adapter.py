@@ -74,6 +74,20 @@ def test_metric_catalog_adapter_requires_the_official_complete_pagination_note()
         normalize_metric_catalog_names(incomplete_note)
 
 
+def test_metric_catalog_adapter_rejects_structured_content_without_official_advisory() -> None:
+    result = SimpleNamespace(
+        structuredContent={
+            "status": "success",
+            "data": {"metrics": [{"metricName": "tracefence_active_nodes"}]},
+        },
+        content=[],
+        isError=False,
+    )
+
+    with pytest.raises(ResponseSchemaError, match="official JSON-first content"):
+        normalize_metric_catalog_names(result)
+
+
 @pytest.mark.parametrize(
     "payload",
     (

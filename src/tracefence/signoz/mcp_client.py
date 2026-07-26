@@ -653,30 +653,27 @@ def normalize_metric_catalog_names(result: Any) -> set[str]:
         structured = getattr(result, "structured_content", None)
     content = getattr(result, "content", None)
     if structured is not None:
-        if content not in (None, [], ""):
-            raise ResponseSchemaError(
-                "MCP metric catalog result contained additional content beside structured data"
-            )
-        payload = structured
-    else:
-        if not isinstance(content, list) or not content:
-            raise ResponseSchemaError("MCP metric catalog result has no structured content")
-        texts: list[str] = []
-        for block in content:
-            block_type = getattr(block, "type", "text")
-            text = getattr(block, "text", None)
-            if block_type != "text" or not isinstance(text, str):
-                raise ResponseSchemaError("MCP metric catalog contained unexpected executable content")
-            texts.append(text)
-        try:
-            payload = json.loads(texts[0])
-        except json.JSONDecodeError as exc:
-            raise ResponseSchemaError("MCP metric catalog first text block was not JSON") from exc
-        advisory_state = _validate_advisories(texts[1:])
-        if advisory_state.kind is not _AdvisoryKind.PAGE_COMPLETE:
-            raise ResponseSchemaError(
-                "MCP metric catalog response lacks a complete pagination advisory"
-            )
+        raise ResponseSchemaError(
+            "MCP metric catalog must use the official JSON-first content with a completeness advisory"
+        )
+    if not isinstance(content, list) or not content:
+        raise ResponseSchemaError("MCP metric catalog result has no structured content")
+    texts: list[str] = []
+    for block in content:
+        block_type = getattr(block, "type", "text")
+        text = getattr(block, "text", None)
+        if block_type != "text" or not isinstance(text, str):
+            raise ResponseSchemaError("MCP metric catalog contained unexpected executable content")
+        texts.append(text)
+    try:
+        payload = json.loads(texts[0])
+    except json.JSONDecodeError as exc:
+        raise ResponseSchemaError("MCP metric catalog first text block was not JSON") from exc
+    advisory_state = _validate_advisories(texts[1:])
+    if advisory_state.kind is not _AdvisoryKind.PAGE_COMPLETE:
+        raise ResponseSchemaError(
+            "MCP metric catalog response lacks a complete pagination advisory"
+        )
     if not isinstance(payload, dict) or set(payload) != {"status", "data"}:
         raise ResponseSchemaError("MCP metric catalog result has an ambiguous envelope")
     if payload.get("status") != "success":
