@@ -7,12 +7,14 @@ import json
 import os
 import sys
 from collections.abc import Iterator
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from tracefence.evidence import EvidenceIntegrityError, resolve_evidence_path
+from tracefence.signoz.mcp_transport import create_mcp_http_client
 
 REQUIRED_METRICS = {
     "tracefence_active_nodes",
@@ -201,9 +203,11 @@ async def verify(
             from mcp import ClientSession
             from mcp.client.streamable_http import streamable_http_client
 
-            async with streamable_http_client(
-                mcp_url, headers={"SIGNOZ-API-KEY": api_key}
-            ) as streams:
+            async with AsyncExitStack() as stack:
+                http_client = await stack.enter_async_context(create_mcp_http_client(api_key))
+                streams = await stack.enter_async_context(
+                    streamable_http_client(mcp_url, http_client=http_client)
+                )
                 read_stream, write_stream, _ = streams
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
