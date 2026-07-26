@@ -64,6 +64,10 @@ class Settings:
         "TRACEFENCE_CREDENTIAL_RECOVERY_TTL_SECONDS",
         30,
     )
+    spawn_intent_ttl_seconds: int = _int_env(
+        "TRACEFENCE_SPAWN_INTENT_TTL_SECONDS",
+        60,
+    )
     allow_insecure_dev: bool = _bool_env("TRACEFENCE_ALLOW_INSECURE_DEV", False)
     heartbeat_interval_seconds: int = _int_env("TRACEFENCE_HEARTBEAT_INTERVAL_SECONDS", 2)
     lease_ttl_seconds: int = _int_env("TRACEFENCE_LEASE_TTL_SECONDS", 7)
@@ -191,6 +195,10 @@ class Settings:
         if not 5 <= self.credential_recovery_ttl_seconds <= 300:
             errors.append(
                 "TRACEFENCE_CREDENTIAL_RECOVERY_TTL_SECONDS must be between 5 and 300"
+            )
+        if not 5 <= self.spawn_intent_ttl_seconds <= 300:
+            errors.append(
+                "TRACEFENCE_SPAWN_INTENT_TTL_SECONDS must be between 5 and 300"
             )
         if not 1 <= self.control_plane_workers <= 64:
             errors.append("TRACEFENCE_CONTROL_PLANE_WORKERS must be between 1 and 64")

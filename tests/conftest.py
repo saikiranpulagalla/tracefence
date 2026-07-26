@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+import os
+
+# Ordinary tests must not depend on whether the host scheduler pauses longer
+# than the production lease. Expiry tests set authoritative timestamps into the
+# past; production and live validation retain the seven-second default.
+os.environ["TRACEFENCE_ENV"] = "test"
+os.environ["TRACEFENCE_LEASE_TTL_SECONDS"] = "300"
+os.environ["TRACEFENCE_SPAWN_INTENT_TTL_SECONDS"] = "300"
+
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 

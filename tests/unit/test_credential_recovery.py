@@ -279,6 +279,133 @@ async def test_expired_recovery_envelope_rotates_pending_activation_credential(
 
 
 @pytest.mark.asyncio
+async def test_expired_recovery_envelope_renews_intent_with_configured_ttl(
+    session_factory,
+    monkeypatch,
+):
+    run = await create_seeded_run(session_factory, "configured-intent-renewal")
+    service = SpawnService(session_factory)
+    request = _spawn_request("configured-intent-renewal-operation")
+    first = await service.create_spawn(run.root_node_id, run.root_token, request)
+
+    with session_factory() as session, session.begin():
+        envelope = session.execute(
+            select(CredentialRecoveryEnvelope).where(
+                CredentialRecoveryEnvelope.operation_key == request.operation_key
+            )
+        ).scalar_one()
+        original_intent = session.execute(
+            select(SpawnIntent).where(SpawnIntent.child_node_id == first.child_node_id)
+        ).scalar_one()
+        original_token_hash = original_intent.activation_token_hash
+        envelope.expires_at = utcnow() - timedelta(seconds=1)
+
+    rotation_started_at = utcnow()
+    monkeypatch.setattr(spawn_module, "utcnow", lambda: rotation_started_at)
+    retried = await service.create_spawn(run.root_node_id, run.root_token, request)
+
+    assert retried.child_node_id == first.child_node_id
+    assert retried.activation_token != first.activation_token
+    assert retried.expires_at == rotation_started_at + timedelta(
+        seconds=settings.spawn_intent_ttl_seconds
+    )
+    with pytest.raises(ConflictError) as old_token:
+        await service.activate(
+            first.child_node_id,
+            NodeActivate(
+                operation_key="configured-intent-old-token",
+                activation_token=first.activation_token,
+            ),
+        )
+    assert old_token.value.code == "INVALID_ACTIVATION_TOKEN"
+    with session_factory() as session:
+        intent = session.execute(
+            select(SpawnIntent).where(SpawnIntent.child_node_id == first.child_node_id)
+        ).scalar_one()
+        assert intent.activation_token_hash != original_token_hash
+        assert intent.expires_at == retried.expires_at
+        assert session.scalar(select(func.count(Node.id)).where(Node.run_id == run.run_id)) == 2
+
+
+@pytest.mark.asyncio
+async def test_expired_spawn_intent_rejects_first_activation(session_factory):
+    run = await create_seeded_run(session_factory, "expired-spawn-intent")
+    service = SpawnService(session_factory)
+    created = await service.create_spawn(
+        run.root_node_id,
+        run.root_token,
+        _spawn_request("expired-spawn-intent-operation"),
+    )
+    with session_factory() as session, session.begin():
+        intent = session.execute(
+            select(SpawnIntent).where(SpawnIntent.child_node_id == created.child_node_id)
+        ).scalar_one()
+        intent.expires_at = utcnow() - timedelta(seconds=1)
+
+    with pytest.raises(ConflictError) as captured:
+        await service.activate(
+            created.child_node_id,
+            NodeActivate(
+                operation_key="expired-spawn-intent-activation",
+                activation_token=created.activation_token,
+            ),
+        )
+    assert captured.value.code == "ACTIVATION_TOKEN_EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_expired_recovery_and_spawn_intent_do_not_revive_pending_node(session_factory):
+    run = await create_seeded_run(session_factory, "expired-recovery-and-intent")
+    service = SpawnService(session_factory)
+    request = _spawn_request("expired-recovery-and-intent-operation")
+    first = await service.create_spawn(run.root_node_id, run.root_token, request)
+    with session_factory() as session, session.begin():
+        envelope = session.execute(
+            select(CredentialRecoveryEnvelope).where(
+                CredentialRecoveryEnvelope.operation_key == request.operation_key
+            )
+        ).scalar_one()
+        intent = session.execute(
+            select(SpawnIntent).where(SpawnIntent.child_node_id == first.child_node_id)
+        ).scalar_one()
+        original_token_hash = intent.activation_token_hash
+        envelope.expires_at = utcnow() - timedelta(seconds=1)
+        intent.expires_at = utcnow() - timedelta(seconds=1)
+
+    with pytest.raises(ConflictError) as captured:
+        await service.create_spawn(run.root_node_id, run.root_token, request)
+    assert captured.value.code == "CREDENTIAL_RECOVERY_EXPIRED"
+    with session_factory() as session:
+        intent = session.execute(
+            select(SpawnIntent).where(SpawnIntent.child_node_id == first.child_node_id)
+        ).scalar_one()
+        assert intent.activation_token_hash == original_token_hash
+        assert intent.expires_at <= utcnow()
+        assert session.scalar(select(func.count(Node.id)).where(Node.run_id == run.run_id)) == 2
+
+
+@pytest.mark.asyncio
+async def test_expired_parent_without_recovery_envelope_cannot_spawn(session_factory):
+    run = await create_seeded_run(session_factory, "expired-parent-first-spawn")
+    service = SpawnService(session_factory)
+    with session_factory() as session, session.begin():
+        root = session.get(Node, run.root_node_id)
+        assert root is not None
+        root.lease_expires_at = utcnow() - timedelta(seconds=1)
+
+    with pytest.raises(ConflictError) as captured:
+        await service.create_spawn(
+            run.root_node_id,
+            run.root_token,
+            _spawn_request("expired-parent-first-spawn-operation"),
+        )
+    assert captured.value.code == "LEASE_EXPIRED"
+    with session_factory() as session:
+        assert session.scalar(select(func.count(Node.id)).where(Node.run_id == run.run_id)) == 1
+        assert session.scalar(select(func.count(CredentialRecoveryEnvelope.id))) == 0
+
+
+@pytest.mark.asyncio
 async def test_expired_activation_envelope_rotates_node_credential(session_factory):
     run = await create_seeded_run(session_factory, "expired-activation-envelope")
     service = SpawnService(session_factory)

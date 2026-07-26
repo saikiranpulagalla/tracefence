@@ -33,7 +33,7 @@ install:
 	$(PYTHON) -m pip install -e '.[dev,mcp,otel-instrumentation]'
 
 test:
-	PYTHONPATH=src TRACEFENCE_ENV=test $(PYTHON) -m pytest -q
+	PYTHONPATH=src $(PYTHON) scripts/run_local_tests.py -q
 
 audit:
 	$(PYTHON) -m compileall -q src scripts tests
@@ -42,7 +42,7 @@ audit:
 	mypy src/tracefence
 	bandit -q -r src scripts -x tests
 	pip-audit
-	PYTHONPATH=src TRACEFENCE_ENV=test $(PYTHON) -m pytest -q --cov=tracefence --cov-branch --cov-fail-under=70
+	PYTHONPATH=src $(PYTHON) scripts/run_local_tests.py -q --cov=tracefence --cov-branch --cov-fail-under=70
 
 locks:
 	mkdir -p requirements-lock
