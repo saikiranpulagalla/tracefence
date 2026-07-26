@@ -7,6 +7,32 @@ from threading import Lock
 from opentelemetry import metrics, trace
 from opentelemetry.metrics import Observation
 
+from tracefence.telemetry.schema import (
+    METRIC_ACTION_ATTEMPTS_TOTAL,
+    METRIC_ACTION_GATEWAY_DURATION_MS,
+    METRIC_ACTIONS_ALLOWED_TOTAL,
+    METRIC_ACTIONS_DENIED_TOTAL,
+    METRIC_ACTIVE_NODES,
+    METRIC_CONTROL_ACK_LATENCY_MS,
+    METRIC_CONTROL_COMMANDS_TOTAL,
+    METRIC_EXPORTER_FAILURES_TOTAL,
+    METRIC_LEASES_EXPIRED_TOTAL,
+    METRIC_LIVE_AFFECTED_NODES,
+    METRIC_NODES_SPAWNED_TOTAL,
+    METRIC_ORPHAN_NODES,
+    METRIC_PROOF_GENERATION_DURATION_MS,
+    METRIC_PROOF_INCONSISTENT_TOTAL,
+    METRIC_RECOVERY_POSTCONDITION_FAILURES_TOTAL,
+    METRIC_RUNS_TOTAL,
+    METRIC_SCOPE_VALIDATION_DURATION_MS,
+    METRIC_STALE_ACTION_ATTEMPTS_TOTAL,
+    METRIC_STALE_ACTIONS_COMMITTED_TOTAL,
+    METRIC_STALE_VIOLATION_LATCHED,
+    METRIC_TELEMETRY_DELIVERY_LAST_SUCCESS_UNIXTIME,
+    METRIC_TELEMETRY_OUTBOX_PENDING,
+    METRIC_UNACKNOWLEDGED_LIVE_NODES,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class GaugeSnapshot:
@@ -132,71 +158,67 @@ class Telemetry:
 def build_telemetry() -> Telemetry:
     meter = metrics.get_meter("tracefence")
     meter.create_observable_gauge(
-        "tracefence_active_nodes",
+        METRIC_ACTIVE_NODES.name,
         callbacks=[_observe("active_nodes")],
         description="Registered nodes with live leases and active inherited scopes",
     )
     meter.create_observable_gauge(
-        "tracefence_live_affected_nodes",
+        METRIC_LIVE_AFFECTED_NODES.name,
         callbacks=[_observe("live_affected_nodes")],
         description="Live nodes affected by a control command",
     )
     meter.create_observable_gauge(
-        "tracefence_unacknowledged_live_nodes",
+        METRIC_UNACKNOWLEDGED_LIVE_NODES.name,
         callbacks=[_observe("unacknowledged_live_nodes")],
         description="Live affected nodes without a convergence classification",
     )
     meter.create_observable_gauge(
-        "tracefence_orphan_nodes",
+        METRIC_ORPHAN_NODES.name,
         callbacks=[_observe("orphan_nodes")],
         description="Live stale nodes that have not acknowledged or been blocked",
     )
     meter.create_observable_gauge(
-        "tracefence_telemetry_outbox_pending",
+        METRIC_TELEMETRY_OUTBOX_PENDING.name,
         callbacks=[_observe("telemetry_outbox_pending")],
         description="Durable safety telemetry events awaiting confirmed export",
     )
     meter.create_observable_gauge(
-        "tracefence_stale_violation_latched",
+        METRIC_STALE_VIOLATION_LATCHED.name,
         callbacks=[_observe("stale_violation_latched")],
         description="Latched process gauge backed by persistent stale-commit violations",
     )
     meter.create_observable_gauge(
-        "tracefence_telemetry_delivery_last_success_unixtime",
+        METRIC_TELEMETRY_DELIVERY_LAST_SUCCESS_UNIXTIME.name,
         callbacks=[_observe("telemetry_delivery_last_success_unixtime")],
         description="Last confirmed outbox delivery time for external dead-man monitoring",
     )
     return Telemetry(
         tracer=trace.get_tracer("tracefence"),
-        runs_total=meter.create_counter("tracefence_runs_total"),
-        nodes_spawned_total=meter.create_counter("tracefence_nodes_spawned_total"),
-        commands_total=meter.create_counter("tracefence_control_commands_total"),
-        action_attempts_total=meter.create_counter("tracefence_action_attempts_total"),
-        actions_allowed_total=meter.create_counter("tracefence_actions_allowed_total"),
-        actions_denied_total=meter.create_counter("tracefence_actions_denied_total"),
-        stale_attempts_total=meter.create_counter("tracefence_stale_action_attempts_total"),
-        stale_committed_total=meter.create_counter("tracefence_stale_actions_committed_total"),
-        exporter_failures_total=meter.create_counter(
-            "tracefence_exporter_failures_total"
-        ),
-        proof_inconsistent_total=meter.create_counter(
-            "tracefence_proof_inconsistent_total"
-        ),
+        runs_total=meter.create_counter(METRIC_RUNS_TOTAL.name),
+        nodes_spawned_total=meter.create_counter(METRIC_NODES_SPAWNED_TOTAL.name),
+        commands_total=meter.create_counter(METRIC_CONTROL_COMMANDS_TOTAL.name),
+        action_attempts_total=meter.create_counter(METRIC_ACTION_ATTEMPTS_TOTAL.name),
+        actions_allowed_total=meter.create_counter(METRIC_ACTIONS_ALLOWED_TOTAL.name),
+        actions_denied_total=meter.create_counter(METRIC_ACTIONS_DENIED_TOTAL.name),
+        stale_attempts_total=meter.create_counter(METRIC_STALE_ACTION_ATTEMPTS_TOTAL.name),
+        stale_committed_total=meter.create_counter(METRIC_STALE_ACTIONS_COMMITTED_TOTAL.name),
+        exporter_failures_total=meter.create_counter(METRIC_EXPORTER_FAILURES_TOTAL.name),
+        proof_inconsistent_total=meter.create_counter(METRIC_PROOF_INCONSISTENT_TOTAL.name),
         recovery_postcondition_failures_total=meter.create_counter(
-            "tracefence_recovery_postcondition_failures_total"
+            METRIC_RECOVERY_POSTCONDITION_FAILURES_TOTAL.name
         ),
-        leases_expired_total=meter.create_counter("tracefence_leases_expired_total"),
+        leases_expired_total=meter.create_counter(METRIC_LEASES_EXPIRED_TOTAL.name),
         action_gateway_duration_ms=meter.create_histogram(
-            "tracefence_action_gateway_duration_ms", unit="ms"
+            METRIC_ACTION_GATEWAY_DURATION_MS.name, unit="ms"
         ),
         scope_validation_duration_ms=meter.create_histogram(
-            "tracefence_scope_validation_duration_ms", unit="ms"
+            METRIC_SCOPE_VALIDATION_DURATION_MS.name, unit="ms"
         ),
         control_ack_latency_ms=meter.create_histogram(
-            "tracefence_control_ack_latency_ms", unit="ms"
+            METRIC_CONTROL_ACK_LATENCY_MS.name, unit="ms"
         ),
         proof_duration_ms=meter.create_histogram(
-            "tracefence_proof_generation_duration_ms", unit="ms"
+            METRIC_PROOF_GENERATION_DURATION_MS.name, unit="ms"
         ),
     )
 

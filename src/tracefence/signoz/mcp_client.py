@@ -551,6 +551,7 @@ _FIELD_ALIASES = {
     "metric.name": "metric_name",
     "value": "value",
     "__result": "value",
+    "__result_0": "value",
 }
 
 
@@ -608,6 +609,108 @@ def _normalize_tool_result(
         defaults=defaults or {},
         advisory_state=advisory_state,
     )
+
+
+def normalize_metric_query_values(result: Any, *, expected_metric_name: str) -> list[float]:
+    """Return finite scalar metric values from one strict SigNoz query result.
+
+    This is intentionally narrower than proof reconciliation.  Operational
+    preflights use it only to prove that a current metric query traversed the
+    OTLP-to-SigNoz path; it never substitutes for command-correlated evidence.
+    """
+
+    payload = _normalize_tool_result(
+        result,
+        defaults={"metric_name": expected_metric_name},
+    )
+    if set(payload) != {"results"} or not isinstance(payload["results"], list):
+        raise ResponseSchemaError("Metric query must contain exactly one results array")
+    values: list[float] = []
+    for row in payload["results"]:
+        if not isinstance(row, dict) or not set(row).issubset(
+            {"metric_name", "value", "timestamp_ms"}
+        ):
+            raise ResponseSchemaError("Metric query row has an ambiguous schema")
+        if row.get("metric_name") != expected_metric_name:
+            raise ResponseSchemaError("Metric query returned an unexpected metric name")
+        value = row.get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ResponseSchemaError("Metric query value is malformed")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ResponseSchemaError("Metric query value is non-finite")
+        values.append(numeric)
+    return values
+
+
+def normalize_metric_catalog_names(result: Any) -> set[str]:
+    """Return metric names from the official, complete list-metrics envelope."""
+
+    if bool(getattr(result, "isError", False) or getattr(result, "is_error", False)):
+        raise MCPToolResultError("MCP tool returned isError=true")
+    structured = getattr(result, "structuredContent", None)
+    if structured is None:
+        structured = getattr(result, "structured_content", None)
+    content = getattr(result, "content", None)
+    if structured is not None:
+        if content not in (None, [], ""):
+            raise ResponseSchemaError(
+                "MCP metric catalog result contained additional content beside structured data"
+            )
+        payload = structured
+    else:
+        if not isinstance(content, list) or not content:
+            raise ResponseSchemaError("MCP metric catalog result has no structured content")
+        texts: list[str] = []
+        for block in content:
+            block_type = getattr(block, "type", "text")
+            text = getattr(block, "text", None)
+            if block_type != "text" or not isinstance(text, str):
+                raise ResponseSchemaError("MCP metric catalog contained unexpected executable content")
+            texts.append(text)
+        try:
+            payload = json.loads(texts[0])
+        except json.JSONDecodeError as exc:
+            raise ResponseSchemaError("MCP metric catalog first text block was not JSON") from exc
+        advisory_state = _validate_advisories(texts[1:])
+        if advisory_state.kind is not _AdvisoryKind.PAGE_COMPLETE:
+            raise ResponseSchemaError(
+                "MCP metric catalog response lacks a complete pagination advisory"
+            )
+    if not isinstance(payload, dict) or set(payload) != {"status", "data"}:
+        raise ResponseSchemaError("MCP metric catalog result has an ambiguous envelope")
+    if payload.get("status") != "success":
+        raise ResponseSchemaError("MCP metric catalog result was not successful")
+    data = payload.get("data")
+    if not isinstance(data, dict) or set(data) != {"metrics"}:
+        raise ResponseSchemaError("MCP metric catalog data envelope is ambiguous")
+    metrics = data["metrics"]
+    if not isinstance(metrics, list):
+        raise ResponseSchemaError("MCP metric catalog metrics must be an array")
+    names: set[str] = set()
+    allowed_metric_keys = {
+        "description",
+        "metricName",
+        "type",
+        "temporality",
+        "isMonotonic",
+        "unit",
+    }
+    for metric in metrics:
+        if not isinstance(metric, dict) or not set(metric).issubset(allowed_metric_keys):
+            raise ResponseSchemaError("MCP metric catalog row has an ambiguous schema")
+        name = metric.get("metricName")
+        if not isinstance(name, str) or not name:
+            raise ResponseSchemaError("MCP metric catalog row lacks a metric name")
+        if name in names:
+            raise ResponseSchemaError("MCP metric catalog contains a duplicate metric name")
+        for key in ("description", "type", "temporality", "unit"):
+            if key in metric and not isinstance(metric[key], str):
+                raise ResponseSchemaError("MCP metric catalog metadata is malformed")
+        if "isMonotonic" in metric and not isinstance(metric["isMonotonic"], bool):
+            raise ResponseSchemaError("MCP metric catalog monotonicity metadata is malformed")
+        names.add(name)
+    return names
 
 
 def _validate_advisories(advisories: list[str]) -> _AdvisoryState:
@@ -722,25 +825,38 @@ def _adapt_query_builder_payload(
 def _parse_query_builder_page(result_set: Any) -> _QueryBuilderPage:
     if not isinstance(result_set, dict):
         raise ResponseSchemaError("SigNoz Query Builder result set must be an object")
-    if not set(result_set).issubset({"queryName", "rows", "columns", "nextCursor"}):
-        raise ResponseSchemaError("SigNoz result set contains an ambiguous row container")
     query_name = result_set.get("queryName")
     if not isinstance(query_name, str) or not query_name:
         raise ResponseSchemaError("SigNoz Query Builder result set lacks queryName")
-    rows = result_set.get("rows")
-    if rows is None:
-        rows = []
-    if not isinstance(rows, list):
-        raise ResponseSchemaError("SigNoz Query Builder rows must be an array")
-    next_cursor = result_set.get("nextCursor")
-    if next_cursor is not None and not isinstance(next_cursor, str):
-        raise ResponseSchemaError("SigNoz Query Builder nextCursor must be a string")
-    if "nextCursor" in result_set and next_cursor is None:
-        raise ResponseSchemaError("SigNoz Query Builder nextCursor must be a string")
+    legacy_keys = {"queryName", "rows", "columns", "nextCursor"}
+    metric_data_keys = {"queryName", "data", "columns"}
+    if set(result_set).issubset(legacy_keys):
+        rows = result_set.get("rows")
+        if rows is None:
+            rows = []
+        if not isinstance(rows, list):
+            raise ResponseSchemaError("SigNoz Query Builder rows must be an array")
+        next_cursor = result_set.get("nextCursor")
+        if next_cursor is not None and not isinstance(next_cursor, str):
+            raise ResponseSchemaError("SigNoz Query Builder nextCursor must be a string")
+        if "nextCursor" in result_set and next_cursor is None:
+            raise ResponseSchemaError("SigNoz Query Builder nextCursor must be a string")
+        columns = _parse_column_aliases(result_set.get("columns"))
+    elif set(result_set) == metric_data_keys:
+        raw_data = result_set["data"]
+        if not isinstance(raw_data, list):
+            raise ResponseSchemaError("SigNoz metric Query Builder data must be an array")
+        columns = _parse_column_aliases(result_set["columns"])
+        if columns is None:
+            raise ResponseSchemaError("SigNoz metric Query Builder data requires columns")
+        rows = [{"data": row} for row in raw_data]
+        next_cursor = None
+    else:
+        raise ResponseSchemaError("SigNoz result set contains an ambiguous row container")
     return _QueryBuilderPage(
         query_name=query_name,
         rows=rows,
-        columns=_parse_column_aliases(result_set.get("columns")),
+        columns=columns,
         next_cursor=next_cursor,
     )
 
