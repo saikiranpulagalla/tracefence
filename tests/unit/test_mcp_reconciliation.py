@@ -157,6 +157,17 @@ def test_complete_exact_command_evidence_verifies():
     assert result.trace_ids == ["a" * 32, "b" * 32, "c" * 32]
 
 
+def test_empty_supplementary_metrics_do_not_hide_exact_correlated_evidence():
+    payload = evidence()
+    payload["attempts_metric"]["results"] = []
+    payload["committed_metric"]["results"] = []
+
+    result = reconcile(payload)
+
+    assert result.verdict == ProofVerdict.VERIFIED
+    assert result.failure_kind is None
+
+
 def test_cross_command_blocked_rows_are_inconsistent():
     payload = evidence()
     payload["blocked_traces"]["results"][0]["command_id"] = "another-command"
