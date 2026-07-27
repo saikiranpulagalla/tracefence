@@ -6,7 +6,6 @@ import json
 import os
 import signal
 import sys
-import threading
 from typing import Any
 
 import httpx
@@ -55,17 +54,25 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _read_startup_payload() -> dict[str, Any]:
-    line = sys.stdin.readline()
+async def _read_startup_payload(reader: asyncio.StreamReader) -> dict[str, Any]:
+    line = await reader.readline()
     if not line:
         raise RuntimeError("Worker startup payload was not provided on stdin")
-    payload = json.loads(line)
+    try:
+        payload = json.loads(line.decode(sys.stdin.encoding or "utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Invalid worker startup payload") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("activation_token"), str):
         raise RuntimeError("Invalid worker startup payload")
     return payload
 
 
-async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
+async def run_worker(
+    args: argparse.Namespace,
+    startup: dict[str, Any],
+    *,
+    release_reader: asyncio.StreamReader,
+) -> int:
     configure_telemetry("tracefence-worker")
 
     carrier = startup.get("trace_context")
@@ -165,20 +172,29 @@ async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
 
             async def wait_for_work_release() -> None:
                 if args.wait_for_release:
-                    release_task = asyncio.create_task(_read_release_signal())
-                    lease_task = asyncio.create_task(lease_lost.wait())
-                    done, pending = await asyncio.wait(
-                        {release_task, lease_task},
-                        return_when=asyncio.FIRST_COMPLETED,
+                    release_task = asyncio.create_task(
+                        _read_release_signal(release_reader)
                     )
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    if lease_task in done and lease_lost.is_set():
-                        return
-                    release = release_task.result()
-                    if release.strip() != "GO":
-                        raise RuntimeError("Worker release signal was not received")
+                    lease_task = asyncio.create_task(lease_lost.wait())
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {release_task, lease_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if lease_task in done and lease_lost.is_set():
+                            return
+                        release = release_task.result()
+                        if release.strip() != "GO":
+                            raise RuntimeError("Worker release signal was not received")
+                    finally:
+                        for task in (release_task, lease_task):
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(
+                            release_task,
+                            lease_task,
+                            return_exceptions=True,
+                        )
                 else:
                     try:
                         await asyncio.wait_for(lease_lost.wait(), timeout=args.delay)
@@ -302,25 +318,24 @@ async def run_worker(args: argparse.Namespace, startup: dict[str, Any]) -> int:
                 await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
-async def _read_release_signal() -> str:
+async def _read_release_signal(reader: asyncio.StreamReader) -> str:
+    line = await reader.readline()
+    return line.decode(sys.stdin.encoding or "utf-8")
+
+
+async def _run_from_stdin(args: argparse.Namespace) -> int:
     loop = asyncio.get_running_loop()
-    result: asyncio.Future[str] = loop.create_future()
-
-    def read() -> None:
-        line = sys.stdin.readline()
-
-        def publish() -> None:
-            if not result.done():
-                result.set_result(line)
-
-        loop.call_soon_threadsafe(publish)
-
-    threading.Thread(
-        target=read,
-        name="tracefence-worker-release-reader",
-        daemon=True,
-    ).start()
-    return await result
+    reader = asyncio.StreamReader()
+    protocol = asyncio.StreamReaderProtocol(reader)
+    transport, _ = await loop.connect_read_pipe(
+        lambda: protocol,
+        sys.stdin.buffer,
+    )
+    try:
+        startup = await _read_startup_payload(reader)
+        return await run_worker(args, startup, release_reader=reader)
+    finally:
+        transport.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -353,9 +368,8 @@ def _install_signal_handlers() -> None:
 if __name__ == "__main__":
     _install_signal_handlers()
     arguments = parse_args()
-    startup_payload = _read_startup_payload()
     try:
-        exit_code = asyncio.run(run_worker(arguments, startup_payload))
+        exit_code = asyncio.run(_run_from_stdin(arguments))
     finally:
         force_flush_telemetry()
         shutdown_telemetry()

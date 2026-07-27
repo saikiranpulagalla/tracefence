@@ -209,6 +209,89 @@ def test_waiting_worker_terminates_without_stdin_thread_hang(worker_api):
     stdout, stderr = process.communicate(timeout=3)
 
     assert process.returncode != 0
+    assert "Fatal Python error" not in stderr
+    assert "_enter_buffered_busy" not in stderr
     assert state.activation_token not in "\0".join(command)
     assert state.activation_token not in stdout + stderr
     assert state.node_token not in stdout + stderr
+
+
+def test_waiting_worker_stops_after_lease_rejection_without_release_input(worker_api):
+    state, api_url = worker_api
+    state.heartbeat_status = 409
+    command = [
+        sys.executable,
+        "-m",
+        "tracefence.runtime.worker",
+        "--api-url",
+        api_url,
+        "--node-id",
+        "worker-node",
+        "--mode",
+        "cooperative",
+        "--wait-for-release",
+        "--heartbeat-interval",
+        "0.02",
+        "--max-heartbeat-failures",
+        "1",
+    ]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=ROOT,
+        env=environment,
+    )
+    assert process.stdin is not None
+    process.stdin.write(json.dumps({"activation_token": state.activation_token}) + "\n")
+    process.stdin.flush()
+
+    process.wait(timeout=5)
+    stdout, stderr = process.communicate(timeout=1)
+
+    assert process.returncode == 3, stderr
+    assert not any(path.endswith("/checkpoint") for path in state.paths)
+    assert "Fatal Python error" not in stderr
+    assert state.activation_token not in stdout + stderr
+    assert state.node_token not in stdout + stderr
+
+
+def test_waiting_worker_preserves_prebuffered_release_signal(worker_api):
+    state, api_url = worker_api
+    command = [
+        sys.executable,
+        "-m",
+        "tracefence.runtime.worker",
+        "--api-url",
+        api_url,
+        "--node-id",
+        "worker-node",
+        "--mode",
+        "cooperative",
+        "--wait-for-release",
+        "--heartbeat-interval",
+        "0.2",
+    ]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(ROOT / "src")
+
+    result = subprocess.run(
+        command,
+        input=json.dumps({"activation_token": state.activation_token}) + "\nGO\n",
+        text=True,
+        capture_output=True,
+        timeout=10,
+        cwd=ROOT,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert any(path.endswith("/checkpoint") for path in state.paths)
+    assert any(path.endswith("/complete") for path in state.paths)
+    assert state.activation_token not in result.stdout + result.stderr
+    assert state.node_token not in result.stdout + result.stderr
