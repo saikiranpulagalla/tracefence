@@ -32,3 +32,27 @@ async def test_release_reader_cancels_without_a_background_thread() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_termination_event_cancels_worker_task_before_returning() -> None:
+    worker_started = asyncio.Event()
+    worker_cancelled = asyncio.Event()
+    termination = asyncio.Event()
+
+    async def blocked_worker() -> int:
+        worker_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            worker_cancelled.set()
+
+    task = asyncio.create_task(
+        worker._await_worker_or_termination(blocked_worker(), termination)
+    )
+    await worker_started.wait()
+
+    termination.set()
+
+    assert await task == 143
+    assert worker_cancelled.is_set()

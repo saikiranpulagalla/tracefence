@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import sys
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -27,6 +28,7 @@ EXIT_INTERNAL_OR_TRANSPORT_FAILURE = 4
 EXIT_CHECKPOINT_DENIED = 5
 EXIT_COMPLETION_REJECTED = 6
 EXIT_ACTIVATION_REJECTED = 7
+EXIT_TERMINATED = 143
 
 
 class _LeaseLost(Exception):
@@ -323,6 +325,67 @@ async def _read_release_signal(reader: asyncio.StreamReader) -> str:
     return line.decode(sys.stdin.encoding or "utf-8")
 
 
+async def _await_worker_or_termination(
+    worker_task_input: Awaitable[int],
+    termination: asyncio.Event,
+) -> int:
+    """Return the worker result or cancel it after a loop-delivered SIGTERM."""
+
+    worker_task = asyncio.ensure_future(worker_task_input)
+    termination_task = asyncio.create_task(termination.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {worker_task, termination_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if termination_task in done:
+            worker_task.cancel()
+            await asyncio.gather(worker_task, return_exceptions=True)
+            return EXIT_TERMINATED
+        return worker_task.result()
+    finally:
+        for task in (worker_task, termination_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            worker_task,
+            termination_task,
+            return_exceptions=True,
+        )
+
+
+def _install_termination_event_handler(
+    loop: asyncio.AbstractEventLoop,
+    termination: asyncio.Event,
+) -> Callable[[], None]:
+    """Wake the owning asyncio loop when SIGTERM is received."""
+
+    if not hasattr(signal, "SIGTERM"):
+        return lambda: None
+
+    termination_signal = signal.SIGTERM
+    try:
+        loop.add_signal_handler(termination_signal, termination.set)
+    except (NotImplementedError, RuntimeError):
+        previous_handler = signal.getsignal(termination_signal)
+
+        def request_termination(_signum: int, _frame: object) -> None:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(termination.set)
+
+        signal.signal(termination_signal, request_termination)
+
+        def restore_signal_handler() -> None:
+            signal.signal(termination_signal, previous_handler)
+
+        return restore_signal_handler
+
+    def remove_signal_handler() -> None:
+        loop.remove_signal_handler(termination_signal)
+
+    return remove_signal_handler
+
+
 async def _run_from_stdin(args: argparse.Namespace) -> int:
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
@@ -336,6 +399,16 @@ async def _run_from_stdin(args: argparse.Namespace) -> int:
         return await run_worker(args, startup, release_reader=reader)
     finally:
         transport.close()
+
+
+async def _run_with_termination(args: argparse.Namespace) -> int:
+    loop = asyncio.get_running_loop()
+    termination = asyncio.Event()
+    remove_handler = _install_termination_event_handler(loop, termination)
+    try:
+        return await _await_worker_or_termination(_run_from_stdin(args), termination)
+    finally:
+        remove_handler()
 
 
 def parse_args() -> argparse.Namespace:
@@ -357,19 +430,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _install_signal_handlers() -> None:
-    def terminate(_signum: int, _frame: object) -> None:
-        raise SystemExit(143)
-
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, terminate)
-
-
 if __name__ == "__main__":
-    _install_signal_handlers()
     arguments = parse_args()
     try:
-        exit_code = asyncio.run(_run_from_stdin(arguments))
+        exit_code = asyncio.run(_run_with_termination(arguments))
     finally:
         force_flush_telemetry()
         shutdown_telemetry()
