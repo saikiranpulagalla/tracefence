@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts.run_local_tests import hermetic_test_environment
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -22,6 +24,7 @@ class _WorkerApi:
         self.completion_status = 204
         self.activation_token = "activation-secret-value-123456"
         self.node_token = "node-secret-value-123456789"
+        self.heartbeat_seen = threading.Event()
 
 
 @pytest.fixture
@@ -46,6 +49,7 @@ def worker_api():
                     },
                 )
             elif self.path.endswith("/heartbeat"):
+                state.heartbeat_seen.set()
                 self._json(state.heartbeat_status, {})
             elif self.path.endswith("/checkpoint"):
                 self._json(200, state.checkpoint_payload)
@@ -76,6 +80,12 @@ def worker_api():
         thread.join(timeout=2)
 
 
+def _worker_environment() -> dict[str, str]:
+    environment = hermetic_test_environment(os.environ)
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    return environment
+
+
 def _run_worker(
     state: _WorkerApi,
     api_url: str,
@@ -100,8 +110,7 @@ def _run_worker(
         "--max-heartbeat-failures",
         "1",
     ]
-    environment = dict(os.environ)
-    environment["PYTHONPATH"] = str(ROOT / "src")
+    environment = _worker_environment()
     result = subprocess.run(
         command,
         input=json.dumps({"activation_token": state.activation_token}) + "\n",
@@ -118,6 +127,21 @@ def _run_worker(
     assert state.activation_token not in result.stdout + result.stderr
     assert state.node_token not in result.stdout + result.stderr
     return result
+
+
+def test_worker_subprocess_environment_is_hermetic(monkeypatch):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=secret")
+    monkeypatch.setenv("SIGNOZ_API_KEY", "test-signoz-key")
+    monkeypatch.setenv("TRACEFENCE_NOTIFICATION_CHANNEL", "test-channel")
+
+    environment = _worker_environment()
+
+    assert environment["OTEL_SDK_DISABLED"] == "true"
+    assert environment["OTEL_EXPORTER_OTLP_ENDPOINT"] == ""
+    assert "OTEL_EXPORTER_OTLP_HEADERS" not in environment
+    assert "SIGNOZ_API_KEY" not in environment
+    assert "TRACEFENCE_NOTIFICATION_CHANNEL" not in environment
 
 
 def test_successful_worker_requires_allowed_checkpoint_and_completes(worker_api):
@@ -184,8 +208,7 @@ def test_waiting_worker_terminates_without_stdin_thread_hang(worker_api):
         "--heartbeat-interval",
         "0.2",
     ]
-    environment = dict(os.environ)
-    environment["PYTHONPATH"] = str(ROOT / "src")
+    environment = _worker_environment()
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -205,6 +228,9 @@ def test_waiting_worker_terminates_without_stdin_thread_hang(worker_api):
         assert time.monotonic() < deadline
         time.sleep(0.02)
 
+    # A heartbeat proves that the worker reached the release wait after activation.
+    assert state.heartbeat_seen.wait(timeout=5)
+
     process.terminate()
     stdout, stderr = process.communicate(timeout=3)
 
@@ -212,6 +238,7 @@ def test_waiting_worker_terminates_without_stdin_thread_hang(worker_api):
     assert "Fatal Python error" not in stderr
     assert "_enter_buffered_busy" not in stderr
     assert state.activation_token not in "\0".join(command)
+    assert process.returncode == 143
     assert state.activation_token not in stdout + stderr
     assert state.node_token not in stdout + stderr
 
@@ -235,8 +262,7 @@ def test_waiting_worker_stops_after_lease_rejection_without_release_input(worker
         "--max-heartbeat-failures",
         "1",
     ]
-    environment = dict(os.environ)
-    environment["PYTHONPATH"] = str(ROOT / "src")
+    environment = _worker_environment()
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -276,8 +302,7 @@ def test_waiting_worker_preserves_prebuffered_release_signal(worker_api):
         "--heartbeat-interval",
         "0.2",
     ]
-    environment = dict(os.environ)
-    environment["PYTHONPATH"] = str(ROOT / "src")
+    environment = _worker_environment()
 
     result = subprocess.run(
         command,
