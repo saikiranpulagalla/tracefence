@@ -2,131 +2,100 @@
 
 **Runtime-enforced cancellation and correction for dynamic AI-agent graphs.**
 
-TraceFence assumes that AI workers can be wrong, delayed or non-cooperative. It therefore
-places deterministic authority and live control-state validation at the side-effect boundary.
-A worker may ignore a cancellation message, but a registered worker cannot commit a
-TraceFence-mediated side effect after any inherited control scope becomes stale.
+TraceFence is a control plane for agent systems where a worker can be delayed, wrong, or
+non-cooperative. It makes the control plane—not a prompt, a cancellation message, or a
+telemetry dashboard—the authority that decides whether a protected side effect may commit.
 
-## Core guarantee
+> A registered descendant may keep computing after its work is cancelled or superseded, but it
+> cannot commit a TraceFence-mediated side effect once any inherited control scope is stale.
 
-> A registered descendant can continue computing after cancellation, but it cannot commit a
-> gateway-mediated side effect with a cancelled, superseded, expired or mismatched scope.
+TraceFence is a release-candidate reference implementation. It is intentionally honest about
+its boundaries: the included tools are database-backed simulations, persistence is SQLite-only,
+and live SigNoz reconciliation is an external release gate—not a claim this README can make on
+its own. See [Limitations](#limitations-and-non-goals) before using it beyond local evaluation.
 
-The checked-in scenario constructs a database-investigation subtree, supersedes that branch
-after stronger Redis evidence appears, and then releases an independently running
-non-compliant descendant that attempts `restart_postgres`.
+## What it solves
 
-Expected local result:
+Agent graphs change while they run. A supervisor can cancel one branch, supersede it with a
+correction, and allow unrelated branches to continue. In an ordinary workflow, a stale worker
+may still perform an action after it receives a cancellation too late. TraceFence closes that
+gap at the side-effect boundary.
+
+The included scenario models a database investigation:
+
+1. a branch investigates PostgreSQL;
+2. stronger Redis evidence supersedes that branch;
+3. a released non-compliant descendant tries to restart PostgreSQL and is denied;
+4. a replacement, bound to an immutable recovery contract, resets the Redis pool exactly once;
+5. a proof reconstructs what happened from authoritative state and, when configured, live
+   telemetry.
+
+Typical local result:
 
 ```text
 restart_postgres                 DENY / SCOPE_SUPERSEDED
-reset_redis_pool                  ALLOW / committed once
+reset_redis_pool                 ALLOW / committed once
 postgres restart count           0
 redis and checkout state         healthy
-control convergence              VERIFIED
-replacement manifest             VERIFIED
-recovery action                  VERIFIED
-recovery postcondition           VERIFIED
-recovery stability               VERIFIED
-runtime proof                    VERIFIED
-telemetry proof                  UNAVAILABLE until live SigNoz is configured
-overall proof                    UNAVAILABLE
+runtime verdict                  VERIFIED
+telemetry verdict                UNAVAILABLE (without a live SigNoz gate)
+overall verdict                  UNAVAILABLE
 ```
 
-## Architecture
+`UNAVAILABLE` is intentional here. A runtime-only proof is not relabelled as fully verified
+when mandatory telemetry evidence was not available.
 
-```text
-coordinator and worker processes
-        │ register · activate · heartbeat · checkpoint · request action
-        ▼
-TraceFence control plane
-  ├── authenticated run/node registry
-  ├── hierarchical versioned scopes
-  ├── command-specific authority and proposal binding
-  ├── one-shot activation, leases and graph budgets
-  ├── payload-bound idempotency
-  ├── exact replacement manifests and recovery contracts
-  ├── atomic action gateway
-  ├── durable invariant ledger and telemetry outbox
-  └── deterministic proof engine
-        │
-        ├── SQLite authoritative state (bounded MVP)
-        ├── signed immutable evidence bundles
-        └── OTLP traces · metrics · logs
-                         │
-                         ▼
-                       SigNoz
-          dashboard · alerts · MCP reconciliation
-```
+## Start here
 
-Detailed design: [`ARCHITECTURE.md`](ARCHITECTURE.md). Security model:
-[`SECURITY.md`](SECURITY.md). Audit remediation: [`HARDENING_REPORT.md`](HARDENING_REPORT.md).
-
-## Implemented safety properties
-
-- All protected operator endpoints require `X-Operator-Key`.
-- Node and activation credentials are stored only as HMAC-SHA256 digests; exact
-  idempotent retries can recover them from short-lived AES-GCM response envelopes.
-- Activation-token consumption is serialized and succeeds at most once under concurrency.
-- Expired leases and expired unactivated spawn intents cannot be revived.
-- `CANCEL_RUN` is restricted to the human operator or root coordinator and must target the root.
-- Delegated agents can control descendants only; sibling control is rejected.
-- Command and action idempotency are checked after authentication and bound to canonical
-  request digests, run and issuer.
-- Corrections freeze an exact replacement manifest: role, behavior, instruction, exact
-  capabilities, expected tool, arguments digest, postconditions, stability window and child
-  budget.
-- Replacement registration is transactionally linked to its correction command.
-- Recovery verification checks the committed action, current authoritative postconditions,
-  causal `last_action_id` binding and the required stability window.
-- Overlapping commands are acknowledged individually instead of collapsing to a single
-  latest command.
-- Service state and all control-plane resources are isolated by run.
-- The action gateway records exact command/scope/version attribution for stale denials.
-- A supervised invariant auditor persists stale-commit violations and an at-least-once
-  telemetry outbox independently of proof requests.
-- Request-body size and process-local rate limits are enforced before route execution.
-- Database schema version **17** validates required tables, columns, indexes, foreign keys and
-  check constraints and fails closed on incompatible databases.
-- Missing, ambiguous or contradictory SigNoz evidence cannot become `VERIFIED`.
-
-## Requirements
+### 1. Prerequisites
 
 - Python 3.12+
-- Node.js only for the JavaScript syntax check
-- Docker and SigNoz Foundry for the complete observability path
-- A SigNoz service-account API key and an existing notification channel
+- Node.js (only for the JavaScript syntax check in `make audit`)
+- Git, for evidence and release-artifact provenance checks
 
-## Install
+Optional live-observability path:
 
-Full development, MCP and OpenTelemetry environment:
+- Docker plus SigNoz Foundry
+- a valid SigNoz service-account API key
+- an existing SigNoz notification channel
+
+### 2. Create a local development environment
 
 ```bash
+git clone https://github.com/saikiranpulagalla/tracefence.git
+cd tracefence
+
 python -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\activate
+source .venv/bin/activate            # Windows PowerShell: .venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev,mcp,otel-instrumentation]'
 ```
 
-Pinned file-based alternatives:
+For hash-locked installs, use the repository targets instead:
 
 ```bash
-make install-core    # runtime only
-make install-dev     # runtime + test/static tools
-make install-full    # runtime + test/static tools + MCP/OTel instrumentation
+make install-core    # runtime dependencies
+make install-dev     # runtime + test/static-analysis tools
+make install-full    # development + MCP/OTel dependencies
 ```
 
-## Configure safely
+### 3. Configure local secrets safely
 
 ```bash
 cp .env.example .env
-python -c "import secrets; print(secrets.token_urlsafe(32))"  # operator key
-python -c "import secrets; print(secrets.token_urlsafe(48))"  # token hash secret
-python -c "import secrets; print(secrets.token_urlsafe(48))"  # credential recovery key
-python -c "import secrets; print(secrets.token_urlsafe(48))"  # evidence signing key
+chmod 600 .env
 ```
 
-Use four independently generated values. Export the file in each terminal:
+Generate four independent values and put them only in the ignored `.env` file:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"  # operator key
+python -c "import secrets; print(secrets.token_urlsafe(48))"  # token-hash secret
+python -c "import secrets; print(secrets.token_urlsafe(48))"  # credential-recovery key
+python -c "import secrets; print(secrets.token_urlsafe(48))"  # evidence-signing key
+```
+
+Load the values only into the terminal that runs TraceFence:
 
 ```bash
 set -a
@@ -135,202 +104,270 @@ set +a
 export PYTHONPATH=src
 ```
 
-Outside `TRACEFENCE_ENV=test`, startup fails closed when secrets are missing, too short,
-placeholder-like or reused across trust domains. Invalid boolean/integer environment values
-also fail closed.
+Never commit `.env`, evidence-signing keys, service-account keys, activation tokens, or node
+credentials. Outside `TRACEFENCE_ENV=test`, startup rejects missing, placeholder-like, reused,
+or undersized secrets.
 
-Credential-bearing spawn, replacement and activation requests should always supply a stable
-`operation_key`. Before commit, a failure rolls back the node, token digest and envelope
-together. After commit but before the response, or after a response is lost, an authenticated
-exact retry returns the same encrypted response while the envelope is live. A different
-payload under the key conflicts. After envelope expiry, a still-pending activation credential
-or a live node credential is rotated atomically; an inactive or terminal subject is not
-revived. An activation-expired replacement remains terminal; its designated live parent must
-use a new operation key to register a new pending attempt under the same immutable correction
-manifest. The database stores only credential digests and authenticated ciphertext. Recovery
-uses `TRACEFENCE_CREDENTIAL_RECOVERY_KEY`, independently generated from operator, token-hash
-and evidence keys, with the bounded `TRACEFENCE_CREDENTIAL_RECOVERY_TTL_SECONDS` lifetime.
-
-Reset an incompatible local database explicitly:
+### 4. Run the local quality gate
 
 ```bash
-make reset
+make test
+make audit
+python -m build
+make release-artifacts
 ```
 
-## Start the control plane
+`make test` runs ordinary tests hermetically: it disables live OTLP and SigNoz access so a
+developer's shell cannot accidentally turn a local unit run into a live integration test. The
+credential-gated MCP contract test remains an explicit opt-in gate.
+
+### 5. Start the control plane and scenario
+
+In one terminal:
 
 ```bash
 make api
 ```
 
-The worker keeps per-request HTTP deadlines below the lease TTL, stops work when heartbeat
-authority is lost, requires checkpoint JSON to contain `allowed: true`, and completes
-cooperative work explicitly. Worker exit statuses are: `0` completed, `2` action rejected,
-`3` lease lost, `4` transport/internal failure, `5` checkpoint denied, `6` completion
-rejected, and `7` activation rejected. Activation and node credentials are supplied through
-stdin/HTTP only and never through process arguments.
-
-The server binds to loopback by default:
-
-```text
-UI         http://127.0.0.1:9000
-OpenAPI    http://127.0.0.1:9000/docs
-Liveness   http://127.0.0.1:9000/livez
-Readiness  http://127.0.0.1:9000/readyz
-```
-
-Readiness verifies database writability, the bounded control-plane executor, lease-scanner and
-invariant-auditor freshness, telemetry state and outbox backlog. The browser stores no embedded
-operator credential; the operator enters it locally for protected operations.
-
-## Run the distributed scenario
-
-Evidence generation is intentionally release-grade and therefore requires:
-
-- a Git repository with a committed `HEAD`;
-- a clean worktree;
-- a dedicated `TRACEFENCE_EVIDENCE_SIGNING_KEY`.
-
-Then run:
+In another terminal with the same private environment loaded:
 
 ```bash
 make scenario
 make verify
 ```
 
-The scenario uses explicit synchronization rather than guessed sleeps. The child activation
-secret and causal trace context are delivered over stdin, never process arguments.
+The API binds to loopback by default.
 
-Generated evidence is placed under an immutable timestamped directory with a signed
-`evidence/latest.json` pointer. See [`evidence/README.md`](evidence/README.md).
+| Endpoint | Purpose |
+| --- | --- |
+| `http://127.0.0.1:9000/` | Local operator UI |
+| `http://127.0.0.1:9000/docs` | OpenAPI documentation |
+| `http://127.0.0.1:9000/livez` | Shallow liveness check |
+| `http://127.0.0.1:9000/readyz` | Protected readiness details |
 
-## Local quality gate
+The scenario is synchronized by explicit events, not guessed sleeps. It writes signed evidence
+only from a clean committed worktree with `TRACEFENCE_EVIDENCE_SIGNING_KEY` set. Read
+[evidence/README.md](evidence/README.md) before handling that output.
 
-```bash
-make audit
+## Architecture
+
+### Authority is at the action gateway
+
+```mermaid
+flowchart LR
+    Agent["Coordinator or worker\n(untrusted input)"]
+    API["TraceFence control plane"]
+    DB[("SQLite authoritative state\nruns · nodes · scopes · leases · commands")]
+    Gateway{"Action Gateway\nlive state admission"}
+    Tool["Simulated protected tool\nside effect"]
+    Auditor["Invariant auditor\nand telemetry outbox"]
+    Proof["Proof engine\nrevision-consistent"]
+    SigNoz["SigNoz\ntraces · logs · metrics · alerts"]
+
+    Agent -->|"register · activate · heartbeat\ncheckpoint · action request"| API
+    API <--> DB
+    API --> Gateway
+    Gateway -->|"ALLOW: one transaction"| Tool
+    Gateway -->|"DENY: durable decision"| DB
+    DB --> Auditor
+    DB --> Proof
+    Auditor -. "OTLP export" .-> SigNoz
+    API -. "OTLP export" .-> SigNoz
+    SigNoz -. "evidence reconciliation only" .-> Proof
+
+    classDef authority fill:#183a5a,color:#fff,stroke:#0b2239;
+    classDef evidence fill:#3d315b,color:#fff,stroke:#251e37;
+    class DB,Gateway,API authority;
+    class SigNoz,Proof,Auditor evidence;
 ```
 
-The current source passes **194 tests** and **77.57% total branch-aware coverage** in the
-available runner, plus Python compilation, JavaScript syntax, Ruff, strict mypy, Bandit,
-pip-audit, wheel/sdist construction, hash-locked installation and clean-wheel service checks.
-`make audit` executes the compile, JavaScript syntax, static, security, dependency and coverage
-gates shown by `make help`; it does not perform live SigNoz verification.
+SigNoz supplies independent evidence; it never grants authority. The gateway evaluates current
+authoritative state in the same transaction that admits a simulated side effect.
 
-## SigNoz deployment and verification
+### What happens when a branch is superseded
 
-Install the checked-in Foundry configuration:
+```mermaid
+sequenceDiagram
+    participant Operator as Operator / root
+    participant Control as Control plane
+    participant DB as Authoritative database
+    participant Stale as Superseded worker
+    participant Gateway as Action Gateway
+    participant Replacement as Replacement worker
+
+    Operator->>Control: CORRECT_SUBTREE with immutable manifest
+    Control->>DB: Increment scope version and mark SUPERSEDED
+    Control->>DB: Persist command, manifest, replacement linkage
+    Stale->>Gateway: restart_postgres(action request)
+    Gateway->>DB: Authenticate; read lease, scopes, idempotency, policy
+    DB-->>Gateway: Snapshot version is stale
+    Gateway-->>Stale: DENY / SCOPE_SUPERSEDED
+    Replacement->>Gateway: reset_redis_pool(exact contract)
+    Gateway->>DB: Validate manifest, capability, budget and live scopes
+    Gateway->>DB: Commit action, result and service state atomically
+    Gateway-->>Replacement: ALLOW / committed once
+```
+
+The stale worker may still run CPU work, but it cannot cross the protected side-effect boundary.
+Unrelated sibling branches are not invalidated by that branch's scope change.
+
+## Core concepts
+
+| Term | Meaning |
+| --- | --- |
+| **Run** | One isolated agent-graph execution and its authoritative aggregate. |
+| **Node** | A registered agent with a parent, role, capabilities, lease and owned scope. |
+| **Scope** | A versioned authority boundary. A node carries an immutable snapshot of every inherited scope. |
+| **Command** | A durable cancellation or correction decision with exact issuer, target, version and idempotency binding. |
+| **Replacement manifest** | The immutable contract for correction: exact tool, arguments digest, role, behavior, capabilities, budget, postconditions and stability window. |
+| **Action Gateway** | The only admission path for protected tool actions. It checks live state and commits allow/deny outcomes durably. |
+| **Proof** | A revision-consistent reconstruction of command convergence, replacement lineage and recovery outcome. |
+| **Telemetry watermark** | A same-process/build export observation required before telemetry can be `VERIFIED`. |
+
+## Safety model
+
+TraceFence preserves these practical invariants:
+
+- Every node registers before acting; ancestry and owned scopes are server-authoritative.
+- A scope status or version change lazily invalidates its subtree without enumerating it on the
+  control path.
+- Every protected side effect goes through the central Action Gateway.
+- Gateway admission reads live run, node, lease, scope, capability, manifest and idempotency
+  state in the same transaction as the decision.
+- Command and action idempotency are bound to the authenticated principal, run and canonical
+  request digest. A reused key with different content conflicts.
+- Corrections enforce their exact recovery manifest *before* execution, including the tool,
+  argument digest, replacement identity and committed-invocation limit.
+- Terminal runs are immutable; expired leases cannot be revived; cancelled or superseded nodes
+  cannot renew their leases.
+- Credentials are stored as HMAC digests. Exact retries use short-lived authenticated encrypted
+  recovery envelopes; raw long-lived credentials are not persisted or logged.
+- Proofs are guarded by an authoritative proof-relevant revision. A changed revision causes a
+  bounded retry or a fail-closed `STATE_CHANGED_DURING_PROOF`, never stale `VERIFIED` output.
+- Missing, malformed, ambiguous, cross-command, cross-run, stale, or contradictory telemetry
+  cannot become `VERIFIED`.
+
+For the full state and transaction design, see [ARCHITECTURE.md](ARCHITECTURE.md). For threat
+boundaries and operator guidance, see [SECURITY.md](SECURITY.md).
+
+## Daily command reference
+
+| Goal | Command | Notes |
+| --- | --- | --- |
+| Run ordinary tests | `make test` | Hermetic; expected live MCP test is skipped. |
+| Run static/security/coverage gates | `make audit` | Includes compileall, JavaScript syntax, Ruff, mypy, Bandit, pip-audit and branch coverage. |
+| Build distributables | `python -m build` | Produces wheel and source distribution. |
+| Generate release metadata | `make release-artifacts` | Generates source lock, SBOM, dependency audit and redacted secret-scan report. |
+| Start local API | `make api` | Serves loopback port 9000. |
+| Run a scenario | `make scenario` | Requires the API and private runtime environment. |
+| Verify signed runtime evidence | `make verify` | Requires fresh, commit-bound evidence and authenticated live API. |
+| Reset the configured local database | `make reset` | Refuses unsafe paths and requires the expected database path. |
+| Deploy local SigNoz | `make signoz` | Requires Docker and Foundry; environment-specific receipt is ignored by Git. |
+| Provision/verify SigNoz resources | `make provision-signoz` / `make verify-signoz` | Requires a valid service account and existing notification channel. |
+| Require live telemetry in evidence verification | `make verify-all` | A release gate, not a local substitute. |
+
+Use `make help` for the authoritative target list. Do not run `make clean` against data or
+evidence you intend to retain.
+
+## Runtime, proof and telemetry verdicts
+
+Runtime proof checks control convergence, replacement lineage, recovery action, postcondition,
+stability and outcome. Telemetry reconciliation separately checks exact command, run, action,
+node, scope/version, process, service, build and time-window correlation.
+
+The canonical severity order is deliberately fail-closed:
+
+| Verdict | Meaning |
+| --- | --- |
+| `INCONSISTENT` | Authoritative state and evidence contradict each other. |
+| `STATE_CHANGED_DURING_PROOF` | No stable proof-relevant revision was available within the retry bound. |
+| `INCOMPLETE` | Required authoritative runtime evidence is missing or unfinished. |
+| `PARTIAL` | An available evidence provider completed only part of its required contract. |
+| `UNAVAILABLE` | A mandatory provider could not be consulted. |
+| `VERIFIED` | Every mandatory runtime and telemetry dimension verifies. |
+
+`INCONSISTENT` always dominates weaker outcomes. In particular, runtime `VERIFIED` + telemetry `UNAVAILABLE` = overall `UNAVAILABLE`; it is never relabelled `PARTIAL` or `VERIFIED`.
+
+## Optional SigNoz path and live release gate
+
+Local tests do not need SigNoz. Live telemetry verification does.
 
 ```bash
+# Deploy only in an approved local/ephemeral environment.
 make signoz
-```
 
-The checked-in `casting.source.lock.json` binds the reviewed `casting.yaml` source bytes only. A real
-Foundry run creates the environment-specific `casting.yaml.lock` deployment receipt; it is ignored
-by Git and can never be substituted by the source lock. `bootstrap_signoz.sh` snapshots any prior
-receipt, runs `gauge` and `cast`, then fails closed unless Foundry creates or replaces a structurally
-valid receipt.
-
-Configure a real service-account key and existing notification channel:
-
-```bash
+# Use private environment variables; never commit these values.
 export SIGNOZ_URL=http://localhost:8080
 export SIGNOZ_MCP_URL=http://localhost:8000/mcp
 export SIGNOZ_API_KEY='...'
-export TRACEFENCE_NOTIFICATION_CHANNEL='exact-existing-channel-name'
+export TRACEFENCE_NOTIFICATION_CHANNEL='existing-channel-name'
 ```
 
-Run a telemetry-enabled scenario so metric series exist, then:
+`casting.source.lock.json` is a Git-tracked digest of reviewed Foundry source configuration.
+Foundry creates `casting.yaml.lock` as an environment-specific deployment receipt. The receipt
+is ignored by Git and is never accepted as a substitute for the source lock—or vice versa.
+
+With a healthy SigNoz deployment and an explicitly configured service account, use:
 
 ```bash
 make provision-signoz
 make verify-signoz
+make scenario
 make verify-all
 ```
 
-Provisioning validates the checked-in dashboard and v2alpha1 alerts, discovers required MCP
-tools and metrics, validates the notification channel, and refuses same-name resources whose
-specification digest differs unless an explicit update is requested.
+Live verification must prove exact runtime/trace/log action-ID equality, same run and command
+correlation, same process/service/build identity, and a successful same-process export watermark
+after the command. Do not claim telemetry `VERIFIED` until that real environment has succeeded.
 
-The final submission gate is:
+## SQLite, migrations and local data
 
-```text
-runtime_verdict   = VERIFIED
-telemetry_verdict = VERIFIED
-overall_verdict   = VERIFIED
-```
-
-## Proof verdicts
-
-Runtime proof reports:
-
-- `control_convergence_verdict`
-- `replacement_lineage_verdict`
-- `recovery_action_verdict`
-- `recovery_postcondition_verdict`
-- `recovery_stability_verdict`
-- `recovery_outcome_verdict`
-- `runtime_verdict`
-
-Telemetry reconciliation then validates command spans, stale-action spans, correlated logs and
-metrics. The overall verdict uses the canonical severity order `INCONSISTENT`,
-`STATE_CHANGED_DURING_PROOF`, `INCOMPLETE`, `PARTIAL`, `UNAVAILABLE`, then
-`VERIFIED`:
-
-- `INCONSISTENT`: authoritative state and telemetry contradict one another;
-- `STATE_CHANGED_DURING_PROOF`: no stable proof-relevant revision was obtained;
-- `INCOMPLETE`: required runtime evidence is missing or unfinished;
-- `PARTIAL`: an available evidence provider verified only part of its contract;
-- `UNAVAILABLE`: a mandatory evidence provider could not be consulted;
-- `VERIFIED`: every mandatory runtime and telemetry dimension verifies.
-
-Consequently, runtime `VERIFIED` + telemetry `UNAVAILABLE` = overall `UNAVAILABLE`;
-unavailable telemetry is never described as a partially verified result.
-
-## Important limitations
-
-- The atomic commit guarantee covers the included simulated tools whose authoritative mutation
-  is in the same database transaction. Real infrastructure/payment/cloud tools require a
-  provider idempotency key, durable execution outbox and reconciliation workflow.
-- The invariant telemetry outbox is implemented for durable safety-event delivery; it is not a
-  full external-tool execution outbox.
-- Persistence is intentionally SQLite-only. Any non-SQLite URL is rejected before a driver is
-  loaded; PostgreSQL and high-availability operation remain production backlog items.
-- The process-local rate limiter must be replaced by a shared limiter in multi-replica use.
-- TraceFence controls registered nodes only while protected side effects remain behind the
-  gateway. It cannot revoke independent external credentials held by an arbitrary process.
-- The MVP uses a single operator credential with fingerprinted audit records, not an identity
-  provider or per-user RBAC.
-- Live SigNoz/Foundry verification remains an external environmental gate.
-
-## SQLite migrations and durability
-
-TraceFence ships an Alembic baseline at `001_schema_v17`. New installations can be initialized
-explicitly with:
+TraceFence intentionally supports SQLite only. Non-SQLite URLs fail before a driver is loaded.
+The Alembic baseline is `001_schema_v17`; new local databases can be initialized explicitly:
 
 ```bash
 TRACEFENCE_DATABASE_URL=sqlite+pysqlite:///./data/tracefence.db \
   python -m alembic upgrade head
 ```
 
-Application bootstrap records both schema version 17 and the Alembic head, validates columns,
-primary keys, named and unnamed foreign keys, unique/check constraints, indexes and mandatory
-proof-revision triggers. A failed first bootstrap that began from an empty database is returned
-to an empty retryable state. Existing unknown or structurally incomplete databases fail closed
-with `SCHEMA_MIGRATION_REQUIRED`; back them up before migration.
+Connections use foreign keys, WAL mode, a five-second busy timeout and `synchronous=FULL`.
+Monitor free disk space and WAL growth, and use SQLite's online backup API or `sqlite3 .backup`
+for backups. Do not copy only the main database file while WAL writes are active. Details and
+restore guidance are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Every connection enables foreign keys, WAL mode, a five-second busy timeout and
-`synchronous=FULL`. WAL improves reader/writer concurrency but the `-wal` file can grow while
-long-lived readers prevent checkpoints. Monitor free disk and WAL size, reserve at least twice
-the combined database/WAL working set, and investigate readers before issuing a controlled
-`PRAGMA wal_checkpoint(TRUNCATE)`.
+## Limitations and non-goals
 
-For backups, use SQLite's online backup API or the `sqlite3 .backup` command against a quiesced
-or coordinated writer. Do not copy only the main database file while WAL writes are active.
-Restore into a separate path, run `PRAGMA integrity_check`, apply `alembic upgrade head`, start
-TraceFence, and validate `/readyz` before replacing the original. Keep at least one tested,
-offline backup and rehearse restoration; TraceFence does not provide automated disaster
-recovery.
+TraceFence is not presented as production-ready. Current boundaries include:
 
-## Provenance
+- included protected tools are database-backed simulations; real cloud, payment, or infrastructure
+  providers need their own idempotency, durable execution outbox and reconciliation design;
+- SQLite and process-local rate limits are appropriate for the single-process MVP, not replicated
+  high-availability deployments;
+- OIDC/JWT, enterprise RBAC, KMS/HSM, PostgreSQL/HA, Kubernetes, multi-region operation and
+  full disaster recovery are intentionally out of scope;
+- TraceFence constrains registered nodes only while their protected side effects stay behind the
+  Action Gateway. It cannot revoke independently held external credentials; and
+- live Foundry/SigNoz verification depends on real infrastructure and credentials.
 
-See [`DISCLOSURE.md`](DISCLOSURE.md) for prior conceptual work and AI-assistance disclosure.
+## Further reading
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — state model, transactions, proof, telemetry and deployment detail
+- [SECURITY.md](SECURITY.md) — threat model, secrets and operator security guidance
+- [HARDENING_REPORT.md](HARDENING_REPORT.md) — remediation history and current findings
+- [evidence/README.md](evidence/README.md) — evidence format and handling
+- [DISCLOSURE.md](DISCLOSURE.md) — provenance and AI-assistance disclosure
+
+## Before opening a pull request
+
+Run the local gate, keep generated output out of Git, and preserve the safety model:
+
+```bash
+make test
+make audit
+python -m build
+make release-artifacts
+git status --short
+```
+
+Do not lower coverage, suppress findings broadly, weaken proof/telemetry strictness, or turn a
+local runtime result into a live telemetry or production-readiness claim.
