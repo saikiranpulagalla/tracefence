@@ -606,10 +606,11 @@ async def _verify_required_alerts(
             failures.append(message)
             continue
 
+        rule_id = next(iter(rule_ids))
         result = await _call_read_only_tool(
             session,
             "signoz_get_alert",
-            arguments={"id": next(iter(rule_ids))},
+            arguments={"ruleId": rule_id},
         )
         if _tool_failed(result):
             message = f"signoz_get_alert failed for {name}"
@@ -619,7 +620,7 @@ async def _verify_required_alerts(
         try:
             _validate_fetched_alert_rule(
                 _normalize(result),
-                expected_rule_id=next(iter(rule_ids)),
+                expected_rule_id=rule_id,
                 expected_alert_name=name,
                 expected_deployment_digest=expected,
             )

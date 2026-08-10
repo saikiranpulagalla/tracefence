@@ -307,7 +307,11 @@ def _install_fake_runtime(
                     structuredContent=payload, content=[], isError=False
                 )
             if name == "signoz_get_alert":
-                rule_id = arguments.get("id")
+                if set(arguments) != {"ruleId"}:
+                    raise AssertionError(
+                        "signoz_get_alert requires exactly the official ruleId argument"
+                    )
+                rule_id = arguments.get("ruleId")
                 assert isinstance(rule_id, str)
                 alert_name = state.name_by_rule_id[rule_id]
                 if alert_name in state.tool_error_names:
@@ -454,7 +458,7 @@ async def _run_verify(
 
 def _fetched_alert_names(state: _VerifierState) -> list[str]:
     return [
-        state.name_by_rule_id[arguments["id"]]
+        state.name_by_rule_id[arguments["ruleId"]]
         for name, arguments in state.calls
         if name == "signoz_get_alert"
     ]
@@ -598,6 +602,29 @@ async def test_verifier_fetches_and_reports_every_checked_in_alert(
     output = capsys.readouterr().out
     for name in expected_names:
         assert f"PASS Alert {name}" in output
+    _assert_read_only(state)
+
+
+async def test_verifier_uses_the_exact_official_rule_id_get_alert_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alerts = _alerts()
+    expected_names = {alert["alert"] for alert in alerts}
+
+    _module, state, result = await _run_verify(monkeypatch, alerts)
+
+    get_alert_calls = [
+        arguments
+        for name, arguments in state.calls
+        if name == "signoz_get_alert"
+    ]
+    assert result == 0
+    assert len(get_alert_calls) == len(expected_names)
+    assert all(set(arguments) == {"ruleId"} for arguments in get_alert_calls)
+    assert {arguments["ruleId"] for arguments in get_alert_calls} == set(
+        state.rule_ids.values()
+    )
+    assert all("id" not in arguments for arguments in get_alert_calls)
     _assert_read_only(state)
 
 
