@@ -199,7 +199,7 @@ sequenceDiagram
     Control->>DB: Increment scope version and mark SUPERSEDED
     Control->>DB: Persist command, manifest, replacement linkage
     Stale->>Gateway: restart_postgres(action request)
-    Gateway->>DB: Authenticate; read lease, scopes, idempotency, policy
+    Gateway->>DB: Read current admission state
     DB-->>Gateway: Snapshot version is stale
     Gateway-->>Stale: DENY / SCOPE_SUPERSEDED
     Replacement->>Gateway: reset_redis_pool(exact contract)
