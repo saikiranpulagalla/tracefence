@@ -1,25 +1,25 @@
 # TraceFence
 
-**Runtime-enforced cancellation and correction for dynamic AI-agent graphs.**
+Runtime-enforced cancellation and correction for dynamic AI-agent graphs.
 
-TraceFence is a control plane for agent systems where a worker can be delayed, wrong, or
-non-cooperative. It makes the control plane—not a prompt, a cancellation message, or a
-telemetry dashboard—the authority that decides whether a protected side effect may commit.
+TraceFence prevents cancelled, superseded, or otherwise stale agent branches from committing
+protected side effects. It is a control plane for agent systems where a worker can be delayed,
+wrong, or non-cooperative. The control plane—not a prompt, cancellation message, or telemetry
+dashboard—is the authority that decides whether a protected side effect may commit.
 
 > A registered descendant may keep computing after its work is cancelled or superseded, but it
 > cannot commit a TraceFence-mediated side effect once any inherited control scope is stale.
 
-TraceFence is a release-candidate reference implementation. It is intentionally honest about
-its boundaries: the included tools are database-backed simulations, persistence is SQLite-only,
-and live SigNoz reconciliation is an external release gate—not a claim this README can make on
-its own. See [Limitations](#limitations-and-non-goals) before using it beyond local evaluation.
+TraceFence is a reference implementation. It uses simulated protected tools and SQLite, and live
+SigNoz reconciliation remains an external verification gate. See
+[Limitations](#limitations-and-non-goals) for deployment boundaries.
 
 ## What it solves
 
 Agent graphs change while they run. A supervisor can cancel one branch, supersede it with a
 correction, and allow unrelated branches to continue. In an ordinary workflow, a stale worker
-may still perform an action after it receives a cancellation too late. TraceFence closes that
-gap at the side-effect boundary.
+may still perform an action after it receives a cancellation too late. TraceFence closes that gap
+at the side-effect boundary.
 
 The included scenario models a database investigation:
 
@@ -44,110 +44,6 @@ overall verdict                  UNAVAILABLE
 
 `UNAVAILABLE` is intentional here. A runtime-only proof is not relabelled as fully verified
 when mandatory telemetry evidence was not available.
-
-## Start here
-
-### 1. Prerequisites
-
-- Python 3.12+
-- Node.js (only for the JavaScript syntax check in `make audit`)
-- Git, for evidence and release-artifact provenance checks
-
-Optional live-observability path:
-
-- Docker plus SigNoz Foundry
-- a valid SigNoz service-account API key
-- an existing SigNoz notification channel
-
-### 2. Create a local development environment
-
-```bash
-git clone https://github.com/saikiranpulagalla/tracefence.git
-cd tracefence
-
-python -m venv .venv
-source .venv/bin/activate            # Windows PowerShell: .venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -e '.[dev,mcp,otel-instrumentation]'
-```
-
-For hash-locked installs, use the repository targets instead:
-
-```bash
-make install-core    # runtime dependencies
-make install-dev     # runtime + test/static-analysis tools
-make install-full    # development + MCP/OTel dependencies
-```
-
-### 3. Configure local secrets safely
-
-```bash
-cp .env.example .env
-chmod 600 .env
-```
-
-Generate four independent values and put them only in the ignored `.env` file:
-
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"  # operator key
-python -c "import secrets; print(secrets.token_urlsafe(48))"  # token-hash secret
-python -c "import secrets; print(secrets.token_urlsafe(48))"  # credential-recovery key
-python -c "import secrets; print(secrets.token_urlsafe(48))"  # evidence-signing key
-```
-
-Load the values only into the terminal that runs TraceFence:
-
-```bash
-set -a
-source .env
-set +a
-export PYTHONPATH=src
-```
-
-Never commit `.env`, evidence-signing keys, service-account keys, activation tokens, or node
-credentials. Outside `TRACEFENCE_ENV=test`, startup rejects missing, placeholder-like, reused,
-or undersized secrets.
-
-### 4. Run the local quality gate
-
-```bash
-make test
-make audit
-python -m build
-make release-artifacts
-```
-
-`make test` runs ordinary tests hermetically: it disables live OTLP and SigNoz access so a
-developer's shell cannot accidentally turn a local unit run into a live integration test. The
-credential-gated MCP contract test remains an explicit opt-in gate.
-
-### 5. Start the control plane and scenario
-
-In one terminal:
-
-```bash
-make api
-```
-
-In another terminal with the same private environment loaded:
-
-```bash
-make scenario
-make verify
-```
-
-The API binds to loopback by default.
-
-| Endpoint | Purpose |
-| --- | --- |
-| `http://127.0.0.1:9000/` | Local operator UI |
-| `http://127.0.0.1:9000/docs` | OpenAPI documentation |
-| `http://127.0.0.1:9000/livez` | Shallow liveness check |
-| `http://127.0.0.1:9000/readyz` | Protected readiness details |
-
-The scenario is synchronized by explicit events, not guessed sleeps. It writes signed evidence
-only from a clean committed worktree with `TRACEFENCE_EVIDENCE_SIGNING_KEY` set. Read
-[evidence/README.md](evidence/README.md) before handling that output.
 
 ## Architecture
 
@@ -181,10 +77,10 @@ flowchart LR
     class SigNoz,Proof,Auditor evidence;
 ```
 
-SigNoz supplies independent evidence; it never grants authority. The gateway evaluates current
-authoritative state in the same transaction that admits a simulated side effect.
+SigNoz supplies independent evidence; it never grants authority. The Action Gateway evaluates
+current authoritative state in the same transaction that admits a simulated side effect.
 
-### What happens when a branch is superseded
+## What happens when a branch is superseded
 
 ```mermaid
 sequenceDiagram
@@ -208,8 +104,9 @@ sequenceDiagram
     Gateway-->>Replacement: ALLOW / committed once
 ```
 
-The stale worker may still run CPU work, but it cannot cross the protected side-effect boundary.
-Unrelated sibling branches are not invalidated by that branch's scope change.
+The stale worker may keep doing CPU work, but its PostgreSQL restart is denied at the protected
+side-effect boundary. The replacement is allowed only after its exact recovery contract and live
+authority pass. A scope change on one branch does not invalidate unrelated sibling branches.
 
 ## Core concepts
 
@@ -250,6 +147,156 @@ TraceFence preserves these practical invariants:
 For the full state and transaction design, see [ARCHITECTURE.md](ARCHITECTURE.md). For threat
 boundaries and operator guidance, see [SECURITY.md](SECURITY.md).
 
+## Quick start
+
+This is the shortest local path. It assumes you will configure the four required secrets in
+`.env` as described in [Full local setup](#full-local-setup).
+
+```bash
+git clone https://github.com/saikiranpulagalla/tracefence.git
+cd tracefence
+
+python -m venv .venv
+source .venv/bin/activate            # Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e '.[dev,mcp,otel-instrumentation]'
+
+cp .env.example .env
+# Populate the required secrets in .env; see Full local setup below.
+```
+
+In a first terminal, load the private environment and start the API:
+
+```bash
+set -a
+source .env
+set +a
+export PYTHONPATH=src
+make api
+```
+
+In a second terminal, load the same private environment, then run and verify the scenario:
+
+```bash
+make scenario
+make verify
+```
+
+The API binds to loopback at `http://127.0.0.1:9000/`. For the full setup, quality gates,
+endpoints and evidence-handling requirements, continue below.
+
+## Full local setup
+
+### Prerequisites
+
+- Python 3.12+
+- Node.js (only for the JavaScript syntax check in `make audit`)
+- Git, for evidence and release-artifact provenance checks
+
+Optional live-observability path:
+
+- Docker plus SigNoz Foundry
+- a valid SigNoz service-account API key
+- an existing SigNoz notification channel
+
+### Create a local development environment
+
+```bash
+git clone https://github.com/saikiranpulagalla/tracefence.git
+cd tracefence
+
+python -m venv .venv
+source .venv/bin/activate            # Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e '.[dev,mcp,otel-instrumentation]'
+```
+
+The `make install-*` targets provide convenience installs for the declared requirement sets:
+
+```bash
+make install-core    # runtime dependencies
+make install-dev     # runtime + test/static-analysis tools
+make install-full    # development + MCP/OTel dependencies
+```
+
+For a hash-locked development and MCP/OTel environment, install the committed locks directly,
+then install the package without resolving dependencies again:
+
+```bash
+python -m pip install --require-hashes \
+  -r requirements-lock/development.txt \
+  -r requirements-lock/full.txt
+python -m pip install --no-deps -e .
+```
+
+### Configure local secrets safely
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+Generate four independent values and put them only in the ignored `.env` file:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"  # operator key
+python -c "import secrets; print(secrets.token_urlsafe(48))"  # token-hash secret
+python -c "import secrets; print(secrets.token_urlsafe(48))"  # credential-recovery key
+python -c "import secrets; print(secrets.token_urlsafe(48))"  # evidence-signing key
+```
+
+Load the values only into each terminal that runs TraceFence:
+
+```bash
+set -a
+source .env
+set +a
+export PYTHONPATH=src
+```
+
+Never commit `.env`, evidence-signing keys, service-account keys, activation tokens, or node
+credentials. Outside `TRACEFENCE_ENV=test`, startup rejects missing, placeholder-like, reused,
+or undersized secrets.
+
+### Run the local quality gate
+
+```bash
+make test
+make audit
+python -m build
+make release-artifacts
+```
+
+`make test` runs ordinary tests hermetically: it disables live OTLP and SigNoz access so a
+developer's shell cannot accidentally turn a local unit run into a live integration test. The
+credential-gated MCP contract test remains an explicit opt-in gate.
+
+### Start the control plane and scenario
+
+In one terminal with the private environment loaded:
+
+```bash
+make api
+```
+
+In another terminal with the same private environment loaded:
+
+```bash
+make scenario
+make verify
+```
+
+| Endpoint | Purpose |
+| --- | --- |
+| `http://127.0.0.1:9000/` | Local operator UI |
+| `http://127.0.0.1:9000/docs` | OpenAPI documentation |
+| `http://127.0.0.1:9000/livez` | Shallow liveness check |
+| `http://127.0.0.1:9000/readyz` | Protected readiness details |
+
+The scenario is synchronized by explicit events, not guessed sleeps. It writes signed evidence
+only from a clean committed worktree with `TRACEFENCE_EVIDENCE_SIGNING_KEY` set. Read
+[evidence/README.md](evidence/README.md) before handling that output.
+
 ## Daily command reference
 
 | Goal | Command | Notes |
@@ -286,7 +333,8 @@ The canonical severity order is deliberately fail-closed:
 | `UNAVAILABLE` | A mandatory provider could not be consulted. |
 | `VERIFIED` | Every mandatory runtime and telemetry dimension verifies. |
 
-`INCONSISTENT` always dominates weaker outcomes. In particular, runtime `VERIFIED` + telemetry `UNAVAILABLE` = overall `UNAVAILABLE`; it is never relabelled `PARTIAL` or `VERIFIED`.
+`INCONSISTENT` always dominates weaker outcomes. In particular, runtime `VERIFIED` + telemetry
+`UNAVAILABLE` = overall `UNAVAILABLE`; it is never relabelled `PARTIAL` or `VERIFIED`.
 
 ## Optional SigNoz path and live release gate
 
