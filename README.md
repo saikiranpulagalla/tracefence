@@ -333,8 +333,7 @@ The canonical severity order is deliberately fail-closed:
 | `UNAVAILABLE` | A mandatory provider could not be consulted. |
 | `VERIFIED` | Every mandatory runtime and telemetry dimension verifies. |
 
-`INCONSISTENT` always dominates weaker outcomes. In particular, runtime `VERIFIED` + telemetry
-`UNAVAILABLE` = overall `UNAVAILABLE`; it is never relabelled `PARTIAL` or `VERIFIED`.
+`INCONSISTENT` always dominates weaker outcomes. In particular, runtime `VERIFIED` + telemetry `UNAVAILABLE` = overall `UNAVAILABLE`; it is never relabelled `PARTIAL` or `VERIFIED`.
 
 ## Optional SigNoz path and live release gate
 
