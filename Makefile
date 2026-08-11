@@ -48,8 +48,11 @@ locks:
 	mkdir -p requirements-lock
 	$(PYTHON) -m piptools compile --generate-hashes --resolver=backtracking --output-file requirements-lock/runtime.txt requirements.txt
 	$(PYTHON) -m piptools compile --generate-hashes --allow-unsafe --resolver=backtracking --output-file requirements-lock/development.txt requirements-dev.txt
-	$(PYTHON) -m piptools compile --generate-hashes --resolver=backtracking --output-file requirements-lock/full.txt requirements-full.txt
-	$(PYTHON) scripts/normalize_lock_markers.py
+	@previous_full_lock=$$(mktemp); \
+	trap 'rm -f "$$previous_full_lock"' EXIT; \
+	cp requirements-lock/full.txt "$$previous_full_lock"; \
+	$(PYTHON) -m piptools compile --generate-hashes --resolver=backtracking --output-file requirements-lock/full.txt requirements-full.txt; \
+	$(PYTHON) scripts/normalize_lock_markers.py --previous-full-lock "$$previous_full_lock"
 	$(PYTHON) -m piptools compile --generate-hashes --allow-unsafe --resolver=backtracking --output-file requirements-lock/build.txt requirements-build.in
 
 release-artifacts:

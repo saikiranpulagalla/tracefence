@@ -142,6 +142,25 @@ def test_lock_normalizer_restores_upstream_windows_marker(tmp_path: Path) -> Non
     )
 
 
+def test_lock_normalizer_restores_missing_windows_block_from_previous_lock(
+    tmp_path: Path,
+) -> None:
+    lock = tmp_path / "full.txt"
+    previous = tmp_path / "previous-full.txt"
+    marker = 'sys_platform == "win32" and python_version < "3.14"'
+    lock.write_text("referencing==0.37.0\n", encoding="utf-8")
+    previous.write_text(
+        f"pywin32==312 ; {marker} {chr(92)}\n"
+        "    --hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "    # via mcp\n"
+        "referencing==0.37.0\n",
+        encoding="utf-8",
+    )
+
+    assert normalize_full_lock(lock, previous)
+    assert lock.read_text(encoding="utf-8") == previous.read_text(encoding="utf-8")
+
+
 def test_cyclonedx_cli_is_declared_and_hash_locked_for_release_artifacts() -> None:
     root = Path(__file__).resolve().parents[2]
     build_input = (root / "requirements-build.in").read_text(encoding="utf-8")
@@ -151,3 +170,21 @@ def test_cyclonedx_cli_is_declared_and_hash_locked_for_release_artifacts() -> No
 
     assert "cyclonedx-bom==7.3.1" in build_input
     assert "cyclonedx-bom==7.3.1" in build_lock
+
+
+def test_declared_lock_sets_pin_the_same_pip_version() -> None:
+    root = Path(__file__).resolve().parents[2]
+    development = (root / "requirements-lock" / "development.txt").read_text(
+        encoding="utf-8"
+    )
+    build = (root / "requirements-lock" / "build.txt").read_text(encoding="utf-8")
+
+    def pinned_version(lock: str, package: str) -> str:
+        prefix = f"{package}=="
+        return next(
+            line.removeprefix(prefix).split(" ", 1)[0]
+            for line in lock.splitlines()
+            if line.startswith(prefix)
+        )
+
+    assert pinned_version(development, "pip") == pinned_version(build, "pip")
