@@ -51,6 +51,7 @@ def _looks_like_placeholder(value: str) -> bool:
 @dataclass(frozen=True, slots=True)
 class Settings:
     environment: str = os.getenv("TRACEFENCE_ENV", "development")
+    demo_mode: bool = _bool_env("TRACEFENCE_DEMO_MODE", False)
     database_url: str = os.getenv(
         "TRACEFENCE_DATABASE_URL", "sqlite+pysqlite:///./data/tracefence.db"
     )

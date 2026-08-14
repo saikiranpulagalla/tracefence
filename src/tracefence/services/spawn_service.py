@@ -52,6 +52,7 @@ from tracefence.services.credential_recovery import (
     seal_envelope,
 )
 from tracefence.services.run_lifecycle import transition_run
+from tracefence.services.runtime_events import record_runtime_event
 from tracefence.telemetry.instruments import telemetry
 
 logger = logging.getLogger(__name__)
@@ -261,6 +262,29 @@ class SpawnService:
                         request_digest=request_digest,
                         response=activated,
                     )
+                record_runtime_event(
+                    session,
+                    run_id=node.run_id,
+                    event_type="NODE_ACTIVATED",
+                    occurred_at=now,
+                    node_id=node.id,
+                    parent_node_id=node.parent_id,
+                    command_id=node.caused_by_command_id,
+                    metadata={"role": node.role},
+                )
+                record_runtime_event(
+                    session,
+                    run_id=node.run_id,
+                    event_type="LEASE_GRANTED",
+                    occurred_at=now,
+                    node_id=node.id,
+                    metadata={
+                        "lease_expires_at": lease_expires_at.isoformat(
+                            timespec="microseconds"
+                        )
+                        + "Z"
+                    },
+                )
                 session.commit()
             except Exception:
                 session.rollback()
@@ -293,6 +317,14 @@ class SpawnService:
                 elif node.lease_expires_at is None or node.lease_expires_at <= now:
                     node.status = NodeStatus.LEASE_EXPIRED
                     await self._record_lease_expiry_ack(session, node, now)
+                    record_runtime_event(
+                        session,
+                        run_id=node.run_id,
+                        event_type="LEASE_EXPIRED",
+                        occurred_at=now,
+                        node_id=node.id,
+                        parent_node_id=node.parent_id,
+                    )
                     denial_code = "LEASE_EXPIRED"
                 else:
                     evaluation = await evaluate_scopes(session, node)
@@ -319,6 +351,20 @@ class SpawnService:
                         node.lease_expires_at = now + timedelta(
                             seconds=settings.lease_ttl_seconds
                         )
+                        record_runtime_event(
+                            session,
+                            run_id=node.run_id,
+                            event_type="LEASE_RENEWED",
+                            occurred_at=now,
+                            node_id=node.id,
+                            parent_node_id=node.parent_id,
+                            metadata={
+                                "lease_expires_at": node.lease_expires_at.isoformat(
+                                    timespec="microseconds"
+                                )
+                                + "Z"
+                            },
+                        )
                 session.commit()
             except Exception:
                 session.rollback()
@@ -344,10 +390,22 @@ class SpawnService:
             )
             allowed, reason, evaluation = await validate_node_runtime_state(session, node)
             if allowed:
+                node.status = NodeStatus.WAITING
+                now = utcnow()
+                record_runtime_event(
+                    session,
+                    run_id=node.run_id,
+                    event_type="NODE_WAITING",
+                    occurred_at=now,
+                    node_id=node.id,
+                    parent_node_id=node.parent_id,
+                    command_id=node.caused_by_command_id,
+                    metadata={"stage": stage},
+                )
                 logger.info(
                     "checkpoint_allowed node_id=%s stage=%s", node.id, stage
                 )
-                return CheckpointResponse(allowed=True, effective_status=NodeStatus.ACTIVE)
+                return CheckpointResponse(allowed=True, effective_status=NodeStatus.WAITING)
 
             commands = await commands_for_scope_mismatches(
                 session, evaluation.mismatches, run_id=node.run_id
@@ -483,7 +541,8 @@ class SpawnService:
                     )
 
                 node.status = NodeStatus.COMPLETED
-                node.completed_at = utcnow()
+                completed_at = utcnow()
+                node.completed_at = completed_at
                 if node.caused_by_command_id is not None:
                     command = session.get(ControlCommand, node.caused_by_command_id)
                     if (
@@ -496,6 +555,25 @@ class SpawnService:
                             code="REPLACEMENT_LIFECYCLE_INVALID",
                         )
                     command.replacement_status = ReplacementStatus.COMPLETED
+                record_runtime_event(
+                    session,
+                    run_id=node.run_id,
+                    event_type="NODE_COMPLETED",
+                    occurred_at=completed_at,
+                    node_id=node.id,
+                    parent_node_id=node.parent_id,
+                    command_id=node.caused_by_command_id,
+                )
+                if node.caused_by_command_id is not None:
+                    record_runtime_event(
+                        session,
+                        run_id=node.run_id,
+                        event_type="RECOVERY_COMPLETED",
+                        occurred_at=completed_at,
+                        node_id=node.id,
+                        parent_node_id=node.parent_id,
+                        command_id=node.caused_by_command_id,
+                    )
                 session.commit()
             except Exception:
                 session.rollback()
@@ -831,6 +909,27 @@ class SpawnService:
                 trace_context_json=dict(trace_context or {}),
                 expires_at=expires_at,
             )
+        )
+        record_runtime_event(
+            session,
+            run_id=parent.run_id,
+            event_type=(
+                "REPLACEMENT_CREATED"
+                if caused_by_command_id is not None
+                else "NODE_REGISTERED"
+            ),
+            occurred_at=now,
+            node_id=child_id,
+            parent_node_id=parent.id,
+            command_id=caused_by_command_id,
+            scope_id=child_scope_id,
+            snapshot_version=1,
+            authoritative_version=1,
+            metadata={
+                "role": request.role,
+                "generation": parent.generation + 1,
+                "supersedes_node_id": supersedes_node_id,
+            },
         )
         return SpawnCreated(
             child_node_id=child_id,

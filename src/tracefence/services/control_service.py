@@ -40,6 +40,7 @@ from tracefence.services.common import (
 )
 from tracefence.services.proposal_service import proposal_payload
 from tracefence.services.run_lifecycle import transition_run
+from tracefence.services.runtime_events import record_runtime_event
 from tracefence.services.tool_registry import get_tool_spec
 from tracefence.telemetry.instruments import telemetry
 
@@ -379,6 +380,42 @@ class ControlService:
                 )
                 session.add(command)
                 session.flush()
+                record_runtime_event(
+                    session,
+                    run_id=run.id,
+                    event_type="COMMAND_ISSUED",
+                    occurred_at=command.created_at,
+                    node_id=target.id,
+                    command_id=command.id,
+                    scope_id=scope.id,
+                    reason_code=command.reason_code,
+                    snapshot_version=old_version,
+                    authoritative_version=scope.version,
+                    metadata={"command_type": command.command_type},
+                )
+                if request.command_type in {
+                    CommandType.CANCEL_RUN,
+                    CommandType.CANCEL_SUBTREE,
+                }:
+                    scope_event_type = "SCOPE_CANCELLED"
+                else:
+                    scope_event_type = "SCOPE_SUPERSEDED"
+                record_runtime_event(
+                    session,
+                    run_id=run.id,
+                    event_type=scope_event_type,
+                    occurred_at=scope.updated_at,
+                    node_id=target.id,
+                    command_id=command.id,
+                    scope_id=scope.id,
+                    reason_code=command.reason_code,
+                    snapshot_version=old_version,
+                    authoritative_version=scope.version,
+                    metadata={
+                        "from_status": ScopeStatus.ACTIVE.value,
+                        "to_status": scope.status,
+                    },
+                )
                 if source_proposal is not None:
                     source_proposal.resulting_command_id = command.id
                 session.commit()

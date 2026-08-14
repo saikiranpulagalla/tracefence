@@ -13,6 +13,7 @@ from tracefence.domain.errors import ConflictError
 from tracefence.domain.schemas import RunCreate, RunCreated
 from tracefence.security import generate_token, hash_token
 from tracefence.services.common import iso_utc, utcnow
+from tracefence.services.runtime_events import record_runtime_event
 from tracefence.services.tool_registry import TOOL_REGISTRY
 from tracefence.telemetry.instruments import telemetry
 
@@ -108,6 +109,45 @@ class RunService:
                     last_heartbeat_at=now,
                     lease_expires_at=now + timedelta(seconds=settings.lease_ttl_seconds),
                 )
+            )
+            record_runtime_event(
+                session,
+                run_id=run_id,
+                event_type="RUN_CREATED",
+                occurred_at=now,
+                metadata={"name": request.name, "status": RunStatus.RUNNING.value},
+            )
+            record_runtime_event(
+                session,
+                run_id=run_id,
+                event_type="NODE_REGISTERED",
+                occurred_at=now,
+                node_id=root_node_id,
+                scope_id=root_scope_id,
+                snapshot_version=1,
+                authoritative_version=1,
+                metadata={"role": request.root_role, "generation": 0},
+            )
+            record_runtime_event(
+                session,
+                run_id=run_id,
+                event_type="NODE_ACTIVATED",
+                occurred_at=now,
+                node_id=root_node_id,
+                metadata={"role": request.root_role},
+            )
+            record_runtime_event(
+                session,
+                run_id=run_id,
+                event_type="LEASE_GRANTED",
+                occurred_at=now,
+                node_id=root_node_id,
+                metadata={
+                    "lease_expires_at": (
+                        now + timedelta(seconds=settings.lease_ttl_seconds)
+                    ).isoformat(timespec="microseconds")
+                    + "Z"
+                },
             )
             session.commit()
 

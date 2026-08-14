@@ -55,6 +55,17 @@ def worker_api():
                 self._json(200, state.checkpoint_payload)
             elif self.path.endswith("/complete"):
                 self._json(state.completion_status, {})
+            elif self.path.endswith("/actions"):
+                self._json(
+                    200,
+                    {
+                        "action_id": "audit-action",
+                        "decision": "DENY",
+                        "denial_reason": "SCOPE_SUPERSEDED",
+                        "committed": False,
+                        "duplicate": False,
+                    },
+                )
             else:
                 self._json(404, {})
 
@@ -318,5 +329,52 @@ def test_waiting_worker_preserves_prebuffered_release_signal(worker_api):
     assert result.returncode == 0, result.stderr
     assert any(path.endswith("/checkpoint") for path in state.paths)
     assert any(path.endswith("/complete") for path in state.paths)
+    assert state.activation_token not in result.stdout + result.stderr
+    assert state.node_token not in result.stdout + result.stderr
+
+
+def test_non_compliant_worker_checkpoints_before_released_action(worker_api):
+    state, api_url = worker_api
+    command = [
+        sys.executable,
+        "-m",
+        "tracefence.runtime.worker",
+        "--api-url",
+        api_url,
+        "--node-id",
+        "worker-node",
+        "--mode",
+        "non_compliant_action",
+        "--wait-for-release",
+        "--heartbeat-interval",
+        "0.2",
+        "--tool",
+        "restart_postgres",
+        "--idempotency-key",
+        "checkpoint-before-action",
+    ]
+    result = subprocess.run(
+        command,
+        input=json.dumps({"activation_token": state.activation_token}) + "\nGO\n",
+        text=True,
+        capture_output=True,
+        timeout=10,
+        cwd=ROOT,
+        env=_worker_environment(),
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    checkpoint_index = next(
+        index
+        for index, path in enumerate(state.paths)
+        if path.endswith("/checkpoint")
+    )
+    action_index = next(
+        index
+        for index, path in enumerate(state.paths)
+        if path.endswith("/actions")
+    )
+    assert checkpoint_index < action_index
     assert state.activation_token not in result.stdout + result.stderr
     assert state.node_token not in result.stdout + result.stderr

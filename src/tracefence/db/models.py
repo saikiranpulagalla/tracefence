@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
+    DDL,
     JSON,
     Boolean,
     CheckConstraint,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -524,6 +526,9 @@ class ActionAttempt(Base):
     matched_live_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     matched_live_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
     scope_evaluation_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    decision_explanation_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
     request_payload_digest: Mapped[str] = mapped_column(String(64))
     arguments_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     arguments_digest: Mapped[str] = mapped_column(String(64))
@@ -678,3 +683,107 @@ class ServiceState(Base):
     pool_reset_count: Mapped[int] = mapped_column(Integer, default=0)
     last_action_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class RuntimeEvent(Base):
+    """Append-only, transactional projection of committed runtime transitions.
+
+    Runtime events never participate in authority decisions. Their sequence is
+    suitable for timeline ordering and SSE replay; the authoritative entity
+    rows and Action Gateway remain the sole safety boundary.
+    """
+
+    __tablename__ = "runtime_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "node_id"],
+            ["nodes.run_id", "nodes.id"],
+            deferrable=True,
+            initially="DEFERRED",
+            name="fk_runtime_event_node",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "parent_node_id"],
+            ["nodes.run_id", "nodes.id"],
+            deferrable=True,
+            initially="DEFERRED",
+            name="fk_runtime_event_parent",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "command_id"],
+            ["control_commands.run_id", "control_commands.id"],
+            deferrable=True,
+            initially="DEFERRED",
+            name="fk_runtime_event_command",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "action_id"],
+            ["action_attempts.run_id", "action_attempts.id"],
+            deferrable=True,
+            initially="DEFERRED",
+            name="fk_runtime_event_action",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "scope_id"],
+            ["control_scopes.run_id", "control_scopes.id"],
+            deferrable=True,
+            initially="DEFERRED",
+            name="fk_runtime_event_scope",
+        ),
+        CheckConstraint(
+            "event_type IN ("
+            "'RUN_CREATED','NODE_REGISTERED','NODE_ACTIVATED','NODE_WAITING',"
+            "'NODE_COMPLETED','LEASE_GRANTED','LEASE_RENEWED','LEASE_EXPIRED',"
+            "'COMMAND_ISSUED','SCOPE_CANCELLED','SCOPE_SUPERSEDED',"
+            "'ACTION_REQUESTED','ACTION_DENIED','ACTION_COMMITTED',"
+            "'REPLACEMENT_CREATED','RECOVERY_COMPLETED','DEMO_WORKER_RELEASED')",
+            name="ck_runtime_event_type",
+        ),
+        CheckConstraint(
+            "decision IS NULL OR decision IN ('ALLOW','DENY')",
+            name="ck_runtime_event_decision",
+        ),
+        CheckConstraint(
+            "snapshot_version IS NULL OR snapshot_version >= 1",
+            name="ck_runtime_event_snapshot_version",
+        ),
+        CheckConstraint(
+            "authoritative_version IS NULL OR authoritative_version >= 1",
+            name="ck_runtime_event_authoritative_version",
+        ),
+        Index("ix_runtime_events_run_sequence", "run_id", "sequence"),
+        Index("ix_runtime_events_action", "action_id"),
+    )
+
+    sequence: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True
+    )
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    event_type: Mapped[str] = mapped_column(String(40))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    node_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    parent_node_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    command_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    action_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    scope_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    decision: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    reason_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    snapshot_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    authoritative_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+for _operation in ("UPDATE", "DELETE"):
+    event.listen(
+        RuntimeEvent.__table__,
+        "after_create",
+        DDL(
+            f"""
+            CREATE TRIGGER trg_runtime_events_no_{_operation.lower()}
+            BEFORE {_operation} ON runtime_events
+            BEGIN
+                SELECT RAISE(ABORT, 'RUNTIME_EVENTS_APPEND_ONLY');
+            END
+            """
+        ).execute_if(dialect="sqlite"),
+    )

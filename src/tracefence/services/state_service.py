@@ -8,9 +8,10 @@ from tracefence.db.models import (
     ControlCommand,
     InvariantViolation,
     Node,
+    RuntimeEvent,
     ServiceState,
 )
-from tracefence.domain.errors import ConflictError
+from tracefence.domain.errors import ConflictError, NotFoundError
 from tracefence.services.common import get_run, iso_utc, utcnow
 
 
@@ -144,6 +145,83 @@ class StateService:
                     "attempted_at": iso_utc(row.attempted_at),
                     "committed_at": iso_utc(row.committed_at),
                     "result": row.result_json,
+                    "scope_evaluation": row.scope_evaluation_json,
+                    "decision_explanation": row.decision_explanation_json,
+                }
+                for row in rows
+            ]
+
+    async def get_action(self, run_id: str, action_id: str) -> dict:
+        with self.session_factory() as session:
+            await get_run(session, run_id)
+            row = session.execute(
+                select(ActionAttempt).where(
+                    ActionAttempt.run_id == run_id,
+                    ActionAttempt.id == action_id,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                raise NotFoundError(f"Action {action_id} was not found")
+            return {
+                "id": row.id,
+                "run_id": row.run_id,
+                "node_id": row.node_id,
+                "tool_name": row.tool_name,
+                "side_effecting": row.side_effecting,
+                "idempotency_key": row.idempotency_key,
+                "decision": row.decision,
+                "denial_reason": row.denial_reason,
+                "matched_command_id": row.matched_command_id,
+                "matched_scope_id": row.matched_scope_id,
+                "matched_snapshot_version": row.matched_snapshot_version,
+                "matched_live_version": row.matched_live_version,
+                "matched_live_status": row.matched_live_status,
+                "scope_evaluation": row.scope_evaluation_json,
+                "decision_explanation": row.decision_explanation_json,
+                "request_payload_digest": row.request_payload_digest,
+                "arguments": row.arguments_json,
+                "arguments_digest": row.arguments_digest,
+                "result": row.result_json,
+                "result_digest": row.result_digest,
+                "committed": row.committed_at is not None,
+                "attempted_at": iso_utc(row.attempted_at),
+                "committed_at": iso_utc(row.committed_at),
+            }
+
+    async def list_events(
+        self,
+        run_id: str,
+        *,
+        after: int = 0,
+        limit: int = 100,
+    ) -> list[dict]:
+        with self.session_factory() as session:
+            await get_run(session, run_id)
+            rows = session.execute(
+                select(RuntimeEvent)
+                .where(
+                    RuntimeEvent.run_id == run_id,
+                    RuntimeEvent.sequence > after,
+                )
+                .order_by(RuntimeEvent.sequence)
+                .limit(limit)
+            ).scalars()
+            return [
+                {
+                    "sequence": row.sequence,
+                    "run_id": row.run_id,
+                    "event_type": row.event_type,
+                    "occurred_at": iso_utc(row.occurred_at),
+                    "node_id": row.node_id,
+                    "parent_node_id": row.parent_node_id,
+                    "command_id": row.command_id,
+                    "action_id": row.action_id,
+                    "scope_id": row.scope_id,
+                    "decision": row.decision,
+                    "reason_code": row.reason_code,
+                    "snapshot_version": row.snapshot_version,
+                    "authoritative_version": row.authoritative_version,
+                    "metadata": row.metadata_json,
                 }
                 for row in rows
             ]

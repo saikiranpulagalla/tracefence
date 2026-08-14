@@ -15,6 +15,7 @@ from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import operator_fingerprint, operator_key_matches
 from tracefence.services.action_gateway import ActionGateway
 from tracefence.services.control_service import ControlService
+from tracefence.services.demo_controller import DemoController
 from tracefence.services.graph_service import GraphService
 from tracefence.services.invariant_service import InvariantService
 from tracefence.services.lease_service import LeaseService
@@ -158,6 +159,17 @@ proof_service = ProofService(SessionLocal)
 invariant_service = InvariantService(SessionLocal)
 lease_service = LeaseService(SessionLocal)
 state_service = StateService(SessionLocal)
+demo_controller = DemoController(
+    SessionLocal,
+    run_service=run_service,
+    spawn_service=spawn_service,
+    control_service=control_service,
+    action_gateway=action_gateway,
+    graph_service=graph_service,
+    state_service=state_service,
+    proof_service=proof_service,
+    lease_service=lease_service,
+)
 
 
 async def call_blocking_service[T](factory: Callable[[], Awaitable[T]]) -> T:

@@ -36,6 +36,11 @@ _PROOF_RELEVANT_RUN_TABLES = (
     "telemetry_outbox",
     "service_state",
 )
+_RUNTIME_EVENT_TRIGGER_NAMES = {
+    "trg_runtime_events_no_update",
+    "trg_runtime_events_no_delete",
+}
+
 _PROOF_REVISION_TRIGGER_DDL = Template(
     """
     CREATE TRIGGER IF NOT EXISTS $trigger_name
@@ -88,7 +93,7 @@ def _install_proof_revision_triggers(selected_engine: Engine) -> None:
         )
 
 
-def _validate_proof_revision_triggers(selected_engine: Engine) -> None:
+def _validate_required_triggers(selected_engine: Engine) -> None:
     if selected_engine.dialect.name != "sqlite":
         return
     with selected_engine.connect() as connection:
@@ -97,10 +102,11 @@ def _validate_proof_revision_triggers(selected_engine: Engine) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             ).scalars()
         )
-    missing = sorted(_proof_revision_trigger_names() - actual)
+    required = _proof_revision_trigger_names() | _RUNTIME_EVENT_TRIGGER_NAMES
+    missing = sorted(required - actual)
     if missing:
         raise RuntimeError(
-            "SCHEMA_MIGRATION_REQUIRED: proof revision triggers are missing: "
+            "SCHEMA_MIGRATION_REQUIRED: required database triggers are missing: "
             + ", ".join(missing)
         )
 
@@ -282,8 +288,8 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 17
-ALEMBIC_HEAD = "001_schema_v17"
+SCHEMA_VERSION = 18
+ALEMBIC_HEAD = "002_schema_v18_runtime_inspector"
 
 
 def _stamp_alembic_head(selected_engine: Engine) -> None:
@@ -342,7 +348,7 @@ def init_db(target_engine: Engine | None = None) -> None:
                 session.add(SchemaMetadata(id=1, version=SCHEMA_VERSION))
                 session.commit()
             _stamp_alembic_head(selected_engine)
-            _validate_proof_revision_triggers(selected_engine)
+            _validate_required_triggers(selected_engine)
         except BaseException as bootstrap_error:
             # This path started from a confirmed empty database. Removing the
             # newly created SQLite tables restores a retryable bootstrap without
@@ -376,7 +382,7 @@ def init_db(target_engine: Engine | None = None) -> None:
     _validate_schema_shape(selected_engine)
     _stamp_alembic_head(selected_engine)
     _install_proof_revision_triggers(selected_engine)
-    _validate_proof_revision_triggers(selected_engine)
+    _validate_required_triggers(selected_engine)
 
 
 def drop_db(target_engine: Engine | None = None) -> None:

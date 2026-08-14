@@ -31,6 +31,7 @@ from tracefence.services.common import (
     get_run,
     utcnow,
 )
+from tracefence.services.runtime_events import record_runtime_event
 from tracefence.services.tool_registry import ToolSpec, get_tool_spec
 from tracefence.telemetry.instruments import telemetry
 
@@ -103,29 +104,69 @@ class ActionGateway:
                 run = await get_run(session, node.run_id)
                 evaluation = await evaluate_scopes(session, node)
 
+                checks: list[dict[str, str | None]] = []
+
+                def check(name: str, passed: bool, reason: str | None = None) -> None:
+                    checks.append(
+                        {
+                            "name": name,
+                            "outcome": "PASS" if passed else "FAIL",
+                            "reason": None if passed else reason,
+                        }
+                    )
+
                 denial_reason: str | None = None
                 if run.status != "RUNNING":
                     denial_reason = "RUN_NOT_ACTIVE"
-                elif node.status not in {"ACTIVE", "WAITING"}:
-                    denial_reason = "NODE_NOT_ACTIVE"
-                elif node.lease_expires_at is None or node.lease_expires_at <= utcnow():
-                    denial_reason = "LEASE_EXPIRED"
-                elif not evaluation.allowed:
-                    denial_reason = evaluation.primary_reason or "SCOPE_INVALID"
+                    check("run_active", False, denial_reason)
                 else:
-                    denial_reason = self._recovery_contract_denial(
-                        session,
-                        node,
-                        request,
-                        spec,
-                    )
-                    if (
-                        denial_reason is None
-                        and spec.capability not in set(node.capabilities_json or [])
-                    ):
-                        denial_reason = "TOOL_NOT_ALLOWED"
-                    if denial_reason is None:
-                        spec.validate_arguments(request.arguments)
+                    check("run_active", True)
+                    if node.status not in {"ACTIVE", "WAITING"}:
+                        denial_reason = "NODE_NOT_ACTIVE"
+                        check("node_active", False, denial_reason)
+                    else:
+                        check("node_active", True)
+                        if (
+                            node.lease_expires_at is None
+                            or node.lease_expires_at <= utcnow()
+                        ):
+                            denial_reason = "LEASE_EXPIRED"
+                            check("lease_valid", False, denial_reason)
+                        else:
+                            check("lease_valid", True)
+                            if not evaluation.allowed:
+                                denial_reason = (
+                                    evaluation.primary_reason or "SCOPE_INVALID"
+                                )
+                                check("scope_current", False, denial_reason)
+                            else:
+                                check("scope_current", True)
+                                denial_reason = self._recovery_contract_denial(
+                                    session,
+                                    node,
+                                    request,
+                                    spec,
+                                )
+                                if node.caused_by_command_id is not None:
+                                    check(
+                                        "recovery_contract",
+                                        denial_reason is None,
+                                        denial_reason,
+                                    )
+                                if denial_reason is None:
+                                    capability_allowed = spec.capability in set(
+                                        node.capabilities_json or []
+                                    )
+                                    if not capability_allowed:
+                                        denial_reason = "TOOL_NOT_ALLOWED"
+                                    check(
+                                        "capability_allowed",
+                                        capability_allowed,
+                                        denial_reason,
+                                    )
+                                if denial_reason is None:
+                                    spec.validate_arguments(request.arguments)
+                                    check("arguments_valid", True)
 
                 commands = []
                 command = None
@@ -169,12 +210,40 @@ class ActionGateway:
                         "mismatches": [asdict(m) for m in evaluation.mismatches],
                         "live_scopes": list(evaluation.live_scopes),
                     },
+                    decision_explanation_json={
+                        "schema_version": 1,
+                        "idempotency": "NEW",
+                        "checks": checks,
+                        "final_decision": (
+                            ActionDecision.DENY.value
+                            if denial_reason
+                            else ActionDecision.ALLOW.value
+                        ),
+                        "final_reason": denial_reason,
+                    },
                     request_payload_digest=request_digest,
                     arguments_json=dict(request.arguments),
                     arguments_digest=payload_digest(request.arguments),
                     attempted_at=utcnow(),
                 )
                 session.add(attempt)
+                record_runtime_event(
+                    session,
+                    run_id=node.run_id,
+                    event_type="ACTION_REQUESTED",
+                    occurred_at=attempt.attempted_at,
+                    node_id=node.id,
+                    action_id=attempt.id,
+                    command_id=command.id if command else None,
+                    scope_id=matched_mismatch.scope_id if matched_mismatch else None,
+                    snapshot_version=(
+                        matched_mismatch.snapshot_version if matched_mismatch else None
+                    ),
+                    authoritative_version=(
+                        matched_mismatch.live_version if matched_mismatch else None
+                    ),
+                    metadata={"tool_name": request.tool_name},
+                )
                 if commands:
                     for applicable_command in commands:
                         mismatch = next(
@@ -210,6 +279,21 @@ class ActionGateway:
                             node.id,
                             applicable_command.to_version,
                         )
+                    record_runtime_event(
+                        session,
+                        run_id=node.run_id,
+                        event_type="ACTION_DENIED",
+                        occurred_at=attempt.attempted_at,
+                        node_id=node.id,
+                        action_id=attempt.id,
+                        command_id=attempt.matched_command_id,
+                        scope_id=attempt.matched_scope_id,
+                        decision=ActionDecision.DENY.value,
+                        reason_code=denial_reason,
+                        snapshot_version=attempt.matched_snapshot_version,
+                        authoritative_version=attempt.matched_live_version,
+                        metadata={"tool_name": request.tool_name},
+                    )
                     session.commit()
                     self._record_metrics(request, denial_reason, started)
                     with telemetry.tracer.start_as_current_span(
@@ -260,6 +344,20 @@ class ActionGateway:
                 attempt.result_json = result
                 attempt.result_digest = payload_digest(result)
                 attempt.committed_at = utcnow()
+                record_runtime_event(
+                    session,
+                    run_id=node.run_id,
+                    event_type="ACTION_COMMITTED",
+                    occurred_at=attempt.committed_at,
+                    node_id=node.id,
+                    action_id=attempt.id,
+                    command_id=node.caused_by_command_id,
+                    decision=ActionDecision.ALLOW.value,
+                    metadata={
+                        "tool_name": request.tool_name,
+                        "result_digest": attempt.result_digest,
+                    },
+                )
                 session.commit()
 
                 telemetry.action_attempts_total.add(1, {"tool_name": request.tool_name})

@@ -3,7 +3,7 @@ API_URL ?= http://127.0.0.1:9000
 EXPECTED_COMMIT ?= $(shell git rev-parse HEAD)
 EVIDENCE_MAX_AGE_SECONDS ?= 900
 
-.PHONY: help install install-core install-dev install-full test audit locks release-artifacts api scenario verify reset signoz provision-signoz verify-signoz verify-all clean
+.PHONY: help install install-core install-dev install-full test audit locks release-artifacts api demo demo-test scenario verify reset signoz provision-signoz verify-signoz verify-all clean
 
 help:
 	@echo "install-core       Install direct runtime dependencies and editable package"
@@ -16,6 +16,8 @@ help:
 	@echo "scenario           Run one distributed scenario against API_URL"
 	@echo "verify             Verify signed evidence against commit, freshness and live API"
 	@echo "verify-all         Verify evidence and require live telemetry reconciliation"
+	@echo "demo               Start the built-in Runtime Inspector without external telemetry"
+	@echo "demo-test          Verify the Runtime Inspector backend and security boundary"
 
 install-core:
 	$(PYTHON) -m pip install -r requirements.txt
@@ -38,6 +40,7 @@ test:
 audit:
 	$(PYTHON) -m compileall -q src scripts tests
 	node --check src/tracefence/frontend/app.js
+	node --check src/tracefence/frontend/demo.js
 	ruff check src scripts tests
 	mypy src/tracefence
 	bandit -q -r src scripts -x tests
@@ -61,6 +64,12 @@ release-artifacts:
 
 api:
 	PYTHONPATH=src $(PYTHON) -m uvicorn tracefence.api.main:app --host 127.0.0.1 --port 9000
+
+demo:
+	PYTHONPATH=src $(PYTHON) scripts/run_demo.py
+
+demo-test:
+	PYTHONPATH=src $(PYTHON) scripts/run_local_tests.py -q tests/unit/test_demo_controller.py tests/unit/test_demo_security_and_launcher.py tests/unit/test_runtime_inspector_journal.py tests/unit/test_runtime_inspector_read_model.py
 
 scenario:
 	PYTHONPATH=src $(PYTHON) scripts/run_scenario.py --api-url $(API_URL)

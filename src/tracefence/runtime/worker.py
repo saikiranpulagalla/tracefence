@@ -228,6 +228,29 @@ async def run_worker(
                 heartbeat_loop(), name=f"tracefence-heartbeat-{args.node_id}"
             )
             try:
+                if args.mode == "non_compliant_action":
+                    checkpoint = await post_while_live(
+                        f"/v1/nodes/{args.node_id}/checkpoint",
+                        json_payload={"stage": "before_protected_action"},
+                    )
+                    print(checkpoint.text, flush=True)
+                    if checkpoint.status_code != 200:
+                        lifecycle_span.set_attribute(
+                            "tracefence.worker.terminal_state",
+                            "CHECKPOINT_REJECTED",
+                        )
+                        return EXIT_CHECKPOINT_DENIED
+                    checkpoint_payload = checkpoint.json()
+                    if (
+                        not isinstance(checkpoint_payload, dict)
+                        or checkpoint_payload.get("allowed") is not True
+                    ):
+                        lifecycle_span.set_attribute(
+                            "tracefence.worker.terminal_state",
+                            "CHECKPOINT_DENIED",
+                        )
+                        return EXIT_CHECKPOINT_DENIED
+
                 await wait_for_work_release()
                 if lease_lost.is_set():
                     lifecycle_span.set_attribute("tracefence.worker.terminal_state", "LEASE_LOST")

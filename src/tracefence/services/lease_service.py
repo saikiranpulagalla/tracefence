@@ -19,6 +19,7 @@ from tracefence.db.models import (
 from tracefence.domain.enums import AckType, NodeStatus, ReplacementStatus, RunStatus
 from tracefence.services.common import commands_for_scope_mismatches, evaluate_scopes, utcnow
 from tracefence.services.run_lifecycle import transition_run
+from tracefence.services.runtime_events import record_runtime_event
 from tracefence.telemetry.instruments import telemetry, update_runtime_gauges
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,15 @@ class LeaseService:
                                     observed_scope_version=command.to_version,
                                 )
                             )
+                    record_runtime_event(
+                        session,
+                        run_id=node.run_id,
+                        event_type="LEASE_EXPIRED",
+                        occurred_at=now,
+                        node_id=node.id,
+                        parent_node_id=node.parent_id,
+                        command_id=node.caused_by_command_id,
+                    )
                     expired += 1
                 session.commit()
             except Exception:

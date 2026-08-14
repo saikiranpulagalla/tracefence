@@ -84,7 +84,8 @@ def test_checked_in_signoz_assets_are_strictly_valid():
 def test_packaged_frontend_has_no_embedded_operator_secret():
     html = (ROOT / "src" / "tracefence" / "frontend" / "index.html").read_text()
     script = (ROOT / "src" / "tracefence" / "frontend" / "app.js").read_text()
-    combined = html + script
+    demo_script = (ROOT / "src" / "tracefence" / "frontend" / "demo.js").read_text()
+    combined = html + script + demo_script
     assert "dev-operator-key" not in combined
     assert "replace-me" not in combined
     assert "finalHeaders['Content-Type'] = 'application/json'" in script
@@ -94,6 +95,12 @@ def test_packaged_frontend_has_no_embedded_operator_secret():
     assert "/scenario/seed" not in combined
     assert '<script src="/assets/app.js" defer></script>' in html
 
+    assert '<script src="/assets/demo.js" defer></script>' in html
+    assert "[hidden]{display:none!important}" in html
+    assert "SIGNOZ_API_KEY" not in demo_script
+    assert "demoRunCheck" in html
+    assert "/checks/lease-expiry/" in demo_script
+    assert "bindActionSelectors" in demo_script
 
 async def test_root_completion_closes_run_only_after_valid_descendants_finish(session_factory):
     spawns = SpawnService(session_factory)

@@ -2,17 +2,21 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>TraceFence Control Integrity</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>TraceFence Runtime Inspector</title>
   <style>
     :root{color-scheme:dark;--bg:#080b10;--panel:#10151d;--panel2:#151c26;--border:#273142;--text:#eef3f8;--muted:#8fa0b5;--accent:#f4a340;--ok:#4fd69c;--warn:#ffc15a;--bad:#ff667a;--info:#6da8ff}
     *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    [hidden]{display:none!important}
     button,input,select,textarea{font:inherit}.shell{max-width:1440px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:20px}.brand h1{margin:0;font-size:28px}.brand p{margin:6px 0 0;color:var(--muted)}.badge{display:inline-flex;border:1px solid var(--border);border-radius:999px;padding:6px 10px;color:var(--muted);background:var(--panel)}
     .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:end}.field{display:grid;gap:5px;color:var(--muted);font-size:12px}.field input,.field select,.field textarea{min-width:180px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:9px;padding:9px}.field textarea{min-height:76px;resize:vertical}.btn{border:1px solid var(--border);border-radius:9px;padding:9px 13px;background:var(--panel2);color:var(--text);cursor:pointer}.btn:hover{border-color:var(--accent)}.btn.primary{background:var(--accent);color:#171008;border-color:var(--accent);font-weight:700}.btn.danger{border-color:var(--bad);color:var(--bad)}
     .metrics{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:12px;margin:18px 0}.metric{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px}.metric span{display:block;color:var(--muted);font-size:12px}.metric strong{font-size:25px;display:block;margin-top:5px}.grid{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(320px,.8fr);gap:14px}.panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;margin-bottom:14px}.panel h2{margin:0 0 13px;font-size:16px}.panel h3{font-size:13px;color:var(--muted);margin:16px 0 9px}.muted{color:var(--muted)}
     .graph-legend{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:12px;color:var(--muted);font-size:11px}.graph-legend span{display:inline-flex;align-items:center;gap:6px}.legend-line{display:inline-block;width:30px;border-top:2px solid var(--info)}.legend-line.supersedes{border-top-color:var(--accent);border-top-style:dashed}.command-chip{border:1px solid var(--accent);color:var(--accent);border-radius:999px;padding:4px 8px}.graph-canvas{position:relative;overflow-x:auto;overflow-y:hidden;padding:4px 2px 12px}.graph-columns{position:relative;z-index:2;display:grid;gap:26px;align-items:start}.graph-edges{position:absolute;z-index:1;left:0;top:0;pointer-events:none;overflow:visible}.graph-edge{fill:none;stroke:var(--info);stroke-width:2;opacity:.72}.graph-edge.supersedes{stroke:var(--accent);stroke-width:2.5;stroke-dasharray:7 5}.graph-edge.spawn+*{}#arrow-spawn path{fill:var(--info)}#arrow-supersedes path{fill:var(--accent)}.generation-column{min-width:0}.generation-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}.generation-nodes{display:grid;gap:12px}.node{position:relative;width:100%;min-height:150px;text-align:left;background:var(--panel2);border:1px solid var(--border);border-radius:11px;padding:12px;cursor:pointer;color:var(--text)}.node:hover,.node.selected{border-color:var(--accent)}.node.selected{box-shadow:0 0 0 1px var(--accent) inset}.node.command-affected{border-left:4px solid var(--warn)}.node.replacement-node{border-right:4px solid var(--accent)}.node-head{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.node .role{font-weight:700;overflow-wrap:anywhere}.behavior{font-size:10px;color:var(--muted);border:1px solid var(--border);border-radius:999px;padding:2px 6px;white-space:nowrap}.node .id{font:11px ui-monospace,monospace;color:var(--muted);margin:5px 0}.statuses{display:flex;gap:5px;flex-wrap:wrap}.status{font-size:10px;padding:3px 6px;border-radius:999px;border:1px solid var(--border)}.status.ACTIVE,.status.COMPLETED{color:var(--ok)}.status.SUPERSEDED,.status.CANCELLED,.status.LEASE_EXPIRED{color:var(--bad)}.status.PENDING,.status.WAITING{color:var(--warn)}.scope-row{display:flex;justify-content:space-between;gap:8px;margin-top:8px;color:var(--muted);font-size:10px}.scope-row strong{color:var(--text);font-weight:600}.block-reason,.blocked-badge,.lineage-note{margin-top:7px;font-size:10px}.block-reason{color:var(--bad)}.blocked-badge{display:inline-block;color:var(--bad);border:1px solid var(--bad);border-radius:999px;padding:3px 6px}.lineage-note{color:var(--accent)}.capabilities{display:flex;gap:5px;flex-wrap:wrap}.capabilities span{font-size:10px;padding:3px 6px;border:1px solid var(--border);border-radius:999px;color:var(--muted)}.manifest{max-height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:9px;color:var(--muted);font-size:10px}
     table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;border-bottom:1px solid var(--border);padding:9px 7px;vertical-align:top}th{color:var(--muted);font-weight:500}.ALLOW{color:var(--ok)}.DENY{color:var(--bad)}.timeline{display:grid;gap:8px}.event{border-left:3px solid var(--info);padding:8px 10px;background:var(--panel2);border-radius:0 9px 9px 0}.event strong{font-size:12px}.event small{display:block;color:var(--muted);margin-top:3px}.proof-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.proof-item{border:1px solid var(--border);padding:9px;border-radius:9px}.proof-item span{display:block;color:var(--muted);font-size:11px}.proof-item strong{font-size:15px}.verdict{font-size:20px;font-weight:800}.VERIFIED{color:var(--ok)}.PARTIAL,.INCOMPLETE{color:var(--warn)}.INCONSISTENT,.UNAVAILABLE{color:var(--bad)}.notice{padding:10px;border:1px solid var(--border);border-radius:9px;color:var(--muted);font-size:12px}.error{border-color:var(--bad);color:var(--bad)}
-    @media(max-width:1000px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.shell{padding:14px}.top{display:block}.toolbar{margin-top:14px}.metrics{grid-template-columns:1fr 1fr}.field input,.field select,.field textarea{width:100%;min-width:0}.graph-columns{gap:18px}}
+    .demo-workspace{border-color:#805728;background:linear-gradient(135deg,#151510 0%,var(--panel) 55%)}.demo-heading{display:flex;justify-content:space-between;gap:18px;align-items:start}.demo-heading h2{font-size:19px}.demo-heading p{max-width:760px;margin:5px 0 0;color:var(--muted)}.demo-controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.demo-progress{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;margin-top:14px}.demo-step{padding:8px;border:1px solid var(--border);border-radius:8px;color:var(--muted);font-size:11px}.demo-step.done{border-color:var(--ok);color:var(--ok)}.demo-step.current{border-color:var(--accent);color:var(--accent)}.telemetry-note{border:1px solid var(--warn);color:var(--warn);border-radius:9px;padding:8px 10px;font-size:11px;white-space:nowrap}.session-history{margin-top:12px;display:flex;gap:8px;align-items:center;color:var(--muted);font-size:12px}.session-history select{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px;min-width:280px}.action-row{cursor:pointer}.action-row:hover,.action-row.selected{background:var(--panel2)}.decision-check{display:grid;grid-template-columns:1fr auto;gap:7px;padding:7px 0;border-bottom:1px solid var(--border)}.decision-check:last-child{border-bottom:0}.decision-check .PASS{color:var(--ok)}.decision-check .FAIL{color:var(--bad)}.event.ACTION_DENIED{border-color:var(--bad)}.event.ACTION_COMMITTED{border-color:var(--ok)}.event.SCOPE_SUPERSEDED,.event.SCOPE_CANCELLED{border-color:var(--warn)}
+    .demo-checks{display:grid;grid-template-columns:minmax(220px,320px) auto 1fr;gap:9px;align-items:center;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}.demo-checks select{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:9px}.demo-check-result{font-size:12px;color:var(--muted)}.event[data-action]{cursor:pointer}.event[data-action]:hover{outline:1px solid var(--accent)}
+    @media(max-width:1000px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.shell{padding:14px}.top{display:block}.toolbar{margin-top:14px}.metrics{grid-template-columns:1fr 1fr}.grid{grid-template-columns:minmax(0,1fr)}.grid>*,.panel{min-width:0}.field input,.field select,.field textarea{width:100%;min-width:0}.graph-columns{gap:18px}.demo-heading{display:block}.telemetry-note{display:inline-block;margin-top:10px;white-space:normal}.demo-progress,.demo-checks{grid-template-columns:1fr}.session-history{display:grid}.session-history select{min-width:0;width:100%}}
   </style>
 </head>
 <body>
@@ -20,16 +24,48 @@
   <section class="top">
     <div class="brand">
       <h1>TraceFence</h1>
-      <p>Runtime-enforced cancellation and correction for dynamic agent graphs.</p>
+      <p>Watch stale agent authority fail closed at the protected side-effect boundary.</p>
     </div>
     <span class="badge" id="health" role="status" aria-live="polite">checking control plane…</span>
   </section>
 
-  <section class="toolbar">
+  <section class="toolbar" id="adminToolbar">
     <label class="field">Run<select id="runSelect"><option value="">No runs</option></select></label>
     <label class="field">Operator key<input id="operatorKey" type="password" autocomplete="off" placeholder="Enter operator key"></label>
     <button class="btn primary" id="refreshBtn">Refresh evidence</button>
     <label class="field">Auto refresh<select id="autoRefresh"><option value="on">On · 2s</option><option value="off">Off</option></select></label>
+  </section>
+
+  <section class="panel demo-workspace" id="demoWorkspace" hidden>
+    <div class="demo-heading">
+      <div>
+        <h2>Local Runtime Inspector</h2>
+        <p>A real worker waits before a protected PostgreSQL restart. Supersede its branch, release it, and inspect the gateway's persisted DENY before an exact replacement resets Redis.</p>
+      </div>
+      <span class="telemetry-note" id="demoTelemetry">external telemetry disabled · runtime proof remains local</span>
+    </div>
+    <div class="demo-controls">
+      <button class="btn primary" id="demoStart">Start stale-worker scenario</button>
+      <button class="btn" id="demoAuto">Run automatically</button>
+      <button class="btn danger" id="demoSupersede" disabled>Supersede branch</button>
+      <button class="btn" id="demoRelease" disabled>Release stale worker</button>
+      <button class="btn" id="demoReplacement" disabled>Run exact replacement</button>
+      <button class="btn" id="demoProof" disabled>Build proof</button>
+      <button class="btn" id="demoReset" disabled>Reset view</button>
+    </div>
+    <div class="demo-progress" id="demoProgress" aria-label="Scenario progress"></div>
+    <div class="session-history">
+      <label for="demoSessions">Session history</label>
+      <select id="demoSessions"><option value="">No sessions yet</option></select>
+    </div>
+    <div id="demoFeedback" class="muted" role="status" aria-live="polite" style="margin-top:10px">Ready to create an isolated SQLite-backed demonstration.</div>
+    <div class="demo-checks">
+      <label class="field">Adversarial check<select id="demoCheckScenario"></select></label>
+      <button class="btn" id="demoRunCheck">Run selected check</button>
+      <div id="demoCheckResult" class="demo-check-result" role="status" aria-live="polite">
+        Cancellation, lease expiry, retries, manifest mismatch, sibling isolation and concurrency use the real gateway.
+      </div>
+    </div>
   </section>
 
   <section class="metrics">
@@ -47,7 +83,7 @@
         <div id="graph"><p class="muted">Run the scenario script, then select the latest run.</p></div>
       </article>
       <article class="panel">
-        <h2>Control timeline</h2>
+        <h2 id="timelineHeading">Runtime event timeline</h2>
         <div class="timeline" id="timeline"><p class="muted">No control commands.</p></div>
       </article>
       <article class="panel">
@@ -60,6 +96,7 @@
       <article class="panel">
         <h2>Selected node</h2>
         <div id="nodeInspector" class="notice" aria-live="polite">Select a graph node.</div>
+        <div id="adminControls">
         <h3>Issue control command</h3>
         <label class="field">Command<select id="commandType"><option>CORRECT_SUBTREE</option><option>CANCEL_SUBTREE</option></select></label>
         <label class="field" style="margin-top:9px">Reason code<input id="reasonCode" value="WRONG_ROOT_CAUSE"></label>
@@ -68,7 +105,11 @@
         <label class="field" style="margin-top:9px">Expected recovery tool<input id="replacementTool" value="reset_redis_pool"></label>
         <label class="field" style="margin-top:9px">Stability window (seconds)<input id="recoveryStability" type="number" min="0" max="300" value="5"></label>
         <button class="btn danger" id="commandBtn" style="margin-top:12px">Apply to selected subtree</button>
-        <div id="commandFeedback" class="muted" role="status" aria-live="polite" style="margin-top:9px;font-size:12px"></div>
+        <div id="commandFeedback" class="muted" role="status" aria-live="polite" style="margin-top:9px;font-size:12px"></div></div>
+      </article>
+      <article class="panel">
+        <h2>Action Gateway decision</h2>
+        <div id="actionInspector" class="notice" aria-live="polite">Select an action ledger row.</div>
       </article>
 
       <article class="panel">
@@ -89,5 +130,6 @@
   </section>
 </main>
 <script src="/assets/app.js" defer></script>
+<script src="/assets/demo.js" defer></script>
 </body>
 </html>

@@ -124,14 +124,18 @@ def test_alembic_initial_revision_is_checked_in():
 
     root = Path(__file__).resolve().parents[2]
     assert (root / "alembic.ini").is_file()
-    revision = (
+    initial = (
         root
         / "migrations"
         / "versions"
         / "001_schema_v17.py"
     ).read_text(encoding="utf-8")
-    assert f'revision = "{ALEMBIC_HEAD}"' in revision
-    assert f"SCHEMA_VERSION = {SCHEMA_VERSION}" in revision
+    latest = (root / "migrations" / "versions" / f"{ALEMBIC_HEAD}.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'revision = "001_schema_v17"' in initial
+    assert f'revision = "{ALEMBIC_HEAD}"' in latest
+    assert f"SCHEMA_VERSION = {SCHEMA_VERSION}" in latest
 
 
 def test_init_db_refuses_legacy_unversioned_database(tmp_path):

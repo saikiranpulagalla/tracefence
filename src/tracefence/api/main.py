@@ -14,6 +14,7 @@ from tracefence.api.dependencies import (
     call_blocking_service,
     call_external_service,
     control_plane_runtime,
+    demo_controller,
     external_io_runtime,
     invariant_service,
     lease_service,
@@ -24,7 +25,7 @@ from tracefence.api.middleware import (
     RequestSizeLimitMiddleware,
     SecurityHeadersMiddleware,
 )
-from tracefence.api.routes import actions, control, health, nodes, proofs, runs, scenario
+from tracefence.api.routes import actions, control, demo, health, nodes, proofs, runs, scenario
 from tracefence.config import settings
 from tracefence.db.engine import init_db
 from tracefence.logging_config import configure_logging
@@ -103,6 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await scanner
         with suppress(asyncio.CancelledError):
             await auditor
+        await demo_controller.close()
         await control_plane_runtime.stop()
         await external_io_runtime.stop()
         if not force_flush_telemetry():
@@ -144,6 +146,7 @@ app.include_router(control.router)
 app.include_router(actions.router)
 app.include_router(proofs.router)
 app.include_router(scenario.router)
+app.include_router(demo.router)
 instrument_app(app)
 
 _frontend_dir = Path(__file__).resolve().parents[1] / "frontend"
@@ -158,3 +161,8 @@ async def home() -> FileResponse:
 @app.get("/assets/app.js", include_in_schema=False)
 async def frontend_script() -> FileResponse:
     return FileResponse(_frontend_dir / "app.js", media_type="application/javascript")
+
+
+@app.get("/assets/demo.js", include_in_schema=False)
+async def demo_frontend_script() -> FileResponse:
+    return FileResponse(_frontend_dir / "demo.js", media_type="application/javascript")
