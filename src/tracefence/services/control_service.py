@@ -8,7 +8,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from tracefence.config import settings
-from tracefence.db.models import ControlCommand, ControlScope, CorrectionProposal, Node
+from tracefence.db.models import (
+    ControlCommand,
+    ControlScope,
+    CorrectionProposal,
+    Node,
+    RuntimeStopIntent,
+)
 from tracefence.domain.enums import (
     CommandType,
     IssuerType,
@@ -123,6 +129,22 @@ class ControlService:
                         raise ConflictError(
                             "Idempotency key was reused with a different command payload",
                             code="IDEMPOTENCY_PAYLOAD_MISMATCH",
+                        )
+                    if existing.command_type in {
+                        CommandType.CANCEL_RUN,
+                        CommandType.CANCEL_SUBTREE,
+                        CommandType.CORRECT_SUBTREE,
+                    } and session.scalar(
+                        select(RuntimeStopIntent.id).where(
+                            RuntimeStopIntent.source_command_id == existing.id
+                        )
+                    ) is None:
+                        # A pre-v22 command has no trustworthy final proof
+                        # revision to backfill as causal history. Do not turn
+                        # an exact replay into a new stop event at today's state.
+                        raise ConflictError(
+                            "Historical command lacks runtime-stop causal history",
+                            code="RUNTIME_STOP_INTENT_HISTORICAL_MISSING",
                         )
                     session.commit()
                     return self._to_response(existing, duplicate=True)
