@@ -288,8 +288,8 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 18
-ALEMBIC_HEAD = "002_schema_v18_runtime_inspector"
+SCHEMA_VERSION = 19
+ALEMBIC_HEAD = "003_schema_v19_worker_instances"
 
 
 def _stamp_alembic_head(selected_engine: Engine) -> None:

@@ -1,0 +1,338 @@
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import select, text
+from sqlalchemy.exc import DatabaseError, IntegrityError
+
+from tests.helpers import create_seeded_run
+from tracefence.db.engine import ALEMBIC_HEAD, SCHEMA_VERSION, build_engine, init_db
+from tracefence.db.models import WorkerInstance
+from tracefence.domain.errors import ConflictError, NotFoundError
+from tracefence.services.worker_instance_service import WorkerInstanceService
+
+
+async def test_create_pending_worker_instance_and_list_by_node(session_factory):
+    run = await create_seeded_run(session_factory, "worker-instance-create")
+    service = WorkerInstanceService(session_factory)
+    instance = await service.create_pending_instance(
+        instance_id=str(uuid4()),
+        node_id=run.root_node_id,
+        incarnation=1,
+    )
+
+    assert instance.node_id == run.root_node_id
+    assert instance.incarnation == 1
+    assert instance.observed_state == "PENDING"
+    assert instance.activated_at is None
+    assert instance.terminal_at is None
+    assert [row.id for row in await service.list_instances_for_node(run.root_node_id)] == [
+        instance.id
+    ]
+
+
+async def test_worker_instance_rejects_duplicate_node_incarnation(session_factory):
+    run = await create_seeded_run(session_factory, "worker-instance-duplicate")
+    service = WorkerInstanceService(session_factory)
+    await service.create_pending_instance(
+        instance_id=str(uuid4()),
+        node_id=run.root_node_id,
+        incarnation=1,
+    )
+
+    with pytest.raises(IntegrityError):
+        await service.create_pending_instance(
+            instance_id=str(uuid4()),
+            node_id=run.root_node_id,
+            incarnation=1,
+        )
+
+
+@pytest.mark.parametrize("incarnation", [0, -1])
+async def test_worker_instance_rejects_nonpositive_incarnation(
+    session_factory,
+    incarnation,
+):
+    run = await create_seeded_run(session_factory, "worker-instance-incarnation")
+    with pytest.raises(IntegrityError):
+        with session_factory.begin() as session:
+            session.add(
+                WorkerInstance(
+                    id=str(uuid4()),
+                    node_id=run.root_node_id,
+                    incarnation=incarnation,
+                    observed_state="PENDING",
+                )
+            )
+
+
+async def test_worker_instance_rejects_unknown_node_and_foreign_key_is_enforced(
+    session_factory,
+):
+    with pytest.raises(IntegrityError):
+        with session_factory.begin() as session:
+            session.add(
+                WorkerInstance(
+                    id=str(uuid4()),
+                    node_id=str(uuid4()),
+                    incarnation=1,
+                    observed_state="PENDING",
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    ("observed_state", "activated_at", "terminal_at"),
+    [
+        ("PENDING", None, None),
+        ("ACTIVE", datetime(2026, 1, 1), None),
+        ("EXITED", datetime(2026, 1, 1), datetime(2026, 1, 2)),
+        ("FAILED", None, datetime(2026, 1, 2)),
+    ],
+)
+async def test_worker_instance_accepts_valid_physical_states(
+    session_factory,
+    observed_state,
+    activated_at,
+    terminal_at,
+):
+    run = await create_seeded_run(session_factory, "worker-instance-valid-state")
+    with session_factory.begin() as session:
+        session.add(
+            WorkerInstance(
+                id=str(uuid4()),
+                node_id=run.root_node_id,
+                incarnation=1,
+                observed_state=observed_state,
+                activated_at=activated_at,
+                terminal_at=terminal_at,
+            )
+        )
+
+
+async def test_worker_instance_rejects_invalid_physical_state(session_factory):
+    run = await create_seeded_run(session_factory, "worker-instance-invalid-state")
+    with pytest.raises(IntegrityError):
+        with session_factory.begin() as session:
+            session.add(
+                WorkerInstance(
+                    id=str(uuid4()),
+                    node_id=run.root_node_id,
+                    incarnation=1,
+                    observed_state="LOST",
+                )
+            )
+
+
+async def test_worker_instance_transitions_are_physical_and_terminal_states_do_not_revive(
+    session_factory,
+):
+    run = await create_seeded_run(session_factory, "worker-instance-transitions")
+    service = WorkerInstanceService(session_factory)
+    instance = await service.create_pending_instance(
+        instance_id=str(uuid4()),
+        node_id=run.root_node_id,
+        incarnation=1,
+        created_at=datetime(2026, 1, 1),
+    )
+
+    active = await service.transition_observed_state(
+        instance.id,
+        "ACTIVE",
+        observed_at=datetime(2026, 1, 2),
+    )
+    exited = await service.transition_observed_state(
+        instance.id,
+        "EXITED",
+        observed_at=datetime(2026, 1, 3),
+    )
+
+    assert active.activated_at == datetime(2026, 1, 2)
+    assert exited.terminal_at == datetime(2026, 1, 3)
+    with pytest.raises(ConflictError, match="invalid") as resurrection:
+        await service.transition_observed_state(instance.id, "ACTIVE")
+    assert resurrection.value.code == "WORKER_INSTANCE_TRANSITION_INVALID"
+
+
+
+async def test_worker_instance_allows_both_failed_paths(session_factory):
+    run = await create_seeded_run(session_factory, "worker-instance-failed-paths")
+    service = WorkerInstanceService(session_factory)
+    pending_failure = await service.create_pending_instance(
+        instance_id=str(uuid4()),
+        node_id=run.root_node_id,
+        incarnation=1,
+    )
+    active_failure = await service.create_pending_instance(
+        instance_id=str(uuid4()),
+        node_id=run.root_node_id,
+        incarnation=2,
+    )
+
+    failed_before_activation = await service.transition_observed_state(
+        pending_failure.id,
+        "FAILED",
+        observed_at=datetime(2026, 1, 2),
+    )
+    await service.transition_observed_state(
+        active_failure.id,
+        "ACTIVE",
+        observed_at=datetime(2026, 1, 2),
+    )
+    failed_after_activation = await service.transition_observed_state(
+        active_failure.id,
+        "FAILED",
+        observed_at=datetime(2026, 1, 3),
+    )
+
+    assert failed_before_activation.activated_at is None
+    assert failed_before_activation.terminal_at == datetime(2026, 1, 2)
+    assert failed_after_activation.activated_at == datetime(2026, 1, 2)
+    assert failed_after_activation.terminal_at == datetime(2026, 1, 3)
+
+
+async def test_worker_instance_rejects_illegal_pending_transition(session_factory):
+    run = await create_seeded_run(session_factory, "worker-instance-illegal-transition")
+    service = WorkerInstanceService(session_factory)
+    instance = await service.create_pending_instance(
+        instance_id=str(uuid4()),
+        node_id=run.root_node_id,
+        incarnation=1,
+    )
+
+    with pytest.raises(ConflictError, match="invalid"):
+        await service.transition_observed_state(instance.id, "EXITED")
+
+
+async def test_worker_instance_id_is_immutable(session_factory):
+    run = await create_seeded_run(session_factory, "worker-instance-id-immutable")
+    service = WorkerInstanceService(session_factory)
+    instance = await service.create_pending_instance(
+        instance_id=str(uuid4()),
+        node_id=run.root_node_id,
+        incarnation=1,
+    )
+
+    with pytest.raises(DatabaseError, match="WORKER_INSTANCE_ID_IMMUTABLE"):
+        with session_factory.begin() as session:
+            session.execute(
+                text("UPDATE worker_instances SET id = :new_id WHERE id = :instance_id"),
+                {"new_id": str(uuid4()), "instance_id": instance.id},
+            )
+
+
+async def test_terminal_node_keeps_historical_worker_instances(session_factory):
+    run = await create_seeded_run(session_factory, "worker-instance-terminal-node")
+    service = WorkerInstanceService(session_factory)
+    instance = await service.create_pending_instance(
+        instance_id=str(uuid4()),
+        node_id=run.root_node_id,
+        incarnation=1,
+    )
+    with session_factory.begin() as session:
+        session.execute(
+            text(
+                "UPDATE nodes SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP "
+                "WHERE id = :node_id"
+            ),
+            {"node_id": run.root_node_id},
+        )
+
+    with session_factory() as session:
+        assert session.scalar(
+            select(WorkerInstance.id).where(WorkerInstance.id == instance.id)
+        ) == instance.id
+
+
+async def test_legacy_nodes_without_worker_instances_remain_valid(session_factory):
+    run = await create_seeded_run(session_factory, "worker-instance-legacy")
+    with session_factory() as session:
+        assert session.scalars(
+            select(WorkerInstance).where(WorkerInstance.node_id == run.root_node_id)
+        ).all() == []
+
+
+async def test_worker_instance_service_reports_missing_instance(session_factory):
+    service = WorkerInstanceService(session_factory)
+    with pytest.raises(NotFoundError):
+        await service.get_instance(str(uuid4()))
+
+
+def _alembic_config(database_path):
+    from alembic.config import Config
+
+    root = Path(__file__).resolve().parents[2]
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "migrations"))
+    config.set_main_option("sqlalchemy.url", f"sqlite+pysqlite:///{database_path}")
+    return config
+
+
+def test_alembic_fresh_worker_instance_migration_and_repeat_behavior(tmp_path):
+    from alembic import command
+
+    path = tmp_path / "fresh-worker-instance.db"
+    config = _alembic_config(path)
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")
+
+    engine = build_engine(f"sqlite+pysqlite:///{path}")
+    with engine.connect() as connection:
+        tables = set(
+            connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).scalars()
+        )
+        version = connection.execute(
+            text("SELECT version FROM schema_metadata WHERE id = 1")
+        ).scalar_one()
+        revision = connection.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one()
+    assert "worker_instances" in tables
+    assert version == SCHEMA_VERSION
+    assert revision == ALEMBIC_HEAD
+    engine.dispose()
+
+
+def test_alembic_upgrade_from_previous_schema_adds_worker_instances(tmp_path):
+    from alembic import command
+
+    path = tmp_path / "upgrade-worker-instance.db"
+    config = _alembic_config(path)
+    command.upgrade(config, "002_schema_v18_runtime_inspector")
+
+    engine = build_engine(f"sqlite+pysqlite:///{path}")
+    with engine.begin() as connection:
+        # The initial historical migration imports model metadata. Remove the
+        # current-model table to faithfully represent the v18 deployed shape.
+        connection.execute(text("DROP TABLE IF EXISTS worker_instances"))
+    engine.dispose()
+
+    command.upgrade(config, "head")
+
+    engine = build_engine(f"sqlite+pysqlite:///{path}")
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT version FROM schema_metadata WHERE id = 1")
+        ).scalar_one() == SCHEMA_VERSION
+        assert "worker_instances" in set(
+            connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).scalars()
+        )
+    engine.dispose()
+
+
+def test_schema_guard_rejects_missing_worker_instance_table(tmp_path):
+    engine = build_engine(f"sqlite+pysqlite:///{tmp_path / 'missing-worker-instance.db'}")
+    init_db(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE worker_instances"))
+
+    with pytest.raises(RuntimeError, match="worker_instances"):
+        init_db(engine)
+    engine.dispose()

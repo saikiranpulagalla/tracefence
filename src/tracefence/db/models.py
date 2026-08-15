@@ -163,6 +163,67 @@ class Node(Base):
     process_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
+class WorkerInstance(Base):
+    """One physical execution incarnation for a logical Node.
+
+    Worker instances are intentionally not authority-bearing. They only record
+    an observed physical lifecycle for a Node; Node remains the logical
+    execution and control identity.
+    """
+
+    __tablename__ = "worker_instances"
+    __table_args__ = (
+        UniqueConstraint(
+            "node_id",
+            "incarnation",
+            name="uq_worker_instance_node_incarnation",
+        ),
+        CheckConstraint(
+            "incarnation >= 1",
+            name="ck_worker_instance_incarnation_positive",
+        ),
+        CheckConstraint(
+            "observed_state IN ('PENDING','ACTIVE','EXITED','FAILED')",
+            name="ck_worker_instance_observed_state",
+        ),
+        CheckConstraint(
+            "(observed_state = 'PENDING' AND activated_at IS NULL AND terminal_at IS NULL) "
+            "OR (observed_state = 'ACTIVE' AND activated_at IS NOT NULL AND terminal_at IS NULL) "
+            "OR (observed_state = 'EXITED' AND activated_at IS NOT NULL AND terminal_at IS NOT NULL) "
+            "OR (observed_state = 'FAILED' AND terminal_at IS NOT NULL)",
+            name="ck_worker_instance_lifecycle_timestamps",
+        ),
+        Index("ix_worker_instances_node", "node_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    node_id: Mapped[str] = mapped_column(
+        ForeignKey("nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    incarnation: Mapped[int] = mapped_column(Integer, nullable=False)
+    observed_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+event.listen(
+    WorkerInstance.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_id_immutable
+        BEFORE UPDATE OF id ON worker_instances
+        WHEN NEW.id != OLD.id
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_ID_IMMUTABLE');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+
+
 class ControlScope(Base):
     __tablename__ = "control_scopes"
     __table_args__ = (
