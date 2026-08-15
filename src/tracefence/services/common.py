@@ -67,13 +67,6 @@ class AuthenticatedExecutionPrincipal:
     protocol_version: int
     worker_instance: WorkerInstance | None
 
-async def authenticate_node(session: Session, node_id: str, token: str) -> Node:
-    node = await get_node(session, node_id)
-    if not token_matches(token, node.token_hash):
-        raise AuthenticationError("Invalid node token")
-    return node
-
-
 async def authenticate_execution_principal(
     session: Session,
     *,
