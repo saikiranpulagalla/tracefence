@@ -149,7 +149,11 @@ class ProofService:
         owner = False
         while True:
             cache_context = self._cache_context(command_id)
-            initial_key = self._cache_key(command_id, cache_context)
+            initial_key = (
+                self._cache_key(command_id, cache_context)
+                if cache_context is not None
+                else None
+            )
             now_mono = time.monotonic()
             with self._state_lock:
                 self._prune_cache_locked(now_mono)
@@ -179,7 +183,11 @@ class ProofService:
             # cache-return linearization point so a mutation after C1 cannot
             # return the C1 response as current.
             final_context = self._cache_context(command_id)
-            final_key = self._cache_key(command_id, final_context)
+            final_key = (
+                self._cache_key(command_id, final_context)
+                if final_context is not None
+                else None
+            )
             if (
                 final_key == initial_key
                 and cached.expires_at > time.monotonic()
@@ -211,10 +219,7 @@ class ProofService:
                     ):
                         store_key = self._cache_key(
                             command_id,
-                            _ProofCacheContext(
-                                proof=context,
-                                export_watermark=reconciled_watermark,
-                            ),
+                            self._make_cache_context(context, reconciled_watermark),
                         )
                         if store_key is not None:
                             self._cache[store_key] = _CacheEntry(
@@ -251,13 +256,28 @@ class ProofService:
                     inflight.set_exception(exc)
             raise
 
-    def _cache_context(self, command_id: str) -> _ProofCacheContext:
-        context = self._current_context(command_id)
+    def _cache_context(self, command_id: str) -> _ProofCacheContext | None:
+        # SQLite's default SELECT behavior does not give a Session an explicit
+        # multi-statement read transaction. Sandwich the context read with the
+        # database-owned monotonic run revision instead. Every cache-relevant
+        # database mutation advances that revision through required triggers.
+        for _ in range(_MAX_PROOF_STABILITY_ATTEMPTS):
+            context = self._current_context(command_id)
+            watermark = _export_watermark_identity(
+                telemetry_export_context(context.run_id, command_id)
+            )
+            if self._read_revision(context.run_id) == context.revision:
+                return self._make_cache_context(context, watermark)
+        return None
+
+    @staticmethod
+    def _make_cache_context(
+        context: _ProofContext,
+        export_watermark: str | None,
+    ) -> _ProofCacheContext:
         return _ProofCacheContext(
             proof=context,
-            export_watermark=_export_watermark_identity(
-                telemetry_export_context(context.run_id, command_id)
-            ),
+            export_watermark=export_watermark,
         )
 
     def _prune_cache_locked(self, now_mono: float) -> None:

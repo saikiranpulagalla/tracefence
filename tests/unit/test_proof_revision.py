@@ -364,6 +364,93 @@ async def test_cache_hit_rebuilds_when_revision_changes_after_context_snapshot(
     assert second.overall_verdict != ProofVerdict.VERIFIED
 
 
+
+async def test_cache_hit_rebuilds_when_node_revision_changes_during_context_read(
+    session_factory,
+    monkeypatch,
+):
+    run, _old, command, _replacement, _action = await _corrected_recovery(
+        session_factory, key="proof-cache-hit-node-revision-race"
+    )
+    watermark = ExportWatermark(
+        service_name="tracefence-control-plane",
+        service_instance_id="service-a",
+        process_instance_id="process-a",
+        build_commit="build-a",
+        schema_version=1,
+        run_id=run.run_id,
+        command_id=command.command_id,
+        exported_at_ms=1_005_000,
+        sequence=1,
+    )
+    monkeypatch.setattr(proof_module, "force_flush_telemetry", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        proof_module,
+        "telemetry_export_context",
+        lambda _run_id, _command_id: watermark,
+    )
+    mcp = _CountingVerifiedMCPClient()
+    proofs = ProofService(session_factory, mcp_client=mcp)
+
+    await proofs.build(command.command_id)
+    assert mcp.calls == 1
+
+    original_context = proofs._current_context
+    mutated = False
+
+    def context_with_node_mutation(command_id: str):
+        nonlocal mutated
+        context = original_context(command_id)
+        if not mutated:
+            mutated = True
+            with session_factory() as session, session.begin():
+                node = session.get(Node, run.root_node_id)
+                assert node is not None
+                node.last_heartbeat_at = utcnow()
+        return context
+
+    monkeypatch.setattr(proofs, "_current_context", context_with_node_mutation)
+    await proofs.build(command.command_id)
+
+    assert mutated
+    assert mcp.calls == 2
+
+
+async def test_cached_response_isolated_from_caller_mutation(
+    session_factory,
+    monkeypatch,
+):
+    run, _old, command, _replacement, _action = await _corrected_recovery(
+        session_factory, key="proof-cache-copy-isolation"
+    )
+    watermark = ExportWatermark(
+        service_name="tracefence-control-plane",
+        service_instance_id="service-a",
+        process_instance_id="process-a",
+        build_commit="build-a",
+        schema_version=1,
+        run_id=run.run_id,
+        command_id=command.command_id,
+        exported_at_ms=1_005_000,
+        sequence=1,
+    )
+    monkeypatch.setattr(proof_module, "force_flush_telemetry", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        proof_module,
+        "telemetry_export_context",
+        lambda _run_id, _command_id: watermark,
+    )
+    mcp = _CountingVerifiedMCPClient()
+    proofs = ProofService(session_factory, mcp_client=mcp)
+
+    first = await proofs.build(command.command_id)
+    first.discrepancies.append("CALLER_MUTATION")
+    cached = await proofs.build(command.command_id)
+
+    assert "CALLER_MUTATION" not in cached.discrepancies
+    assert mcp.calls == 1
+
+
 async def test_cache_hit_rebuilds_when_command_export_watermark_changes(
     session_factory,
     monkeypatch,
