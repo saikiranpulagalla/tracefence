@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     event,
+    text as sql_text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -381,7 +382,10 @@ SCHEMA_INTEGRITY_TRIGGER_DDL = {
 }
 
 
-for _trigger_ddl in SCHEMA_INTEGRITY_TRIGGER_DDL.values():
+_WORKER_INSTANCE_SCHEMA_INTEGRITY_TRIGGER_DDL = dict(SCHEMA_INTEGRITY_TRIGGER_DDL)
+
+
+for _trigger_ddl in _WORKER_INSTANCE_SCHEMA_INTEGRITY_TRIGGER_DDL.values():
     event.listen(
         WorkerInstance.__table__,
         "after_create",
@@ -471,9 +475,47 @@ class CredentialRecoveryEnvelope(Base):
             ["nodes.run_id", "nodes.id"],
             ondelete="CASCADE",
         ),
+        ForeignKeyConstraint(
+            ["subject_worker_instance_id"],
+            ["worker_instances.id"],
+            name="fk_credential_recovery_subject_worker_instance",
+        ),
+        ForeignKeyConstraint(
+            ["spawn_intent_id"],
+            ["spawn_intents.id"],
+            name="fk_credential_recovery_spawn_intent",
+        ),
         CheckConstraint(
             "operation_type IN ('SPAWN','REPLACEMENT','ACTIVATION')",
             name="ck_credential_recovery_operation_type",
+        ),
+        CheckConstraint(
+            "binding_version IN (1, 2)",
+            name="ck_credential_recovery_binding_version_allowed",
+        ),
+        CheckConstraint(
+            "(binding_version = 1 AND binding_kind = 'V1_NODE' "
+            "AND subject_worker_instance_id IS NULL AND spawn_intent_id IS NULL) "
+            "OR (binding_version = 2 AND binding_kind = 'V2_CHILD_ACTIVATION' "
+            "AND operation_type = 'ACTIVATION' "
+            "AND subject_worker_instance_id IS NOT NULL AND spawn_intent_id IS NOT NULL)",
+            name="ck_credential_recovery_binding_shape",
+        ),
+        Index(
+            "uq_credential_recovery_v2_spawn_intent",
+            "spawn_intent_id",
+            unique=True,
+            sqlite_where=sql_text(
+                "binding_version = 2 AND binding_kind = 'V2_CHILD_ACTIVATION'"
+            ),
+        ),
+        Index(
+            "uq_credential_recovery_v2_subject_worker_instance",
+            "subject_worker_instance_id",
+            unique=True,
+            sqlite_where=sql_text(
+                "binding_version = 2 AND binding_kind = 'V2_CHILD_ACTIVATION'"
+            ),
         ),
     )
 
@@ -484,11 +526,121 @@ class CredentialRecoveryEnvelope(Base):
     subject_node_id: Mapped[str] = mapped_column(String(36))
     operation_key: Mapped[str] = mapped_column(String(160))
     request_payload_digest: Mapped[str] = mapped_column(String(64))
+    binding_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    binding_kind: Mapped[str] = mapped_column(
+        String(24),
+        nullable=False,
+        default="V1_NODE",
+        server_default="V1_NODE",
+    )
+    subject_worker_instance_id: Mapped[str | None] = mapped_column(
+        String(36),
+        nullable=True,
+    )
+    spawn_intent_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     nonce: Mapped[str] = mapped_column(String(24))
     ciphertext: Mapped[str] = mapped_column(Text)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+V21_SCHEMA_INTEGRITY_TRIGGER_DDL = {
+    "trg_credential_recovery_envelopes_causal_identity_immutable": """
+        CREATE TRIGGER IF NOT EXISTS
+            trg_credential_recovery_envelopes_causal_identity_immutable
+        BEFORE UPDATE OF run_id, operation_type, caller_node_id, subject_node_id,
+            operation_key, request_payload_digest ON credential_recovery_envelopes
+        WHEN NEW.run_id IS NOT OLD.run_id
+          OR NEW.operation_type IS NOT OLD.operation_type
+          OR NEW.caller_node_id IS NOT OLD.caller_node_id
+          OR NEW.subject_node_id IS NOT OLD.subject_node_id
+          OR NEW.operation_key IS NOT OLD.operation_key
+          OR NEW.request_payload_digest IS NOT OLD.request_payload_digest
+        BEGIN
+            SELECT RAISE(ABORT, 'CREDENTIAL_RECOVERY_CAUSAL_IDENTITY_IMMUTABLE');
+        END
+    """,
+    "trg_credential_recovery_envelopes_binding_immutable": """
+        CREATE TRIGGER IF NOT EXISTS
+            trg_credential_recovery_envelopes_binding_immutable
+        BEFORE UPDATE OF binding_version, binding_kind, subject_worker_instance_id,
+            spawn_intent_id ON credential_recovery_envelopes
+        WHEN NEW.binding_version IS NOT OLD.binding_version
+          OR NEW.binding_kind IS NOT OLD.binding_kind
+          OR NEW.subject_worker_instance_id IS NOT OLD.subject_worker_instance_id
+          OR NEW.spawn_intent_id IS NOT OLD.spawn_intent_id
+        BEGIN
+            SELECT RAISE(ABORT, 'CREDENTIAL_RECOVERY_BINDING_IMMUTABLE');
+        END
+    """,
+    "trg_credential_recovery_envelopes_v2_child_binding_insert": """
+        CREATE TRIGGER IF NOT EXISTS
+            trg_credential_recovery_envelopes_v2_child_binding_insert
+        BEFORE INSERT ON credential_recovery_envelopes
+        WHEN NEW.binding_version = 2
+         AND NOT EXISTS (
+            SELECT 1
+            FROM runs
+            JOIN worker_instances
+              ON worker_instances.id = NEW.subject_worker_instance_id
+            JOIN spawn_intents
+              ON spawn_intents.id = NEW.spawn_intent_id
+            WHERE runs.id = NEW.run_id
+              AND runs.execution_protocol_version = 2
+              AND worker_instances.node_id = NEW.subject_node_id
+              AND worker_instances.activation_intent_id = NEW.spawn_intent_id
+              AND spawn_intents.child_node_id = NEW.subject_node_id
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'V2_CHILD_ACTIVATION_BINDING_CAUSAL_MISMATCH');
+        END
+    """,
+    "trg_spawn_intents_v2_recovery_binding_delete_prohibited": """
+        CREATE TRIGGER IF NOT EXISTS
+            trg_spawn_intents_v2_recovery_binding_delete_prohibited
+        BEFORE DELETE ON spawn_intents
+        WHEN EXISTS (
+            SELECT 1
+            FROM credential_recovery_envelopes
+            WHERE binding_version = 2
+              AND spawn_intent_id = OLD.id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'SPAWN_INTENT_V2_RECOVERY_BINDING_DELETE_PROHIBITED');
+        END
+    """,
+    "trg_spawn_intents_v2_recovery_binding_causality_immutable": """
+        CREATE TRIGGER IF NOT EXISTS
+            trg_spawn_intents_v2_recovery_binding_causality_immutable
+        BEFORE UPDATE OF id, run_id, child_node_id ON spawn_intents
+        WHEN EXISTS (
+            SELECT 1
+            FROM credential_recovery_envelopes
+            WHERE binding_version = 2
+              AND spawn_intent_id = OLD.id
+        )
+         AND (NEW.id IS NOT OLD.id
+              OR NEW.run_id IS NOT OLD.run_id
+              OR NEW.child_node_id IS NOT OLD.child_node_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'SPAWN_INTENT_V2_RECOVERY_BINDING_CAUSALITY_IMMUTABLE');
+        END
+    """,
+}
+
+
+for _trigger_ddl in V21_SCHEMA_INTEGRITY_TRIGGER_DDL.values():
+    event.listen(
+        CredentialRecoveryEnvelope.__table__,
+        "after_create",
+        DDL(_trigger_ddl).execute_if(dialect="sqlite"),
+    )
 
 
 class CorrectionProposal(Base):

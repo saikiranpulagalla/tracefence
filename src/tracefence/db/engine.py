@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from tracefence.config import settings
 from tracefence.db.models import (
     SCHEMA_INTEGRITY_TRIGGER_DDL,
+    V21_SCHEMA_INTEGRITY_TRIGGER_DDL,
     Base,
     SchemaMetadata,
 )
@@ -45,7 +46,11 @@ _RUNTIME_EVENT_TRIGGER_NAMES = {
     "trg_runtime_events_no_update",
     "trg_runtime_events_no_delete",
 }
-_SCHEMA_INTEGRITY_TRIGGER_NAMES = set(SCHEMA_INTEGRITY_TRIGGER_DDL)
+_ALL_SCHEMA_INTEGRITY_TRIGGER_DDL = {
+    **SCHEMA_INTEGRITY_TRIGGER_DDL,
+    **V21_SCHEMA_INTEGRITY_TRIGGER_DDL,
+}
+_SCHEMA_INTEGRITY_TRIGGER_NAMES = set(_ALL_SCHEMA_INTEGRITY_TRIGGER_DDL)
 
 
 _PROOF_REVISION_TRIGGER_DDL = Template(
@@ -133,7 +138,7 @@ def _validate_required_triggers(selected_engine: Engine) -> None:
         )
     malformed = sorted(
         name
-        for name, expected in SCHEMA_INTEGRITY_TRIGGER_DDL.items()
+        for name, expected in _ALL_SCHEMA_INTEGRITY_TRIGGER_DDL.items()
         if _normalize_sql(actual[name]) != _normalize_sql(expected)
     )
     if malformed:
@@ -309,15 +314,19 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
             constraint_mismatches.append(
                 f"{table_name}(index {missing_ix!r})"
             )
-    v20_checks = {
+    versioned_checks = {
         "runs": {"ck_run_execution_protocol_version_allowed"},
         "worker_instances": {
             "ck_worker_instance_activated_revision_nonnegative",
             "ck_worker_instance_terminal_revision_nonnegative",
             "ck_worker_instance_revision_order",
         },
+        "credential_recovery_envelopes": {
+            "ck_credential_recovery_binding_version_allowed",
+            "ck_credential_recovery_binding_shape",
+        },
     }
-    for table_name, required_checks in v20_checks.items():
+    for table_name, required_checks in versioned_checks.items():
         expected_checks = {
             str(constraint.name): _normalize_sql(str(constraint.sqltext))
             for constraint in Base.metadata.tables[table_name].constraints
@@ -339,14 +348,52 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
                 f"{table_name}(check definition {wrong_checks!r})"
             )
 
-    protocol_column = next(
-        column
-        for column in inspector.get_columns("runs")
-        if column["name"] == "execution_protocol_version"
+    default_requirements = {
+        ("runs", "execution_protocol_version"): "1",
+        ("credential_recovery_envelopes", "binding_version"): "1",
+        ("credential_recovery_envelopes", "binding_kind"): "V1_NODE",
+    }
+    for (table_name, column_name), expected_default in default_requirements.items():
+        column = next(
+            column
+            for column in inspector.get_columns(table_name)
+            if column["name"] == column_name
+        )
+        actual_default = str(column.get("default") or "").strip("'\"() ")
+        if actual_default != expected_default:
+            constraint_mismatches.append(
+                f"{table_name}({column_name} default {expected_default})"
+            )
+
+    v21_partial_unique_indexes = {
+        "uq_credential_recovery_v2_spawn_intent": (
+            "CREATE UNIQUE INDEX uq_credential_recovery_v2_spawn_intent "
+            "ON credential_recovery_envelopes (spawn_intent_id) "
+            "WHERE binding_version = 2 AND binding_kind = 'V2_CHILD_ACTIVATION'"
+        ),
+        "uq_credential_recovery_v2_subject_worker_instance": (
+            "CREATE UNIQUE INDEX uq_credential_recovery_v2_subject_worker_instance "
+            "ON credential_recovery_envelopes (subject_worker_instance_id) "
+            "WHERE binding_version = 2 AND binding_kind = 'V2_CHILD_ACTIVATION'"
+        ),
+    }
+    with selected_engine.connect() as connection:
+        index_sql = {
+            str(name): str(sql)
+            for name, sql in connection.exec_driver_sql(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+    malformed_indexes = sorted(
+        name
+        for name, expected in v21_partial_unique_indexes.items()
+        if _normalize_sql(index_sql.get(name, "")) != _normalize_sql(expected)
     )
-    protocol_default = str(protocol_column.get("default") or "").strip("'\"() ")
-    if protocol_default != "1":
-        constraint_mismatches.append("runs(execution_protocol_version default 1)")
+    if malformed_indexes:
+        constraint_mismatches.append(
+            "credential_recovery_envelopes(partial index definition "
+            f"{malformed_indexes!r})"
+        )
 
     if constraint_mismatches:
         raise RuntimeError(
@@ -359,8 +406,8 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 20
-ALEMBIC_HEAD = "004_schema_v20_execution_protocol_activation"
+SCHEMA_VERSION = 21
+ALEMBIC_HEAD = "005_schema_v21_v2_recovery_binding"
 
 
 def _stamp_alembic_head(selected_engine: Engine) -> None:

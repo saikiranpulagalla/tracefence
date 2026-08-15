@@ -702,3 +702,38 @@ def test_schema_guard_rejects_critical_trigger_with_correct_name_wrong_body(tmp_
     with pytest.raises(RuntimeError, match="unexpected definitions"):
         init_db(engine)
     engine.dispose()
+
+
+def test_schema_guard_rejects_malformed_v21_trigger_body(tmp_path):
+    engine = build_engine(f"sqlite+pysqlite:///{tmp_path / 'bad-v21-trigger.db'}")
+    init_db(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text("DROP TRIGGER trg_credential_recovery_envelopes_binding_immutable")
+        )
+        connection.execute(
+            text(
+                "CREATE TRIGGER trg_credential_recovery_envelopes_binding_immutable "
+                "BEFORE UPDATE OF binding_version ON credential_recovery_envelopes "
+                "BEGIN SELECT 1; END"
+            )
+        )
+    with pytest.raises(RuntimeError, match="unexpected definitions"):
+        init_db(engine)
+    engine.dispose()
+
+
+def test_schema_guard_rejects_malformed_v21_partial_index_body(tmp_path):
+    engine = build_engine(f"sqlite+pysqlite:///{tmp_path / 'bad-v21-index.db'}")
+    init_db(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP INDEX uq_credential_recovery_v2_spawn_intent"))
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX uq_credential_recovery_v2_spawn_intent "
+                "ON credential_recovery_envelopes (spawn_intent_id)"
+            )
+        )
+    with pytest.raises(RuntimeError, match="partial index definition"):
+        init_db(engine)
+    engine.dispose()
