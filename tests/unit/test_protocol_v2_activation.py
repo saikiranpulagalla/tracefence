@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import func, select
 
-from tests.helpers import FULL_ROOT_CAPABILITIES, create_v2_run
+from tests.helpers import FULL_ROOT_CAPABILITIES, create_seeded_run, create_v2_run
 from tracefence.db.models import (
     CredentialRecoveryEnvelope,
     Node,
@@ -387,3 +387,32 @@ async def test_v2_recovery_rejects_cancelled_activation_subject(session_factory)
             NodeActivate(activation_token=child.activation_token, process_id=4301),
         )
     assert captured.value.code in {"SCOPE_CANCELLED", "ACTIVATION_RECOVERY_DENIED"}
+
+
+async def test_normal_new_runs_use_protocol_v2_and_legacy_test_runs_remain_v1(
+    session_factory,
+):
+    normal = await RunService(session_factory).create_run(
+        RunCreate(name="normal-v2-default", root_capabilities=FULL_ROOT_CAPABILITIES)
+    )
+    legacy = await create_seeded_run(session_factory, "legacy-v1-fixture")
+
+    with session_factory() as session:
+        normal_run = session.get(Run, normal.run_id)
+        normal_node = session.get(Node, normal.root_node_id)
+        normal_worker = session.execute(
+            select(WorkerInstance).where(WorkerInstance.node_id == normal.root_node_id)
+        ).scalar_one()
+        legacy_run = session.get(Run, legacy.run_id)
+        legacy_node = session.get(Node, legacy.root_node_id)
+        legacy_workers = session.scalar(
+            select(func.count(WorkerInstance.id)).where(
+                WorkerInstance.node_id == legacy.root_node_id
+            )
+        )
+        assert normal_run is not None and normal_run.execution_protocol_version == 2
+        assert normal_node is not None and normal_node.token_hash is None
+        assert normal_node.current_worker_instance_id == normal_worker.id
+        assert legacy_run is not None and legacy_run.execution_protocol_version == 1
+        assert legacy_node is not None and legacy_node.token_hash is not None
+        assert legacy_workers == 0

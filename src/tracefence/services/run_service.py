@@ -25,7 +25,7 @@ class RunService:
         self.session_factory = session_factory
 
     async def create_run(
-        self, request: RunCreate, *, execution_protocol_version: int = 1
+        self, request: RunCreate, *, execution_protocol_version: int = 2
     ) -> RunCreated:
         if execution_protocol_version not in {1, 2}:
             raise ValueError("Unsupported execution protocol version")
