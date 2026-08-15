@@ -20,6 +20,12 @@ from tracefence.domain.enums import AckType, NodeStatus, ReplacementStatus, RunS
 from tracefence.services.common import commands_for_scope_mismatches, evaluate_scopes, utcnow
 from tracefence.services.run_lifecycle import transition_run
 from tracefence.services.runtime_events import record_runtime_event
+from tracefence.services.runtime_stop_service import (
+    CAUSE_LEASE_EXPIRED,
+    DOMAIN_NODE,
+    DOMAIN_RUN,
+    RuntimeStopService,
+)
 from tracefence.telemetry.instruments import telemetry, update_runtime_gauges
 
 logger = logging.getLogger(__name__)
@@ -58,6 +64,10 @@ class LeaseService:
                 pending_nodes = session.execute(pending_query).scalars().all()
 
                 for node in [*nodes, *pending_nodes]:
+                    had_physical_execution = node.status in {
+                        NodeStatus.ACTIVE,
+                        NodeStatus.WAITING,
+                    }
                     node.status = NodeStatus.LEASE_EXPIRED
                     if node.caused_by_command_id is not None:
                         command = session.get(
@@ -73,11 +83,12 @@ class LeaseService:
                                 ReplacementStatus.ACTIVATION_EXPIRED
                             )
                     run = session.get(Run, node.run_id)
-                    if (
+                    run_failed_from_root_lease = (
                         run is not None
                         and run.root_node_id == node.id
                         and run.status == RunStatus.RUNNING
-                    ):
+                    )
+                    if run_failed_from_root_lease:
                         transition_run(
                             session,
                             run,
@@ -117,6 +128,16 @@ class LeaseService:
                         parent_node_id=node.parent_id,
                         command_id=node.caused_by_command_id,
                     )
+                    if had_physical_execution and run is not None:
+                        RuntimeStopService.ensure_intent(
+                            session,
+                            run=run,
+                            cause_type=CAUSE_LEASE_EXPIRED,
+                            target_domain=(
+                                DOMAIN_RUN if run_failed_from_root_lease else DOMAIN_NODE
+                            ),
+                            source_node_id=node.id,
+                        )
                     expired += 1
                 session.commit()
             except Exception:

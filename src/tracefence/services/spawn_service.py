@@ -55,6 +55,13 @@ from tracefence.services.credential_recovery import (
 )
 from tracefence.services.run_lifecycle import transition_run
 from tracefence.services.runtime_events import record_runtime_event
+from tracefence.services.runtime_stop_service import (
+    CAUSE_LEASE_EXPIRED,
+    CAUSE_LOGICAL_COMPLETION,
+    DOMAIN_NODE,
+    DOMAIN_RUN,
+    RuntimeStopService,
+)
 from tracefence.telemetry.instruments import telemetry
 
 logger = logging.getLogger(__name__)
@@ -583,6 +590,13 @@ class SpawnService:
                         node_id=node.id,
                         parent_node_id=node.parent_id,
                     )
+                    RuntimeStopService.ensure_intent(
+                        session,
+                        run=run,
+                        cause_type=CAUSE_LEASE_EXPIRED,
+                        target_domain=DOMAIN_NODE,
+                        source_node_id=node.id,
+                    )
                     denial_code = "LEASE_EXPIRED"
                 else:
                     evaluation = await evaluate_scopes(session, node)
@@ -679,6 +693,16 @@ class SpawnService:
                 node.status = NodeStatus.LEASE_EXPIRED
                 effective_status = NodeStatus.LEASE_EXPIRED
                 await self._record_lease_expiry_ack(session, node, utcnow())
+                run = session.get(Run, node.run_id)
+                if run is None:
+                    raise NotFoundError(f"Run {node.run_id} was not found")
+                RuntimeStopService.ensure_intent(
+                    session,
+                    run=run,
+                    cause_type=CAUSE_LEASE_EXPIRED,
+                    target_domain=DOMAIN_NODE,
+                    source_node_id=node.id,
+                )
                 telemetry.leases_expired_total.add(1)
             elif commands:
                 observed_at = utcnow()
@@ -835,6 +859,15 @@ class SpawnService:
                         parent_node_id=node.parent_id,
                         command_id=node.caused_by_command_id,
                     )
+                RuntimeStopService.ensure_intent(
+                    session,
+                    run=run,
+                    cause_type=CAUSE_LOGICAL_COMPLETION,
+                    target_domain=(
+                        DOMAIN_RUN if run.root_node_id == node.id else DOMAIN_NODE
+                    ),
+                    source_node_id=node.id,
+                )
                 session.commit()
             except Exception:
                 session.rollback()

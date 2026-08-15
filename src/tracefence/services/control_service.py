@@ -41,6 +41,14 @@ from tracefence.services.common import (
 from tracefence.services.proposal_service import proposal_payload
 from tracefence.services.run_lifecycle import transition_run
 from tracefence.services.runtime_events import record_runtime_event
+from tracefence.services.runtime_stop_service import (
+    CAUSE_COMMAND_CANCEL_RUN,
+    CAUSE_COMMAND_CANCEL_SUBTREE,
+    CAUSE_COMMAND_CORRECT_SUBTREE,
+    DOMAIN_RUN,
+    DOMAIN_SCOPE,
+    RuntimeStopService,
+)
 from tracefence.services.tool_registry import get_tool_spec
 from tracefence.telemetry.instruments import telemetry
 
@@ -418,6 +426,33 @@ class ControlService:
                 )
                 if source_proposal is not None:
                     source_proposal.resulting_command_id = command.id
+
+                cause_type, target_domain, source_scope_id = {
+                    CommandType.CANCEL_RUN: (
+                        CAUSE_COMMAND_CANCEL_RUN,
+                        DOMAIN_RUN,
+                        None,
+                    ),
+                    CommandType.CANCEL_SUBTREE: (
+                        CAUSE_COMMAND_CANCEL_SUBTREE,
+                        DOMAIN_SCOPE,
+                        scope.id,
+                    ),
+                    CommandType.CORRECT_SUBTREE: (
+                        CAUSE_COMMAND_CORRECT_SUBTREE,
+                        DOMAIN_SCOPE,
+                        scope.id,
+                    ),
+                }[request.command_type]
+                RuntimeStopService.ensure_intent(
+                    session,
+                    run=run,
+                    cause_type=cause_type,
+                    target_domain=target_domain,
+                    source_command_id=command.id,
+                    source_scope_id=source_scope_id,
+                    source_node_id=target.id,
+                )
                 session.commit()
                 scope_status = ScopeStatus(scope.status)
             except IntegrityError as exc:
