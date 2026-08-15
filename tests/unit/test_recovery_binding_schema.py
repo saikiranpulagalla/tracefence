@@ -13,8 +13,8 @@ from tracefence.db.models import (
     WorkerInstance,
     utcnow,
 )
-from tracefence.security import hash_token
 from tracefence.domain.schemas import SpawnCreate
+from tracefence.security import hash_token
 from tracefence.services.spawn_service import SpawnService
 
 
