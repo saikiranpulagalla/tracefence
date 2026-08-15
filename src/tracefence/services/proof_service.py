@@ -87,6 +87,12 @@ class _ProofContext:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProofCacheContext:
+    proof: _ProofContext
+    export_watermark: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _CacheKey:
     command_id: str
     revision: int
@@ -139,36 +145,49 @@ class ProofService:
         safe to coordinate across those loops: one caller builds while all other
         callers await the identical immutable result.
         """
-        initial_context = self._current_context(command_id)
-        initial_watermark = _export_watermark_identity(
-            telemetry_export_context(initial_context.run_id, command_id)
-        )
-        initial_key = (
-            self._cache_key(command_id, initial_context, initial_watermark)
-            if initial_watermark is not None
-            else None
-        )
-        now_mono = time.monotonic()
-        with self._state_lock:
-            self._prune_cache_locked(now_mono)
-            for key in [
-                key
-                for key in self._cache
-                if key.command_id == command_id and key != initial_key
-            ]:
-                self._cache.pop(key, None)
-            cached = self._cache.get(initial_key) if initial_key is not None else None
-            if cached is not None and cached.expires_at > now_mono:
+        inflight: Future[ProofResponse] | None = None
+        owner = False
+        while True:
+            cache_context = self._cache_context(command_id)
+            initial_key = self._cache_key(command_id, cache_context)
+            now_mono = time.monotonic()
+            with self._state_lock:
+                self._prune_cache_locked(now_mono)
+                for key in [
+                    key
+                    for key in self._cache
+                    if key.command_id == command_id and key != initial_key
+                ]:
+                    self._cache.pop(key, None)
+                cached = (
+                    self._cache.get(initial_key) if initial_key is not None else None
+                )
+                if cached is None:
+                    inflight = self._inflight.get(command_id)
+                    if inflight is None:
+                        inflight = Future()
+                        self._inflight[command_id] = inflight
+                        owner = True
+                    else:
+                        owner = False
+
+            if cached is None:
+                break
+
+            # A cache key is a snapshot-derived identity, not a promise that its
+            # snapshot is still current. Re-read the complete identity at the
+            # cache-return linearization point so a mutation after C1 cannot
+            # return the C1 response as current.
+            final_context = self._cache_context(command_id)
+            final_key = self._cache_key(command_id, final_context)
+            if (
+                final_key == initial_key
+                and cached.expires_at > time.monotonic()
+            ):
                 return cached.response.model_copy(deep=True)
 
-            inflight = self._inflight.get(command_id)
-            if inflight is None:
-                inflight = Future()
-                self._inflight[command_id] = inflight
-                owner = True
-            else:
-                owner = False
-
+        if inflight is None:
+            raise RuntimeError("Proof single-flight owner was not established")
         if not owner:
             response = await asyncio.shield(asyncio.wrap_future(inflight))
             return response.model_copy(deep=True)
@@ -190,15 +209,18 @@ class ProofService:
                         reconciled_watermark is not None
                         and expires_at > time.monotonic()
                     ):
-                        key = self._cache_key(
+                        store_key = self._cache_key(
                             command_id,
-                            context,
-                            reconciled_watermark,
+                            _ProofCacheContext(
+                                proof=context,
+                                export_watermark=reconciled_watermark,
+                            ),
                         )
-                        self._cache[key] = _CacheEntry(
-                            expires_at=expires_at,
-                            response=stored,
-                        )
+                        if store_key is not None:
+                            self._cache[store_key] = _CacheEntry(
+                                expires_at=expires_at,
+                                response=stored,
+                            )
                     self._inflight.pop(command_id, None)
                     if not inflight.done():
                         inflight.set_result(stored.model_copy(deep=True))
@@ -228,6 +250,15 @@ class ProofService:
                 if not inflight.done():
                     inflight.set_exception(exc)
             raise
+
+    def _cache_context(self, command_id: str) -> _ProofCacheContext:
+        context = self._current_context(command_id)
+        return _ProofCacheContext(
+            proof=context,
+            export_watermark=_export_watermark_identity(
+                telemetry_export_context(context.run_id, command_id)
+            ),
+        )
 
     def _prune_cache_locked(self, now_mono: float) -> None:
         for key in [
@@ -269,14 +300,15 @@ class ProofService:
     @staticmethod
     def _cache_key(
         command_id: str,
-        context: _ProofContext,
-        watermark: str,
-    ) -> _CacheKey:
+        context: _ProofCacheContext,
+    ) -> _CacheKey | None:
+        if context.export_watermark is None:
+            return None
         return _CacheKey(
             command_id=command_id,
-            revision=context.revision,
-            export_watermark=watermark,
-            nearest_lease_expiry=context.nearest_lease_expiry,
+            revision=context.proof.revision,
+            export_watermark=context.export_watermark,
+            nearest_lease_expiry=context.proof.nearest_lease_expiry,
         )
 
     @staticmethod
