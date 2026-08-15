@@ -55,7 +55,7 @@ class WorkerInstanceService:
 
     async def get_instance(self, instance_id: str) -> WorkerInstance:
         with self.session_factory() as session:
-            instance = session.get(WorkerInstance, instance_id)
+            instance: WorkerInstance | None = session.get(WorkerInstance, instance_id)
             if instance is None:
                 raise NotFoundError(f"Worker instance {instance_id} was not found")
             return instance
@@ -79,7 +79,7 @@ class WorkerInstanceService:
     ) -> WorkerInstance:
         now = observed_at or utcnow()
         with self.session_factory() as session, session.begin():
-            instance = session.get(WorkerInstance, instance_id)
+            instance: WorkerInstance | None = session.get(WorkerInstance, instance_id)
             if instance is None:
                 raise NotFoundError(f"Worker instance {instance_id} was not found")
             self.validate_transition(instance.observed_state, target_state)
