@@ -284,8 +284,6 @@ def test_v20_to_v21_preserves_legacy_envelope_ciphertext(tmp_path):
                 ")"
             )
         )
-        connection.execute(text("DROP TRIGGER trg_spawn_intents_v2_recovery_binding_delete_prohibited"))
-        connection.execute(text("DROP TRIGGER trg_spawn_intents_v2_recovery_binding_causality_immutable"))
         connection.execute(text("DROP TABLE credential_recovery_envelopes"))
         connection.execute(
             text(

@@ -590,6 +590,19 @@ def test_alembic_upgrade_from_phase1a_preserves_protocol_one_runs(tmp_path):
     command.upgrade(config, "003_schema_v19_worker_instances")
 
     engine = build_engine(f"sqlite+pysqlite:///{path}")
+    with engine.connect() as connection:
+        object_names = set(
+            connection.exec_driver_sql("SELECT name FROM sqlite_master").scalars()
+        )
+        assert (
+            "trg_credential_recovery_envelopes_v2_child_binding_insert"
+            not in object_names
+        )
+        assert "uq_credential_recovery_v2_spawn_intent" not in object_names
+        assert (
+            "uq_credential_recovery_v2_subject_worker_instance"
+            not in object_names
+        )
     with engine.begin() as connection:
         connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
         connection.execute(text("DROP TABLE runs"))

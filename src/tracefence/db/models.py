@@ -19,7 +19,6 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
 )
-from sqlalchemy import text as sql_text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -501,22 +500,6 @@ class CredentialRecoveryEnvelope(Base):
             "AND subject_worker_instance_id IS NOT NULL AND spawn_intent_id IS NOT NULL)",
             name="ck_credential_recovery_binding_shape",
         ),
-        Index(
-            "uq_credential_recovery_v2_spawn_intent",
-            "spawn_intent_id",
-            unique=True,
-            sqlite_where=sql_text(
-                "binding_version = 2 AND binding_kind = 'V2_CHILD_ACTIVATION'"
-            ),
-        ),
-        Index(
-            "uq_credential_recovery_v2_subject_worker_instance",
-            "subject_worker_instance_id",
-            unique=True,
-            sqlite_where=sql_text(
-                "binding_version = 2 AND binding_kind = 'V2_CHILD_ACTIVATION'"
-            ),
-        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -634,13 +617,6 @@ V21_SCHEMA_INTEGRITY_TRIGGER_DDL = {
     """,
 }
 
-
-for _trigger_ddl in V21_SCHEMA_INTEGRITY_TRIGGER_DDL.values():
-    event.listen(
-        CredentialRecoveryEnvelope.__table__,
-        "after_create",
-        DDL(_trigger_ddl).execute_if(dialect="sqlite"),
-    )
 
 
 class CorrectionProposal(Base):

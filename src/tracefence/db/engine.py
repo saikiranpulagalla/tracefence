@@ -105,6 +105,27 @@ def _install_proof_revision_triggers(selected_engine: Engine) -> None:
         )
 
 
+_V21_PARTIAL_UNIQUE_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_recovery_v2_spawn_intent "
+    "ON credential_recovery_envelopes (spawn_intent_id) "
+    "WHERE binding_version = 2 AND binding_kind = 'V2_CHILD_ACTIVATION'",
+    "CREATE UNIQUE INDEX IF NOT EXISTS "
+    "uq_credential_recovery_v2_subject_worker_instance "
+    "ON credential_recovery_envelopes (subject_worker_instance_id) "
+    "WHERE binding_version = 2 AND binding_kind = 'V2_CHILD_ACTIVATION'",
+)
+
+
+def _install_v21_schema_integrity_triggers(selected_engine: Engine) -> None:
+    if selected_engine.dialect.name != "sqlite":
+        return
+    with selected_engine.begin() as connection:
+        for index_ddl in _V21_PARTIAL_UNIQUE_INDEX_DDL:
+            connection.exec_driver_sql(index_ddl)
+        for trigger_ddl in V21_SCHEMA_INTEGRITY_TRIGGER_DDL.values():
+            connection.exec_driver_sql(trigger_ddl)
+
+
 def _normalize_sql(sql: str) -> str:
     normalized = re.sub(r"\bif\s+not\s+exists\b", "", sql, flags=re.IGNORECASE)
     return " ".join(
@@ -461,6 +482,7 @@ def init_db(target_engine: Engine | None = None) -> None:
     if not existing_tables:
         try:
             Base.metadata.create_all(selected_engine)
+            _install_v21_schema_integrity_triggers(selected_engine)
             _install_proof_revision_triggers(selected_engine)
             with Session(selected_engine) as session:
                 session.add(SchemaMetadata(id=1, version=SCHEMA_VERSION))
