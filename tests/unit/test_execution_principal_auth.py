@@ -20,6 +20,13 @@ from tracefence.services.spawn_service import SpawnService
 
 async def _synthetic_v2(session_factory):
     run = await create_seeded_run(session_factory, "synthetic-v2-principal")
+    first_credential, second_credential, first_id = await _install_synthetic_v2(
+        session_factory, run
+    )
+    return run, first_credential, second_credential, first_id
+
+
+async def _install_synthetic_v2(session_factory, run):
     first_credential = "synthetic-worker-one-credential"
     second_credential = "synthetic-worker-two-credential"
     with session_factory.begin() as session:
@@ -41,7 +48,7 @@ async def _synthetic_v2(session_factory):
         session.add(first)
         session.flush()
         node.current_worker_instance_id = first.id
-    return run, first_credential, second_credential, first.id
+    return first_credential, second_credential, first.id
 
 
 async def _switch_current_worker(session_factory, run_id: str, node_id: str, credential: str):
@@ -114,3 +121,70 @@ async def test_v2_action_authenticates_before_node_scoped_replay(session_factory
         await gateway.execute(run.root_node_id, first, request)
     replay = await gateway.execute(run.root_node_id, second, request)
     assert replay.duplicate is True
+
+    current_request = ActionExecute(
+        tool_name="read_metrics",
+        arguments={},
+        idempotency_key="v2-current-worker-action",
+    )
+    current = await gateway.execute(run.root_node_id, second, current_request)
+    assert current.duplicate is False
+    assert current.committed is True
+    current_replay = await gateway.execute(
+        run.root_node_id, second, current_request
+    )
+    assert current_replay.duplicate is True
+
+
+async def test_v2_current_worker_confirmation_is_once_set_and_revision_neutral(
+    session_factory,
+):
+    run, first, second, first_id = await _synthetic_v2(session_factory)
+    second_id = await _switch_current_worker(
+        session_factory, run.run_id, run.root_node_id, second
+    )
+    with session_factory() as session:
+        before_revision = session.get(Run, run.run_id).proof_revision
+        first_instance = session.get(WorkerInstance, first_id)
+        second_instance = session.get(WorkerInstance, second_id)
+        assert first_instance is not None and first_instance.credential_confirmed_at is None
+        assert second_instance is not None and second_instance.credential_confirmed_at is None
+
+    with session_factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        await authenticate_execution_principal(
+            session, node_id=run.root_node_id, credential=second
+        )
+        session.commit()
+    with session_factory() as session:
+        second_instance = session.get(WorkerInstance, second_id)
+        assert second_instance is not None
+        assert second_instance.credential_confirmed_at is not None
+        confirmed_at = second_instance.credential_confirmed_at
+        assert session.get(Run, run.run_id).proof_revision == before_revision
+
+    with session_factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        await authenticate_execution_principal(
+            session, node_id=run.root_node_id, credential=second
+        )
+        session.commit()
+    with session_factory() as session:
+        first_instance = session.get(WorkerInstance, first_id)
+        second_instance = session.get(WorkerInstance, second_id)
+        assert first_instance is not None and first_instance.credential_confirmed_at is None
+        assert second_instance is not None
+        assert second_instance.credential_confirmed_at == confirmed_at
+        assert session.get(Run, run.run_id).proof_revision == before_revision
+
+    with session_factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        with pytest.raises(AuthenticationError):
+            await authenticate_execution_principal(
+                session, node_id=run.root_node_id, credential=first
+            )
+        session.rollback()
+    with session_factory() as session:
+        second_instance = session.get(WorkerInstance, second_id)
+        assert second_instance is not None
+        assert second_instance.credential_confirmed_at == confirmed_at
