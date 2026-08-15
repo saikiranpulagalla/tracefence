@@ -18,8 +18,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     event,
-    text as sql_text,
 )
+from sqlalchemy import text as sql_text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
