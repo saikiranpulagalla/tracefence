@@ -104,13 +104,10 @@ class RuntimeStopService:
     @staticmethod
     def _candidate_sql(*, exists_only: bool = False) -> str:
         # Phase 2A intentionally does not inspect mutable observed state or
-        # terminal_revision.  Phase 2B must first define a trusted terminal
+        # terminal_revision. Phase 2B must first define a trusted terminal
         # ordering comparable with source_revision before either can omit a
         # conservative historical convergence candidate.
-        select_clause = "SELECT 1" if exists_only else "SELECT worker.id"
-        limit_clause = "" if exists_only else "ORDER BY worker.id LIMIT :batch_size"
-        return f"""
-            {select_clause}
+        predicate = """
             FROM worker_instances AS worker
             JOIN nodes AS node ON node.id = worker.node_id
             WHERE node.run_id = :run_id
@@ -141,8 +138,10 @@ class RuntimeStopService:
                     WHERE target.stop_intent_id = :intent_id
                       AND target.worker_instance_id = worker.id
               )
-            {limit_clause}
         """
+        if exists_only:
+            return "SELECT 1 " + predicate
+        return "SELECT worker.id " + predicate + " ORDER BY worker.id LIMIT :batch_size"
 
     @staticmethod
     def _params(intent: RuntimeStopIntent, *, batch_size: int | None = None) -> dict:
