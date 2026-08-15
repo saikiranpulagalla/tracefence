@@ -16,7 +16,7 @@ from tracefence.db.models import (
     Node,
     SpawnIntent,
 )
-from tracefence.domain.enums import CommandType, IssuerType, NodeStatus
+from tracefence.domain.enums import CommandType, IssuerType
 from tracefence.domain.errors import AuthenticationError, ConflictError
 from tracefence.domain.schemas import CommandCreate, NodeActivate, Principal, SpawnCreate
 from tracefence.services.common import utcnow
@@ -77,7 +77,6 @@ async def test_lost_spawn_response_is_recovered_without_duplicate_node(session_f
     with session_factory() as session, session.begin():
         root = session.get(Node, run.root_node_id)
         assert root is not None
-        root.status = NodeStatus.LEASE_EXPIRED
     retried = await service.create_spawn(run.root_node_id, run.root_token, request)
 
     assert retried == first
@@ -528,3 +527,157 @@ def test_recovery_encryption_key_must_be_independent_and_ttl_is_bounded():
         ).validate_security()
     with pytest.raises(RuntimeError, match="must be between 5 and 300"):
         replace(secure, credential_recovery_ttl_seconds=301).validate_security()
+
+
+@pytest.mark.asyncio
+async def test_spawn_recovery_rejects_expired_parent_lease(session_factory):
+    run = await create_seeded_run(session_factory, "recovery-expired-parent")
+    service = SpawnService(session_factory)
+    parent = await activate(
+        service,
+        await service.create_spawn(
+            run.root_node_id,
+            run.root_token,
+            SpawnCreate(role="parent", capabilities=["tool:read_metrics"]),
+        ),
+    )
+    request = _spawn_request("recovery-expired-parent-operation")
+    await service.create_spawn(parent.node_id, parent.node_token, request)
+
+    with session_factory() as session, session.begin():
+        node = session.get(Node, parent.node_id)
+        assert node is not None
+        node.lease_expires_at = utcnow() - timedelta(seconds=1)
+
+    with pytest.raises(ConflictError) as captured:
+        await service.create_spawn(parent.node_id, parent.node_token, request)
+    assert captured.value.code == "LEASE_EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_spawn_recovery_rejects_cancelled_parent_scope(session_factory):
+    run = await create_seeded_run(session_factory, "recovery-cancelled-parent")
+    service = SpawnService(session_factory)
+    controls = ControlService(session_factory)
+    parent = await activate(
+        service,
+        await service.create_spawn(
+            run.root_node_id,
+            run.root_token,
+            SpawnCreate(role="parent", capabilities=["tool:read_metrics"]),
+        ),
+    )
+    request = _spawn_request("recovery-cancelled-parent-operation")
+    await service.create_spawn(parent.node_id, parent.node_token, request)
+
+    await controls.issue_command(
+        CommandCreate(
+            idempotency_key="recovery-cancelled-parent-command",
+            command_type=CommandType.CANCEL_SUBTREE,
+            target_node_id=parent.node_id,
+            reason_code="TEST_CANCEL",
+            reason_text="Revoke parent recovery authority",
+        ),
+        Principal(issuer_type=IssuerType.HUMAN),
+    )
+
+    with pytest.raises(ConflictError) as captured:
+        await service.create_spawn(parent.node_id, parent.node_token, request)
+    assert captured.value.code == "SCOPE_CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_spawn_recovery_rejects_superseded_parent_scope(session_factory):
+    run = await create_seeded_run(session_factory, "recovery-superseded-parent")
+    service = SpawnService(session_factory)
+    controls = ControlService(session_factory)
+    parent = await activate(
+        service,
+        await service.create_spawn(
+            run.root_node_id,
+            run.root_token,
+            SpawnCreate(role="parent", capabilities=["tool:read_metrics"]),
+        ),
+    )
+    request = _spawn_request("recovery-superseded-parent-operation")
+    await service.create_spawn(parent.node_id, parent.node_token, request)
+
+    await controls.issue_command(
+        CommandCreate(
+            idempotency_key="recovery-superseded-parent-command",
+            command_type=CommandType.CORRECT_SUBTREE,
+            target_node_id=parent.node_id,
+            reason_code="TEST_SUPERSEDE",
+            reason_text="Revoke parent recovery authority",
+            replacement_instruction={"task": "replacement"},
+        ),
+        Principal(issuer_type=IssuerType.HUMAN),
+    )
+
+    with pytest.raises(ConflictError) as captured:
+        await service.create_spawn(parent.node_id, parent.node_token, request)
+    assert captured.value.code == "SCOPE_SUPERSEDED"
+
+
+@pytest.mark.asyncio
+async def test_activation_recovery_rejects_cancelled_subject_scope(session_factory):
+    run = await create_seeded_run(session_factory, "recovery-cancelled-activation")
+    service = SpawnService(session_factory)
+    controls = ControlService(session_factory)
+    created = await service.create_spawn(
+        run.root_node_id,
+        run.root_token,
+        _spawn_request("recovery-cancelled-activation-spawn"),
+    )
+    request = NodeActivate(
+        operation_key="recovery-cancelled-activation-operation",
+        activation_token=created.activation_token,
+    )
+    await service.activate(created.child_node_id, request)
+
+    await controls.issue_command(
+        CommandCreate(
+            idempotency_key="recovery-cancelled-activation-command",
+            command_type=CommandType.CANCEL_SUBTREE,
+            target_node_id=created.child_node_id,
+            reason_code="TEST_CANCEL",
+            reason_text="Revoke activation recovery authority",
+        ),
+        Principal(issuer_type=IssuerType.HUMAN),
+    )
+
+    with pytest.raises(ConflictError) as captured:
+        await service.activate(created.child_node_id, request)
+    assert captured.value.code == "SCOPE_CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_activation_recovery_rejects_terminated_run(session_factory):
+    run = await create_seeded_run(session_factory, "recovery-terminated-activation")
+    service = SpawnService(session_factory)
+    controls = ControlService(session_factory)
+    created = await service.create_spawn(
+        run.root_node_id,
+        run.root_token,
+        _spawn_request("recovery-terminated-activation-spawn"),
+    )
+    request = NodeActivate(
+        operation_key="recovery-terminated-activation-operation",
+        activation_token=created.activation_token,
+    )
+    await service.activate(created.child_node_id, request)
+
+    await controls.issue_command(
+        CommandCreate(
+            idempotency_key="recovery-terminated-activation-command",
+            command_type=CommandType.CANCEL_RUN,
+            target_node_id=run.root_node_id,
+            reason_code="TEST_CANCEL",
+            reason_text="Terminate activation recovery authority",
+        ),
+        Principal(issuer_type=IssuerType.HUMAN),
+    )
+
+    with pytest.raises(ConflictError) as captured:
+        await service.activate(created.child_node_id, request)
+    assert captured.value.code == "RUN_NOT_ACTIVE"

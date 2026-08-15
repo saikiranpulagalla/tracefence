@@ -85,9 +85,10 @@ class SpawnService:
                             request_digest=request_digest,
                         )
                         if envelope is not None:
-                            created = self._recover_spawn_response(
+                            created = await self._recover_spawn_response(
                                 session,
                                 envelope,
+                                parent,
                             )
                             recovered = True
                     if not recovered:
@@ -167,6 +168,20 @@ class SpawnService:
                         request_digest=request_digest,
                     )
                     if envelope is not None:
+                        self._validate_recovery_envelope(
+                            envelope,
+                            operation_type="ACTIVATION",
+                            caller=node,
+                            subject=node,
+                        )
+                        allowed, reason, _ = await validate_node_runtime_state(
+                            session, node
+                        )
+                        if not allowed:
+                            raise ConflictError(
+                                f"Activation credential is no longer recoverable: {reason}",
+                                code=reason or "ACTIVATION_RECOVERY_DENIED",
+                            )
                         if envelope.expires_at > now:
                             recovered = open_envelope(envelope, NodeActivated)
                             session.commit()
@@ -623,9 +638,10 @@ class SpawnService:
                                     "Recovered replacement does not match the command",
                                     code="CREDENTIAL_RECOVERY_SUBJECT_MISMATCH",
                                 )
-                            created = self._recover_spawn_response(
+                            created = await self._recover_spawn_response(
                                 session,
                                 envelope,
+                                parent,
                             )
                             recovered = True
                     if not recovered:
@@ -792,10 +808,36 @@ class SpawnService:
         return created
 
     @staticmethod
-    def _recover_spawn_response(
+    def _validate_recovery_envelope(
+        envelope: CredentialRecoveryEnvelope,
+        *,
+        operation_type: str,
+        caller: Node,
+        subject: Node,
+    ) -> None:
+        if (
+            envelope.operation_type != operation_type
+            or envelope.run_id != caller.run_id
+            or envelope.caller_node_id != caller.id
+            or envelope.subject_node_id != subject.id
+        ):
+            raise ConflictError(
+                "Credential recovery envelope does not match the operation subject",
+                code="CREDENTIAL_RECOVERY_SUBJECT_MISMATCH",
+            )
+
+    @staticmethod
+    async def _recover_spawn_response(
         session: Session,
         envelope: CredentialRecoveryEnvelope,
+        parent: Node,
     ) -> SpawnCreated:
+        allowed, reason, _ = await validate_node_runtime_state(session, parent)
+        if not allowed:
+            raise ConflictError(
+                f"Spawn credential is no longer recoverable: {reason}",
+                code=reason or "SPAWN_RECOVERY_DENIED",
+            )
         now = utcnow()
         node = session.get(Node, envelope.subject_node_id)
         intent = session.execute(
@@ -807,6 +849,12 @@ class SpawnService:
             node is None
             or intent is None
             or node.status != NodeStatus.PENDING
+            or envelope.run_id != parent.run_id
+            or envelope.caller_node_id != parent.id
+            or node.run_id != parent.run_id
+            or node.parent_id != parent.id
+            or intent.run_id != parent.run_id
+            or intent.parent_node_id != parent.id
             or intent.consumed_at is not None
             or intent.expires_at <= now
         ):
