@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import timedelta
 
 import pytest
@@ -160,6 +161,10 @@ async def test_repeated_mutation_returns_bounded_fail_closed_result(session_fact
 async def test_nearest_lease_expiry_bounds_cached_proof(
     session_factory, monkeypatch
 ):
+    clock = {"now": utcnow(), "monotonic": 100.0}
+    monkeypatch.setattr(proof_module, "utcnow", lambda: clock["now"])
+    monkeypatch.setattr(proof_module.time, "monotonic", lambda: clock["monotonic"])
+
     run, _old, command, _replacement, _action = await _corrected_recovery(
         session_factory, key="proof-lease-boundary"
     )
@@ -171,7 +176,7 @@ async def test_nearest_lease_expiry_bounds_cached_proof(
             )
         )
         assert root is not None
-        root.lease_expires_at = utcnow() + timedelta(milliseconds=500)
+        root.lease_expires_at = clock["now"] + timedelta(milliseconds=500)
 
     watermark = ExportWatermark(
         service_name="tracefence-control-plane",
@@ -194,7 +199,8 @@ async def test_nearest_lease_expiry_bounds_cached_proof(
     proofs = ProofService(session_factory, mcp_client=mcp)
 
     await proofs.build(command.command_id)
-    await asyncio.sleep(0.6)
+    clock["now"] += timedelta(milliseconds=600)
+    clock["monotonic"] += 0.6
     await proofs.build(command.command_id)
 
     assert mcp.calls == 2
@@ -285,6 +291,125 @@ async def test_cancelling_follower_does_not_cancel_owner_or_shared_cache(
     assert owner_result.overall_verdict == ProofVerdict.VERIFIED
     assert cached_result == owner_result
     assert mcp.calls == 1
+
+
+async def test_cache_hit_rebuilds_when_revision_changes_after_context_snapshot(
+    session_factory,
+    monkeypatch,
+):
+    run, _old, command, _replacement, _action = await _corrected_recovery(
+        session_factory, key="proof-cache-hit-revision-race"
+    )
+    watermark = ExportWatermark(
+        service_name="tracefence-control-plane",
+        service_instance_id="service-a",
+        process_instance_id="process-a",
+        build_commit="build-a",
+        schema_version=1,
+        run_id=run.run_id,
+        command_id=command.command_id,
+        exported_at_ms=1_005_000,
+        sequence=1,
+    )
+    monkeypatch.setattr(proof_module, "force_flush_telemetry", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        proof_module,
+        "telemetry_export_context",
+        lambda _run_id, _command_id: watermark,
+    )
+    mcp = _CountingVerifiedMCPClient()
+    proofs = ProofService(session_factory, mcp_client=mcp)
+
+    first = await proofs.build(command.command_id)
+    assert first.overall_verdict == ProofVerdict.VERIFIED
+    assert mcp.calls == 1
+
+    original_context = proofs._current_context
+    snapshot_taken = threading.Event()
+    mutation_complete = threading.Event()
+    arm_pause = threading.Event()
+    mutation_errors: list[BaseException] = []
+
+    def paused_context(command_id: str):
+        context = original_context(command_id)
+        if arm_pause.is_set():
+            snapshot_taken.set()
+            assert mutation_complete.wait(timeout=1)
+        return context
+
+    def mutate_after_snapshot() -> None:
+        assert snapshot_taken.wait(timeout=1)
+        try:
+            with session_factory() as session, session.begin():
+                state = session.get(ServiceState, (run.run_id, "redis"))
+                assert state is not None
+                state.status = "connection_pool_exhausted"
+                state.updated_at = utcnow()
+        except BaseException as exc:
+            mutation_errors.append(exc)
+        finally:
+            arm_pause.clear()
+            mutation_complete.set()
+
+    monkeypatch.setattr(proofs, "_current_context", paused_context)
+    arm_pause.set()
+    mutator = threading.Thread(target=mutate_after_snapshot)
+    mutator.start()
+    second = await asyncio.wait_for(proofs.build(command.command_id), timeout=3)
+    mutator.join(timeout=1)
+
+    assert not mutator.is_alive()
+    assert mutation_errors == []
+    assert mcp.calls == 2
+    assert second.overall_verdict != ProofVerdict.VERIFIED
+
+
+async def test_cache_hit_rebuilds_when_command_export_watermark_changes(
+    session_factory,
+    monkeypatch,
+):
+    run, _old, command, _replacement, _action = await _corrected_recovery(
+        session_factory, key="proof-watermark-advance"
+    )
+    watermarks = [
+        ExportWatermark(
+            service_name="tracefence-control-plane",
+            service_instance_id="service-a",
+            process_instance_id="process-a",
+            build_commit="build-a",
+            schema_version=1,
+            run_id=run.run_id,
+            command_id=command.command_id,
+            exported_at_ms=1_005_000,
+            sequence=1,
+        ),
+        ExportWatermark(
+            service_name="tracefence-control-plane",
+            service_instance_id="service-a",
+            process_instance_id="process-a",
+            build_commit="build-a",
+            schema_version=1,
+            run_id=run.run_id,
+            command_id=command.command_id,
+            exported_at_ms=1_006_000,
+            sequence=2,
+        ),
+    ]
+    current = {"watermark": watermarks[0]}
+    monkeypatch.setattr(proof_module, "force_flush_telemetry", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        proof_module,
+        "telemetry_export_context",
+        lambda _run_id, _command_id: current["watermark"],
+    )
+    mcp = _CountingVerifiedMCPClient()
+    proofs = ProofService(session_factory, mcp_client=mcp)
+
+    await proofs.build(command.command_id)
+    current["watermark"] = watermarks[1]
+    await proofs.build(command.command_id)
+
+    assert mcp.calls == 2
 
 
 async def test_overlapping_commands_cache_the_exact_reconciled_export_watermark(
