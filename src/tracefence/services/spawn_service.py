@@ -39,7 +39,7 @@ from tracefence.domain.schemas import (
 from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import generate_token, hash_token, payload_digest, token_matches
 from tracefence.services.common import (
-    authenticate_node,
+    authenticate_execution_principal,
     commands_for_scope_mismatches,
     evaluate_scopes,
     utcnow,
@@ -74,7 +74,7 @@ class SpawnService:
             with self.session_factory() as session:
                 session.execute(text("BEGIN IMMEDIATE"))
                 try:
-                    parent = await authenticate_node(session, parent_node_id, parent_token)
+                    parent = (await authenticate_execution_principal(session, node_id=parent_node_id, credential=parent_token)).node
                     recovered = False
                     if request.operation_key is not None:
                         envelope = find_envelope(
@@ -317,7 +317,7 @@ class SpawnService:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
-                node = await authenticate_node(session, node_id, node_token)
+                node = (await authenticate_execution_principal(session, node_id=node_id, credential=node_token)).node
                 authenticated_rate_limiter.check(
                     "heartbeat",
                     f"{node.run_id}:{node.id}",
@@ -397,8 +397,9 @@ class SpawnService:
     async def checkpoint(
         self, node_id: str, node_token: str, stage: str
     ) -> CheckpointResponse:
-        with self.session_factory() as session, session.begin():
-            node = await authenticate_node(session, node_id, node_token)
+        with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            node = (await authenticate_execution_principal(session, node_id=node_id, credential=node_token)).node
             authenticated_rate_limiter.check(
                 "heartbeat",
                 f"{node.run_id}:{node.id}",
@@ -420,6 +421,7 @@ class SpawnService:
                 logger.info(
                     "checkpoint_allowed node_id=%s stage=%s", node.id, stage
                 )
+                session.commit()
                 return CheckpointResponse(allowed=True, effective_status=NodeStatus.WAITING)
 
             commands = await commands_for_scope_mismatches(
@@ -461,6 +463,7 @@ class SpawnService:
                 reason,
                 command.id if command else None,
             )
+            session.commit()
             return CheckpointResponse(
                 allowed=False,
                 effective_status=effective_status,
@@ -472,7 +475,7 @@ class SpawnService:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
-                node = await authenticate_node(session, node_id, node_token)
+                node = (await authenticate_execution_principal(session, node_id=node_id, credential=node_token)).node
                 authenticated_rate_limiter.check(
                     "heartbeat",
                     f"{node.run_id}:{node.id}",
@@ -613,7 +616,7 @@ class SpawnService:
             with self.session_factory() as session:
                 session.execute(text("BEGIN IMMEDIATE"))
                 try:
-                    parent = await authenticate_node(session, parent_node_id, parent_token)
+                    parent = (await authenticate_execution_principal(session, node_id=parent_node_id, credential=parent_token)).node
                     recovered = False
                     command: ControlCommand | None = None
                     if request.operation_key is not None:

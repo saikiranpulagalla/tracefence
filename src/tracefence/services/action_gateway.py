@@ -23,11 +23,11 @@ from tracefence.domain.enums import AckType, ActionDecision
 from tracefence.domain.errors import ConflictError
 from tracefence.domain.schemas import ActionExecute, ActionResult, ReplacementManifest
 from tracefence.rate_limits import authenticated_rate_limiter
-from tracefence.security import payload_digest, token_matches
+from tracefence.security import payload_digest
 from tracefence.services.common import (
+    authenticate_execution_principal,
     commands_for_scope_mismatches,
     evaluate_scopes,
-    get_node,
     get_run,
     utcnow,
 )
@@ -60,11 +60,11 @@ class ActionGateway:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
-                node = await get_node(session, node_id)
-                if not token_matches(node_token, node.token_hash):
-                    from tracefence.domain.errors import AuthenticationError
-
-                    raise AuthenticationError("Invalid node token")
+                node = (
+                    await authenticate_execution_principal(
+                        session, node_id=node_id, credential=node_token
+                    )
+                ).node
 
                 existing = session.execute(
                     select(ActionAttempt).where(

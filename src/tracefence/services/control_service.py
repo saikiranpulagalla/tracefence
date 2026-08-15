@@ -31,7 +31,7 @@ from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import payload_digest
 from tracefence.services.authority_service import AuthorityService
 from tracefence.services.common import (
-    authenticate_node,
+    authenticate_execution_principal,
     get_node,
     get_run,
     is_descendant,
@@ -73,7 +73,7 @@ class ControlService:
                 if principal.issuer_type == IssuerType.AGENT:
                     if principal.node_id is None or node_token is None:
                         raise AuthorizationError("Agent principal requires a node token")
-                    issuer_node = await authenticate_node(session, principal.node_id, node_token)
+                    issuer_node = (await authenticate_execution_principal(session, node_id=principal.node_id, credential=node_token)).node
                     issuer_fingerprint = f"agent:{issuer_node.id}"
                 else:
                     issuer_fingerprint = principal.principal_id or "human:operator"

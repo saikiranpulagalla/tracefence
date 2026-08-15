@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from tracefence.db.models import ControlCommand, ControlScope, Node, Run
+from tracefence.db.models import ControlCommand, ControlScope, Node, Run, WorkerInstance
 from tracefence.domain.enums import NodeStatus, RunStatus, ScopeStatus
 from tracefence.domain.errors import AuthenticationError, NotFoundError
 from tracefence.security import token_matches
@@ -58,12 +58,60 @@ async def get_node(session: Session, node_id: str) -> Node:
     return node
 
 
+@dataclass(frozen=True, slots=True)
+class AuthenticatedExecutionPrincipal:
+    """The current execution authority authenticated in the caller's transaction."""
+
+    node: Node
+    run: Run
+    protocol_version: int
+    worker_instance: WorkerInstance | None
+
 async def authenticate_node(session: Session, node_id: str, token: str) -> Node:
     node = await get_node(session, node_id)
     if not token_matches(token, node.token_hash):
         raise AuthenticationError("Invalid node token")
     return node
 
+
+async def authenticate_execution_principal(
+    session: Session,
+    *,
+    node_id: str,
+    credential: str,
+    confirm_credential: bool = True,
+) -> AuthenticatedExecutionPrincipal:
+    """Authenticate an execution credential without changing caller transaction scope."""
+    node = await get_node(session, node_id)
+    run = await get_run(session, node.run_id)
+    protocol_version = run.execution_protocol_version
+    worker_instance: WorkerInstance | None = None
+
+    if protocol_version == 1:
+        if not token_matches(credential, node.token_hash):
+            raise AuthenticationError("Invalid node token")
+    elif protocol_version == 2:
+        if node.current_worker_instance_id is None:
+            raise AuthenticationError("Invalid node token")
+        worker_instance = session.get(WorkerInstance, node.current_worker_instance_id)
+        if (
+            worker_instance is None
+            or worker_instance.node_id != node.id
+            or worker_instance.observed_state != "ACTIVE"
+            or not token_matches(credential, worker_instance.credential_hash)
+        ):
+            raise AuthenticationError("Invalid node token")
+        if confirm_credential and worker_instance.credential_confirmed_at is None:
+            worker_instance.credential_confirmed_at = utcnow()
+    else:
+        raise AuthenticationError("Invalid node token")
+
+    return AuthenticatedExecutionPrincipal(
+        node=node,
+        run=run,
+        protocol_version=protocol_version,
+        worker_instance=worker_instance,
+    )
 
 async def evaluate_scopes(session: Session, node: Node) -> ScopeEvaluation:
     snapshot = list(node.scope_snapshot_json or [])

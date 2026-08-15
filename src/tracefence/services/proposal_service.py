@@ -14,7 +14,7 @@ from tracefence.domain.schemas import ProposalCreate, ProposalReview
 from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import payload_digest
 from tracefence.services.common import (
-    authenticate_node,
+    authenticate_execution_principal,
     get_node,
     get_run,
     utcnow,
@@ -44,7 +44,7 @@ class ProposalService:
     ) -> CorrectionProposal:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
-            reporter = await authenticate_node(session, reporter_node_id, reporter_token)
+            reporter = (await authenticate_execution_principal(session, node_id=reporter_node_id, credential=reporter_token)).node
             authenticated_rate_limiter.check(
                 "command",
                 f"{reporter.run_id}:{reporter.id}",
