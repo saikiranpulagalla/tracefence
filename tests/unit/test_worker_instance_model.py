@@ -13,6 +13,7 @@ from tracefence.db.engine import ALEMBIC_HEAD, SCHEMA_VERSION, build_engine, ini
 from tracefence.db.models import Node, Run, SpawnIntent, WorkerInstance
 from tracefence.domain.errors import ConflictError, NotFoundError
 from tracefence.domain.schemas import SpawnCreate
+from tracefence.services.runtime_stop_service import RuntimeStopService
 from tracefence.services.spawn_service import SpawnService
 from tracefence.services.worker_instance_service import WorkerInstanceService
 
@@ -146,11 +147,12 @@ async def test_worker_instance_transitions_are_physical_and_terminal_states_do_n
         "ACTIVE",
         observed_at=datetime(2026, 1, 2),
     )
-    exited = await service.transition_observed_state(
-        instance.id,
-        "EXITED",
-        observed_at=datetime(2026, 1, 3),
+    assert await RuntimeStopService(session_factory).record_trusted_terminal(
+        worker_instance_id=instance.id,
+        terminal_state="EXITED",
+        now=datetime(2026, 1, 3),
     )
+    exited = await service.get_instance(instance.id)
 
     assert active.activated_at == datetime(2026, 1, 2)
     assert exited.terminal_at == datetime(2026, 1, 3)
@@ -174,21 +176,23 @@ async def test_worker_instance_allows_both_failed_paths(session_factory):
         incarnation=2,
     )
 
-    failed_before_activation = await service.transition_observed_state(
-        pending_failure.id,
-        "FAILED",
-        observed_at=datetime(2026, 1, 2),
+    assert await RuntimeStopService(session_factory).record_trusted_terminal(
+        worker_instance_id=pending_failure.id,
+        terminal_state="FAILED",
+        now=datetime(2026, 1, 2),
     )
+    failed_before_activation = await service.get_instance(pending_failure.id)
     await service.transition_observed_state(
         active_failure.id,
         "ACTIVE",
         observed_at=datetime(2026, 1, 2),
     )
-    failed_after_activation = await service.transition_observed_state(
-        active_failure.id,
-        "FAILED",
-        observed_at=datetime(2026, 1, 3),
+    assert await RuntimeStopService(session_factory).record_trusted_terminal(
+        worker_instance_id=active_failure.id,
+        terminal_state="FAILED",
+        now=datetime(2026, 1, 3),
     )
+    failed_after_activation = await service.get_instance(active_failure.id)
 
     assert failed_before_activation.activated_at is None
     assert failed_before_activation.terminal_at == datetime(2026, 1, 2)

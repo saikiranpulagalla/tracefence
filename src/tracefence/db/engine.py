@@ -23,6 +23,7 @@ from tracefence.db.models import (
     V21_SCHEMA_INTEGRITY_TRIGGER_DDL,
     V22_PARTIAL_UNIQUE_INDEX_DDL,
     V22_SCHEMA_INTEGRITY_TRIGGER_DDL,
+    V23_SCHEMA_INTEGRITY_TRIGGER_DDL,
     Base,
     SchemaMetadata,
 )
@@ -52,6 +53,7 @@ _ALL_SCHEMA_INTEGRITY_TRIGGER_DDL = {
     **SCHEMA_INTEGRITY_TRIGGER_DDL,
     **V21_SCHEMA_INTEGRITY_TRIGGER_DDL,
     **V22_SCHEMA_INTEGRITY_TRIGGER_DDL,
+    **V23_SCHEMA_INTEGRITY_TRIGGER_DDL,
 }
 _SCHEMA_INTEGRITY_TRIGGER_NAMES = set(_ALL_SCHEMA_INTEGRITY_TRIGGER_DDL)
 
@@ -136,6 +138,15 @@ def _install_v22_schema_integrity_triggers(selected_engine: Engine) -> None:
         for index_ddl in V22_PARTIAL_UNIQUE_INDEX_DDL:
             connection.exec_driver_sql(index_ddl)
         for trigger_ddl in V22_SCHEMA_INTEGRITY_TRIGGER_DDL.values():
+            connection.exec_driver_sql(trigger_ddl)
+
+
+def _install_v23_schema_integrity_triggers(selected_engine: Engine) -> None:
+    if selected_engine.dialect.name != "sqlite":
+        return
+    with selected_engine.begin() as connection:
+        connection.exec_driver_sql("DROP TRIGGER IF EXISTS trg_runtime_stop_targets_historical_selector")
+        for trigger_ddl in V23_SCHEMA_INTEGRITY_TRIGGER_DDL.values():
             connection.exec_driver_sql(trigger_ddl)
 
 
@@ -366,6 +377,10 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
             "ck_runtime_stop_intent_domain_shape",
             "ck_runtime_stop_intent_cause_source_shape",
         },
+        "worker_stop_tasks": {
+            "ck_worker_stop_task_state",
+            "ck_worker_stop_task_attempt_count_nonnegative",
+        },
     }
     for table_name, required_checks in versioned_checks.items():
         expected_checks = {
@@ -454,8 +469,8 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 22
-ALEMBIC_HEAD = "006_schema_v22_runtime_stop_causality"
+SCHEMA_VERSION = 23
+ALEMBIC_HEAD = "007_schema_v23_worker_stop_tasks"
 
 
 def _stamp_alembic_head(selected_engine: Engine) -> None:
@@ -511,6 +526,7 @@ def init_db(target_engine: Engine | None = None) -> None:
             Base.metadata.create_all(selected_engine)
             _install_v21_schema_integrity_triggers(selected_engine)
             _install_v22_schema_integrity_triggers(selected_engine)
+            _install_v23_schema_integrity_triggers(selected_engine)
             _install_proof_revision_triggers(selected_engine)
             with Session(selected_engine) as session:
                 session.add(SchemaMetadata(id=1, version=SCHEMA_VERSION))

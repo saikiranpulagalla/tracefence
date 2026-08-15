@@ -83,10 +83,12 @@ class WorkerInstanceService:
             if instance is None:
                 raise NotFoundError(f"Worker instance {instance_id} was not found")
             self.validate_transition(instance.observed_state, target_state)
+            if target_state != "ACTIVE":
+                raise ConflictError(
+                    "Trusted terminal observation is required for terminal worker state",
+                    code="TRUSTED_TERMINAL_OBSERVATION_REQUIRED",
+                )
             instance.observed_state = target_state
-            if target_state == "ACTIVE":
-                instance.activated_at = now
-            else:
-                instance.terminal_at = now
+            instance.activated_at = now
             session.flush()
         return instance

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import uuid4
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from tracefence.db.models import Run, RuntimeStopIntent, RuntimeStopTarget
+from tracefence.db.models import (
+    Node,
+    Run,
+    RuntimeStopIntent,
+    RuntimeStopTarget,
+    WorkerInstance,
+    WorkerStopTask,
+)
 from tracefence.domain.errors import ConflictError, NotFoundError
 from tracefence.services.common import utcnow
 
@@ -23,6 +31,12 @@ DOMAIN_NODE = "NODE"
 
 @dataclass(frozen=True, slots=True)
 class TargetMaterialization:
+    inserted: int
+    batch_exhausted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TaskMaterialization:
     inserted: int
     batch_exhausted: bool
 
@@ -115,6 +129,10 @@ class RuntimeStopService:
               AND (
                     worker.activated_revision IS NULL
                     OR worker.activated_revision <= :source_revision
+              )
+              AND (
+                    worker.terminal_revision IS NULL
+                    OR worker.terminal_revision > :source_revision
               )
               AND (
                     :target_domain = 'RUN'
@@ -217,6 +235,10 @@ class RuntimeStopService:
                                 OR worker.activated_revision <= intent.source_revision
                           )
                           AND (
+                                worker.terminal_revision IS NULL
+                                OR worker.terminal_revision > intent.source_revision
+                          )
+                          AND (
                                 intent.target_domain = 'RUN'
                                 OR (
                                     intent.target_domain = 'SCOPE'
@@ -246,3 +268,122 @@ class RuntimeStopService:
                 {"limit": limit},
             )
             return [str(intent_id) for intent_id in rows.scalars()]
+
+
+    async def materialize_tasks(self, *, batch_size: int, now: datetime | None = None) -> TaskMaterialization:
+        """Create one bounded, immutable-identity task per targeted WorkerInstance."""
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        observed_at = now or utcnow()
+        with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            try:
+                worker_ids = list(
+                    session.execute(
+                        text(
+                            """
+                            SELECT DISTINCT target.worker_instance_id
+                            FROM runtime_stop_targets AS target
+                            LEFT JOIN worker_stop_tasks AS task
+                              ON task.worker_instance_id = target.worker_instance_id
+                            WHERE task.id IS NULL
+                            ORDER BY target.worker_instance_id
+                            LIMIT :batch_size
+                            """
+                        ),
+                        {"batch_size": batch_size},
+                    ).scalars()
+                )
+                for worker_id in worker_ids:
+                    worker = session.get(WorkerInstance, str(worker_id))
+                    if worker is None:
+                        raise NotFoundError(f"Worker instance {worker_id} was not found")
+                    session.add(
+                        WorkerStopTask(
+                            id=str(uuid4()),
+                            worker_instance_id=worker.id,
+                            state="CONVERGED" if worker.terminal_revision is not None else "PENDING",
+                            attempt_count=0,
+                            next_attempt_at=observed_at,
+                            last_attempt_at=None,
+                            last_error_code=None,
+                            last_error_at=None,
+                            created_at=observed_at,
+                            updated_at=observed_at,
+                        )
+                    )
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+        return TaskMaterialization(
+            inserted=len(worker_ids),
+            batch_exhausted=len(worker_ids) == batch_size,
+        )
+
+    async def record_trusted_terminal(
+        self,
+        *,
+        worker_instance_id: str,
+        terminal_state: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Stamp one trusted physical terminal observation in Run revision order."""
+
+        if terminal_state not in {"EXITED", "FAILED"}:
+            raise ValueError("terminal_state must be EXITED or FAILED")
+        observed_at = now or utcnow()
+        with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            try:
+                worker = session.get(WorkerInstance, worker_instance_id)
+                if worker is None:
+                    raise NotFoundError(f"Worker instance {worker_instance_id} was not found")
+                if worker.terminal_revision is not None:
+                    session.commit()
+                    return False
+                node = session.get(Node, worker.node_id)
+                if node is None:
+                    raise NotFoundError(f"Node {worker.node_id} was not found")
+                run = session.get(Run, node.run_id)
+                if run is None:
+                    raise NotFoundError(f"Run {node.run_id} was not found")
+                if worker.observed_state in {"EXITED", "FAILED"}:
+                    final_state = worker.observed_state
+                elif worker.observed_state == "ACTIVE":
+                    final_state = terminal_state
+                    worker.observed_state = final_state
+                    worker.terminal_at = observed_at
+                elif worker.observed_state == "PENDING":
+                    final_state = "FAILED"
+                    worker.observed_state = final_state
+                    worker.terminal_at = observed_at
+                else:
+                    raise ConflictError(
+                        "Worker instance cannot accept trusted terminal observation",
+                        code="WORKER_TERMINAL_STATE_INVALID",
+                    )
+                session.flush()
+                run.proof_revision += 1
+                session.flush()
+                session.refresh(run, attribute_names=["proof_revision"])
+                worker.terminal_revision = run.proof_revision
+                task = session.scalar(
+                    select(WorkerStopTask).where(
+                        WorkerStopTask.worker_instance_id == worker.id
+                    )
+                )
+                if task is not None and task.state != "CONVERGED":
+                    if task.state == "PENDING":
+                        task.state = "STOP_REQUESTED"
+                        session.flush()
+                    task.state = "CONVERGED"
+                    task.last_error_code = None
+                    task.last_error_at = None
+                    task.updated_at = observed_at
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+        return True
