@@ -18,6 +18,7 @@ from tracefence.db.models import (
     Node,
     Run,
     SpawnIntent,
+    WorkerInstance,
 )
 from tracefence.domain.enums import (
     AckType,
@@ -50,6 +51,7 @@ from tracefence.services.credential_recovery import (
     open_envelope,
     recovery_request_digest,
     seal_envelope,
+    v2_activation_request_digest,
 )
 from tracefence.services.run_lifecycle import transition_run
 from tracefence.services.runtime_events import record_runtime_event
@@ -159,6 +161,26 @@ class SpawnService:
                     raise ConflictError(
                         "Invalid activation token", code="INVALID_ACTIVATION_TOKEN"
                     )
+                run = session.get(Run, node.run_id)
+                if run is None:
+                    raise NotFoundError(f"Run {node.run_id} was not found")
+                if run.execution_protocol_version == 2:
+                    activated = await self._activate_v2_locked(
+                        session,
+                        node=node,
+                        run=run,
+                        intent=intent,
+                        request=request,
+                        now=now,
+                        lease_expires_at=lease_expires_at,
+                    )
+                    session.commit()
+                    logger.info("node_activated node_id=%s", node_id)
+                    with telemetry.tracer.start_as_current_span(
+                        "tracefence.node.activate"
+                    ) as span:
+                        span.set_attribute("tracefence.node.id", node_id)
+                    return activated
                 if request.operation_key is not None:
                     envelope = find_envelope(
                         session,
@@ -309,6 +331,227 @@ class SpawnService:
         with telemetry.tracer.start_as_current_span("tracefence.node.activate") as span:
             span.set_attribute("tracefence.node.id", node_id)
         return activated
+
+    async def _activate_v2_locked(
+        self,
+        session: Session,
+        *,
+        node: Node,
+        run: Run,
+        intent: SpawnIntent,
+        request: NodeActivate,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> NodeActivated:
+        """Activate or recover the first WorkerInstance for one SpawnIntent."""
+
+        if (
+            intent.run_id != run.id
+            or intent.child_node_id != node.id
+            or run.status != RunStatus.RUNNING
+        ):
+            raise ConflictError(
+                "Protocol-v2 activation is no longer valid",
+                code="ACTIVATION_RECOVERY_DENIED",
+            )
+        worker = session.execute(
+            select(WorkerInstance).where(WorkerInstance.activation_intent_id == intent.id)
+        ).scalar_one_or_none()
+        request_digest = v2_activation_request_digest(request)
+        recovery_operation_key = f"v2-activation:{intent.id}"
+        if worker is not None:
+            return await self._recover_v2_activation_locked(
+                session,
+                node=node,
+                run=run,
+                intent=intent,
+                worker=worker,
+                request_digest=request_digest,
+                operation_key=recovery_operation_key,
+                now=now,
+            )
+
+        if intent.consumed_at is not None:
+            raise ConflictError(
+                "Activation token already used", code="ACTIVATION_TOKEN_USED"
+            )
+        authenticated_rate_limiter.check("activation", f"{node.run_id}:{node.id}")
+        if intent.expires_at <= now:
+            raise ConflictError(
+                "Activation token expired", code="ACTIVATION_TOKEN_EXPIRED"
+            )
+        if node.status != NodeStatus.PENDING or node.token_hash is not None:
+            raise ConflictError("Node is not pending activation", code="NODE_NOT_PENDING")
+
+        evaluation = await evaluate_scopes(session, node)
+        if not evaluation.allowed:
+            raise ConflictError(
+                "Inherited control state is no longer active",
+                code=evaluation.primary_reason or "SCOPE_INVALID",
+            )
+
+        credential = generate_token()
+        worker = WorkerInstance(
+            id=str(uuid4()),
+            node_id=node.id,
+            incarnation=1,
+            observed_state="PENDING",
+            activation_intent_id=intent.id,
+            credential_hash=hash_token(credential),
+            credential_confirmed_at=None,
+            reported_process_id=request.process_id,
+            activated_revision=None,
+            terminal_revision=None,
+        )
+        session.add(worker)
+        session.flush()
+        worker.observed_state = "ACTIVE"
+        worker.activated_at = now
+        node.current_worker_instance_id = worker.id
+        node.status = NodeStatus.ACTIVE
+        node.activated_at = now
+        node.last_heartbeat_at = now
+        node.lease_expires_at = lease_expires_at
+        intent.consumed_at = now
+        if node.caused_by_command_id is not None:
+            command = session.get(ControlCommand, node.caused_by_command_id)
+            if (
+                command is None
+                or command.replacement_node_id != node.id
+                or command.replacement_status != ReplacementStatus.PENDING
+            ):
+                raise ConflictError(
+                    "Replacement activation lifecycle is inconsistent",
+                    code="REPLACEMENT_LIFECYCLE_INVALID",
+                )
+            command.replacement_status = ReplacementStatus.ACTIVE
+        record_runtime_event(
+            session,
+            run_id=node.run_id,
+            event_type="NODE_ACTIVATED",
+            occurred_at=now,
+            node_id=node.id,
+            parent_node_id=node.parent_id,
+            command_id=node.caused_by_command_id,
+            metadata={"role": node.role},
+        )
+        record_runtime_event(
+            session,
+            run_id=node.run_id,
+            event_type="LEASE_GRANTED",
+            occurred_at=now,
+            node_id=node.id,
+            metadata={
+                "lease_expires_at": lease_expires_at.isoformat(timespec="microseconds")
+                + "Z"
+            },
+        )
+        session.flush()
+        session.refresh(run, attribute_names=["proof_revision"])
+        worker.activated_revision = run.proof_revision
+        session.flush()
+        activated = NodeActivated(
+            node_id=node.id,
+            run_id=node.run_id,
+            role=node.role,
+            node_token=credential,
+            lease_expires_at=lease_expires_at,
+        )
+        seal_envelope(
+            session,
+            existing=None,
+            run_id=run.id,
+            operation_type="ACTIVATION",
+            caller_node_id=node.id,
+            subject_node_id=node.id,
+            operation_key=recovery_operation_key,
+            request_digest=request_digest,
+            response=activated,
+            binding_version=2,
+            binding_kind="V2_CHILD_ACTIVATION",
+            subject_worker_instance_id=worker.id,
+            spawn_intent_id=intent.id,
+        )
+        return activated
+
+    async def _recover_v2_activation_locked(
+        self,
+        session: Session,
+        *,
+        node: Node,
+        run: Run,
+        intent: SpawnIntent,
+        worker: WorkerInstance,
+        request_digest: str,
+        operation_key: str,
+        now: datetime,
+    ) -> NodeActivated:
+        envelope = session.execute(
+            select(CredentialRecoveryEnvelope).where(
+                CredentialRecoveryEnvelope.binding_version == 2,
+                CredentialRecoveryEnvelope.binding_kind == "V2_CHILD_ACTIVATION",
+                CredentialRecoveryEnvelope.spawn_intent_id == intent.id,
+            )
+        ).scalar_one_or_none()
+        if (
+            envelope is None
+            or envelope.operation_type != "ACTIVATION"
+            or envelope.run_id != run.id
+            or envelope.caller_node_id != node.id
+            or envelope.subject_node_id != node.id
+            or envelope.subject_worker_instance_id != worker.id
+            or envelope.request_payload_digest != request_digest
+            or envelope.operation_key != operation_key
+            or worker.node_id != node.id
+            or worker.activation_intent_id != intent.id
+            or node.current_worker_instance_id != worker.id
+            or worker.observed_state != "ACTIVE"
+            or worker.credential_hash is None
+        ):
+            raise ConflictError(
+                "Protocol-v2 activation recovery is no longer valid",
+                code="ACTIVATION_RECOVERY_DENIED",
+            )
+        allowed, reason, _ = await validate_node_runtime_state(session, node)
+        if not allowed or node.lease_expires_at is None:
+            raise ConflictError(
+                f"Activation credential is no longer recoverable: {reason}",
+                code=reason or "ACTIVATION_RECOVERY_DENIED",
+            )
+        lease_expires_at = node.lease_expires_at
+        if envelope.expires_at > now:
+            recovered = open_envelope(envelope, NodeActivated)
+            return NodeActivated.model_validate(recovered)
+        if worker.credential_confirmed_at is not None:
+            raise ConflictError(
+                "Confirmed protocol-v2 credentials cannot be recovered",
+                code="CREDENTIAL_RECOVERY_CONFIRMED",
+            )
+        credential = generate_token()
+        worker.credential_hash = hash_token(credential)
+        rotated = NodeActivated(
+            node_id=node.id,
+            run_id=node.run_id,
+            role=node.role,
+            node_token=credential,
+            lease_expires_at=lease_expires_at,
+        )
+        seal_envelope(
+            session,
+            existing=envelope,
+            run_id=run.id,
+            operation_type="ACTIVATION",
+            caller_node_id=node.id,
+            subject_node_id=node.id,
+            operation_key=operation_key,
+            request_digest=request_digest,
+            response=rotated,
+            binding_version=2,
+            binding_kind="V2_CHILD_ACTIVATION",
+            subject_worker_instance_id=worker.id,
+            spawn_intent_id=intent.id,
+        )
+        return rotated
 
     async def heartbeat(self, node_id: str, node_token: str) -> Node:
         now = utcnow()

@@ -7,7 +7,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import sessionmaker
 
 from tracefence.config import settings
-from tracefence.db.models import ControlScope, Node, Run
+from tracefence.db.models import ControlScope, Node, Run, WorkerInstance
 from tracefence.domain.enums import NodeStatus, RunStatus, ScopeStatus
 from tracefence.domain.errors import ConflictError
 from tracefence.domain.schemas import RunCreate, RunCreated
@@ -24,7 +24,11 @@ class RunService:
     def __init__(self, session_factory: sessionmaker) -> None:
         self.session_factory = session_factory
 
-    async def create_run(self, request: RunCreate) -> RunCreated:
+    async def create_run(
+        self, request: RunCreate, *, execution_protocol_version: int = 1
+    ) -> RunCreated:
+        if execution_protocol_version not in {1, 2}:
+            raise ValueError("Unsupported execution protocol version")
         allowed_capabilities = _ALLOWED_NON_TOOL_CAPABILITIES | {
             spec.capability for spec in TOOL_REGISTRY.values()
         }
@@ -52,16 +56,16 @@ class RunService:
                 raise ConflictError(
                     "Active run quota exceeded", code="ACTIVE_RUN_QUOTA_EXCEEDED"
                 )
-            session.add(
-                Run(
-                    id=run_id,
-                    name=request.name,
-                    status=RunStatus.RUNNING,
-                    root_node_id=root_node_id,
-                    run_scope_id=run_scope_id,
-                    created_at=now,
-                )
+            run = Run(
+                id=run_id,
+                name=request.name,
+                status=RunStatus.RUNNING,
+                root_node_id=root_node_id,
+                run_scope_id=run_scope_id,
+                created_at=now,
+                execution_protocol_version=execution_protocol_version,
             )
+            session.add(run)
             session.flush()
             session.add_all(
                 [
@@ -83,33 +87,56 @@ class RunService:
                     ),
                 ]
             )
-            session.add(
-                Node(
-                    id=root_node_id,
-                    run_id=run_id,
-                    parent_id=None,
-                    supersedes_node_id=None,
-                    caused_by_command_id=None,
-                    role=request.root_role,
-                    behavior="cooperative",
-                    generation=0,
-                    lineage_path="/",
-                    status=NodeStatus.ACTIVE,
-                    own_scope_id=root_scope_id,
-                    scope_snapshot_json=[
-                        {"scope_id": run_scope_id, "version": 1},
-                        {"scope_id": root_scope_id, "version": 1},
-                    ],
-                    instruction_version=1,
-                    instruction_json=request.root_instruction,
-                    capabilities_json=sorted(set(request.root_capabilities)),
-                    token_hash=hash_token(root_token),
-                    registered_at=now,
-                    activated_at=now,
-                    last_heartbeat_at=now,
-                    lease_expires_at=now + timedelta(seconds=settings.lease_ttl_seconds),
-                )
+            root_node = Node(
+                id=root_node_id,
+                run_id=run_id,
+                parent_id=None,
+                supersedes_node_id=None,
+                caused_by_command_id=None,
+                role=request.root_role,
+                behavior="cooperative",
+                generation=0,
+                lineage_path="/",
+                status=NodeStatus.ACTIVE,
+                own_scope_id=root_scope_id,
+                scope_snapshot_json=[
+                    {"scope_id": run_scope_id, "version": 1},
+                    {"scope_id": root_scope_id, "version": 1},
+                ],
+                instruction_version=1,
+                instruction_json=request.root_instruction,
+                capabilities_json=sorted(set(request.root_capabilities)),
+                token_hash=(
+                    hash_token(root_token) if execution_protocol_version == 1 else None
+                ),
+                registered_at=now,
+                activated_at=now,
+                last_heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=settings.lease_ttl_seconds),
             )
+            session.add(root_node)
+            root_worker: WorkerInstance | None = None
+            if execution_protocol_version == 2:
+                # The Node must exist before its WorkerInstance, and the instance
+                # must exist before it becomes the Node's current pointer.
+                session.flush()
+                root_worker = WorkerInstance(
+                    id=str(uuid4()),
+                    node_id=root_node_id,
+                    incarnation=1,
+                    observed_state="ACTIVE",
+                    created_at=now,
+                    activated_at=now,
+                    activation_intent_id=None,
+                    credential_hash=hash_token(root_token),
+                    credential_confirmed_at=None,
+                    reported_process_id=None,
+                    activated_revision=None,
+                    terminal_revision=None,
+                )
+                session.add(root_worker)
+                session.flush()
+                root_node.current_worker_instance_id = root_worker.id
             record_runtime_event(
                 session,
                 run_id=run_id,
@@ -149,6 +176,14 @@ class RunService:
                     + "Z"
                 },
             )
+            # Runtime events do not contribute to proof revision, but all
+            # authority-bearing activation state has now been flushed. Stamp the
+            # WorkerInstance with this transaction's final proof revision.
+            session.flush()
+            if root_worker is not None:
+                session.refresh(run, attribute_names=["proof_revision"])
+                root_worker.activated_revision = run.proof_revision
+                session.flush()
             session.commit()
 
         telemetry.runs_total.add(1, {"environment": settings.environment})

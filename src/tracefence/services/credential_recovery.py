@@ -28,6 +28,26 @@ def recovery_request_digest(request: BaseModel, *, context: str = "") -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def v2_activation_request_digest(request: BaseModel) -> str:
+    """Digest v2 activation identity without client retry-only fields.
+
+    A SpawnIntent is the server-owned exactly-once identity for a protocol-v2
+    activation. A caller operation key and reported PID may vary after a lost
+    response, so neither participates in the recovery identity.
+    """
+
+    payload = request.model_dump(
+        mode="json",
+        exclude={"operation_key", "process_id"},
+    )
+    encoded = (
+        request.__class__.__name__.encode()
+        + b"\0v2-child-activation\0"
+        + _canonical_json(payload)
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _canonical_json(payload: object) -> bytes:
     import json
 
@@ -49,14 +69,42 @@ def _aad(
     operation_key: str,
     request_digest: str,
     subject_node_id: str,
+    *,
+    run_id: str | None = None,
+    binding_version: int = 1,
+    binding_kind: str = "V1_NODE",
+    subject_worker_instance_id: str | None = None,
+    spawn_intent_id: str | None = None,
 ) -> bytes:
+    components = (
+        operation_type,
+        caller_node_id,
+        operation_key,
+        request_digest,
+        subject_node_id,
+    )
+    if binding_version == 1:
+        # Preserve the v1 ciphertext contract exactly for existing envelopes.
+        return "\0".join(components).encode()
+    if (
+        binding_version != 2
+        or binding_kind != "V2_CHILD_ACTIVATION"
+        or run_id is None
+        or subject_worker_instance_id is None
+        or spawn_intent_id is None
+    ):
+        raise ConflictError(
+            "Credential recovery envelope has an invalid v2 binding",
+            code="CREDENTIAL_RECOVERY_ENVELOPE_INVALID",
+        )
     return "\0".join(
         (
-            operation_type,
-            caller_node_id,
-            operation_key,
-            request_digest,
-            subject_node_id,
+            "v2-child-activation",
+            run_id,
+            *components,
+            binding_kind,
+            subject_worker_instance_id,
+            spawn_intent_id,
         )
     ).encode()
 
@@ -101,6 +149,11 @@ def open_envelope(
                 envelope.operation_key,
                 envelope.request_payload_digest,
                 envelope.subject_node_id,
+                run_id=envelope.run_id,
+                binding_version=envelope.binding_version,
+                binding_kind=envelope.binding_kind,
+                subject_worker_instance_id=envelope.subject_worker_instance_id,
+                spawn_intent_id=envelope.spawn_intent_id,
             ),
         )
         return response_type.model_validate_json(plaintext)
@@ -122,6 +175,10 @@ def seal_envelope(
     operation_key: str,
     request_digest: str,
     response: BaseModel,
+    binding_version: int = 1,
+    binding_kind: str = "V1_NODE",
+    subject_worker_instance_id: str | None = None,
+    spawn_intent_id: str | None = None,
 ) -> CredentialRecoveryEnvelope:
     import secrets
     from uuid import uuid4
@@ -137,6 +194,11 @@ def seal_envelope(
             operation_key,
             request_digest,
             subject_node_id,
+            run_id=run_id,
+            binding_version=binding_version,
+            binding_kind=binding_kind,
+            subject_worker_instance_id=subject_worker_instance_id,
+            spawn_intent_id=spawn_intent_id,
         ),
     )
     envelope = existing or CredentialRecoveryEnvelope(
@@ -147,12 +209,26 @@ def seal_envelope(
         subject_node_id=subject_node_id,
         operation_key=operation_key,
         request_payload_digest=request_digest,
+        binding_version=binding_version,
+        binding_kind=binding_kind,
+        subject_worker_instance_id=subject_worker_instance_id,
+        spawn_intent_id=spawn_intent_id,
         nonce="",
         ciphertext="",
         expires_at=now,
         created_at=now,
         updated_at=now,
     )
+    if existing is not None and (
+        existing.binding_version != binding_version
+        or existing.binding_kind != binding_kind
+        or existing.subject_worker_instance_id != subject_worker_instance_id
+        or existing.spawn_intent_id != spawn_intent_id
+    ):
+        raise ConflictError(
+            "Credential recovery envelope binding cannot be changed",
+            code="CREDENTIAL_RECOVERY_ENVELOPE_INVALID",
+        )
     envelope.subject_node_id = subject_node_id
     envelope.nonce = base64.urlsafe_b64encode(nonce).decode()
     envelope.ciphertext = base64.urlsafe_b64encode(ciphertext).decode()

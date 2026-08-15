@@ -112,25 +112,39 @@ async def run_worker(
             follow_redirects=False,
         ) as client:
             instrument_httpx_client(client)
-            try:
-                response = await client.post(
-                    f"/v1/nodes/{args.node_id}/activate",
-                    json={
-                        "operation_key": f"worker-activate-{args.node_id}",
-                        "activation_token": startup["activation_token"],
-                        "process_id": os.getpid(),
-                    },
-                )
-            except httpx.HTTPError as exc:
-                lifecycle_span.record_exception(exc)
+            activation_request = {
+                # The same payload is retried after a lost response. Protocol-v2
+                # correctness is bound server-side to the SpawnIntent, not this
+                # compatibility operation key or the diagnostic PID.
+                "operation_key": f"worker-activate-{args.node_id}",
+                "activation_token": startup["activation_token"],
+                "process_id": os.getpid(),
+            }
+            for attempt in range(2):
+                try:
+                    response = await client.post(
+                        f"/v1/nodes/{args.node_id}/activate",
+                        json=activation_request,
+                    )
+                except httpx.HTTPError as exc:
+                    if attempt == 1:
+                        lifecycle_span.record_exception(exc)
+                        return EXIT_INTERNAL_OR_TRANSPORT_FAILURE
+                    lifecycle_span.add_event(
+                        "activation_response_lost",
+                        {"error.type": type(exc).__name__},
+                    )
+                    continue
+                if response.status_code >= 400:
+                    lifecycle_span.add_event(
+                        "activation_rejected",
+                        {"http.status_code": response.status_code},
+                    )
+                    return EXIT_ACTIVATION_REJECTED
+                activation = response.json()
+                break
+            else:  # pragma: no cover - the final transport failure returns above.
                 return EXIT_INTERNAL_OR_TRANSPORT_FAILURE
-            if response.status_code >= 400:
-                lifecycle_span.add_event(
-                    "activation_rejected",
-                    {"http.status_code": response.status_code},
-                )
-                return EXIT_ACTIVATION_REJECTED
-            activation = response.json()
             node_token = activation["node_token"]
             lifecycle_span.set_attribute("tracefence.run.id", activation["run_id"])
             lifecycle_span.set_attribute("tracefence.node.role", activation["role"])
