@@ -13,6 +13,7 @@ from tracefence.db.models import (
     WorkerInstance,
     utcnow,
 )
+from tracefence.security import hash_token
 from tracefence.domain.schemas import SpawnCreate
 from tracefence.services.spawn_service import SpawnService
 
@@ -91,7 +92,22 @@ async def _v2_binding(session_factory):
                 activation_intent_id=intent_id,
             )
         )
-    return run, created.child_node_id, intent_id, worker_id
+        root_credential = "synthetic-v2-root-worker-credential"
+        root_worker = WorkerInstance(
+            id=str(uuid4()),
+            node_id=run.root_node_id,
+            incarnation=1,
+            observed_state="ACTIVE",
+            activated_at=utcnow(),
+            credential_hash=hash_token(root_credential),
+        )
+        session.add(root_worker)
+        session.flush()
+        session.execute(
+            text("UPDATE nodes SET current_worker_instance_id = :worker WHERE id = :node"),
+            {"worker": root_worker.id, "node": run.root_node_id},
+        )
+    return run, created.child_node_id, intent_id, worker_id, root_credential
 
 
 async def test_v21_legacy_defaults_and_v1_shape(session_factory):
@@ -121,7 +137,7 @@ async def test_v21_legacy_defaults_and_v1_shape(session_factory):
 
 @pytest.mark.parametrize("field", ["subject_worker_instance_id", "spawn_intent_id"])
 async def test_v21_rejects_v1_binding_ids(session_factory, field):
-    run, subject_node, intent_id, worker_id = await _v2_binding(session_factory)
+    run, subject_node, intent_id, worker_id, _ = await _v2_binding(session_factory)
     values = {field: worker_id if field == "subject_worker_instance_id" else intent_id}
     with pytest.raises(IntegrityError):
         with session_factory.begin() as session:
@@ -145,7 +161,7 @@ async def test_v21_rejects_v1_binding_ids(session_factory, field):
 async def test_v21_rejects_incomplete_or_non_activation_v2_binding(
     session_factory, overrides
 ):
-    run, subject_node, intent_id, worker_id = await _v2_binding(session_factory)
+    run, subject_node, intent_id, worker_id, _ = await _v2_binding(session_factory)
     with pytest.raises(IntegrityError):
         with session_factory.begin() as session:
             _insert_envelope(
@@ -164,7 +180,7 @@ async def test_v21_rejects_incomplete_or_non_activation_v2_binding(
 
 
 async def test_v21_v2_causality_uniqueness_and_immutability(session_factory):
-    run, subject_node, intent_id, worker_id = await _v2_binding(session_factory)
+    run, subject_node, intent_id, worker_id, _ = await _v2_binding(session_factory)
     envelope_id = str(uuid4())
     with session_factory.begin() as session:
         _insert_envelope(
@@ -226,10 +242,10 @@ async def test_v21_v2_causality_uniqueness_and_immutability(session_factory):
 
 
 async def test_v21_rejects_cross_node_worker_and_spawn_intent(session_factory):
-    run, subject_node, intent_id, _ = await _v2_binding(session_factory)
+    run, subject_node, intent_id, _, root_credential = await _v2_binding(session_factory)
     spawns = SpawnService(session_factory)
     other = await spawns.create_spawn(
-        run.root_node_id, run.root_token, SpawnCreate(role="other-child", capabilities=[])
+        run.root_node_id, root_credential, SpawnCreate(role="other-child", capabilities=[])
     )
     with session_factory() as session:
         other_intent = session.scalar(
