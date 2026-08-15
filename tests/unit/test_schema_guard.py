@@ -682,3 +682,23 @@ async def test_database_rejects_incomplete_allowed_actions_and_invalid_node_shap
                 text("UPDATE runs SET finished_at = CURRENT_TIMESTAMP WHERE id = :id"),
                 {"id": run.run_id},
             )
+
+
+
+def test_schema_guard_rejects_critical_trigger_with_correct_name_wrong_body(tmp_path):
+    engine = build_engine(f"sqlite+pysqlite:///{tmp_path / 'wrong-trigger-body.db'}")
+    init_db(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text("DROP TRIGGER trg_worker_instances_delete_prohibited")
+        )
+        connection.execute(
+            text(
+                "CREATE TRIGGER trg_worker_instances_delete_prohibited "
+                "BEFORE DELETE ON worker_instances BEGIN SELECT 1; END"
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="unexpected definitions"):
+        init_db(engine)
+    engine.dispose()

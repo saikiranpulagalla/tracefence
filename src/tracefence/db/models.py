@@ -67,6 +67,10 @@ class Run(Base):
             "(status IN ('CREATED','RUNNING') AND finished_at IS NULL)",
             name="ck_run_finished_shape",
         ),
+        CheckConstraint(
+            "execution_protocol_version IN (1, 2)",
+            name="ck_run_execution_protocol_version_allowed",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -88,36 +92,6 @@ class Run(Base):
         default=1,
         server_default="1",
     )
-
-
-event.listen(
-    Run.__table__,
-    "after_create",
-    DDL(
-        """
-        CREATE TRIGGER IF NOT EXISTS trg_runs_execution_protocol_version_valid
-        BEFORE INSERT ON runs
-        WHEN NEW.execution_protocol_version NOT IN (1, 2)
-        BEGIN
-            SELECT RAISE(ABORT, 'RUN_EXECUTION_PROTOCOL_VERSION_INVALID');
-        END
-        """
-    ).execute_if(dialect="sqlite"),
-)
-event.listen(
-    Run.__table__,
-    "after_create",
-    DDL(
-        """
-        CREATE TRIGGER IF NOT EXISTS trg_runs_execution_protocol_version_immutable
-        BEFORE UPDATE OF execution_protocol_version ON runs
-        WHEN NEW.execution_protocol_version != OLD.execution_protocol_version
-        BEGIN
-            SELECT RAISE(ABORT, 'RUN_EXECUTION_PROTOCOL_VERSION_IMMUTABLE');
-        END
-        """
-    ).execute_if(dialect="sqlite"),
-)
 
 
 class Node(Base):
@@ -203,46 +177,6 @@ class Node(Base):
     )
 
 
-event.listen(
-    Node.__table__,
-    "after_create",
-    DDL(
-        """
-        CREATE TRIGGER IF NOT EXISTS trg_nodes_current_worker_instance_owned_insert
-        BEFORE INSERT ON nodes
-        WHEN NEW.current_worker_instance_id IS NOT NULL
-         AND NOT EXISTS (
-            SELECT 1 FROM worker_instances
-            WHERE worker_instances.id = NEW.current_worker_instance_id
-              AND worker_instances.node_id = NEW.id
-         )
-        BEGIN
-            SELECT RAISE(ABORT, 'NODE_CURRENT_WORKER_INSTANCE_NODE_MISMATCH');
-        END
-        """
-    ).execute_if(dialect="sqlite"),
-)
-event.listen(
-    Node.__table__,
-    "after_create",
-    DDL(
-        """
-        CREATE TRIGGER IF NOT EXISTS trg_nodes_current_worker_instance_owned_update
-        BEFORE UPDATE OF current_worker_instance_id ON nodes
-        WHEN NEW.current_worker_instance_id IS NOT NULL
-         AND NOT EXISTS (
-            SELECT 1 FROM worker_instances
-            WHERE worker_instances.id = NEW.current_worker_instance_id
-              AND worker_instances.node_id = NEW.id
-         )
-        BEGIN
-            SELECT RAISE(ABORT, 'NODE_CURRENT_WORKER_INSTANCE_NODE_MISMATCH');
-        END
-        """
-    ).execute_if(dialect="sqlite"),
-)
-
-
 class WorkerInstance(Base):
     """One physical execution incarnation for a logical Node.
 
@@ -278,16 +212,16 @@ class WorkerInstance(Base):
             name="uq_worker_instance_activation_intent",
         ),
         CheckConstraint(
-            "created_revision IS NULL OR created_revision >= 0",
-            name="ck_worker_instance_created_revision_nonnegative",
+            "activated_revision IS NULL OR activated_revision >= 0",
+            name="ck_worker_instance_activated_revision_nonnegative",
         ),
         CheckConstraint(
             "terminal_revision IS NULL OR terminal_revision >= 0",
             name="ck_worker_instance_terminal_revision_nonnegative",
         ),
         CheckConstraint(
-            "terminal_revision IS NULL OR created_revision IS NULL "
-            "OR terminal_revision >= created_revision",
+            "terminal_revision IS NULL OR activated_revision IS NULL "
+            "OR terminal_revision > activated_revision",
             name="ck_worker_instance_revision_order",
         ),
         Index("ix_worker_instances_node", "node_id"),
@@ -313,57 +247,146 @@ class WorkerInstance(Base):
         nullable=True,
     )
     reported_process_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    created_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    activated_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     terminal_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
-event.listen(
-    WorkerInstance.__table__,
-    "after_create",
-    DDL(
-        """
-        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_id_immutable
-        BEFORE UPDATE OF id ON worker_instances
-        WHEN NEW.id != OLD.id
+
+SCHEMA_INTEGRITY_TRIGGER_DDL = {
+    "trg_runs_execution_protocol_version_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_runs_execution_protocol_version_immutable
+        BEFORE UPDATE OF execution_protocol_version ON runs
+        WHEN NEW.execution_protocol_version IS NOT OLD.execution_protocol_version
         BEGIN
-            SELECT RAISE(ABORT, 'WORKER_INSTANCE_ID_IMMUTABLE');
+            SELECT RAISE(ABORT, 'RUN_EXECUTION_PROTOCOL_VERSION_IMMUTABLE');
         END
-        """
-    ).execute_if(dialect="sqlite"),
-)
-event.listen(
-    WorkerInstance.__table__,
-    "after_create",
-    DDL(
-        """
-        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_current_pointer_node_guard
-        BEFORE UPDATE OF node_id ON worker_instances
-        WHEN EXISTS (
-            SELECT 1 FROM nodes
-            WHERE nodes.current_worker_instance_id = OLD.id
-              AND nodes.id != NEW.node_id
-        )
+    """,
+    "trg_nodes_current_worker_instance_owned_insert": """
+        CREATE TRIGGER IF NOT EXISTS trg_nodes_current_worker_instance_owned_insert
+        BEFORE INSERT ON nodes
+        WHEN NEW.current_worker_instance_id IS NOT NULL
+         AND NOT EXISTS (
+            SELECT 1 FROM worker_instances
+            WHERE worker_instances.id = NEW.current_worker_instance_id
+              AND worker_instances.node_id = NEW.id
+         )
         BEGIN
             SELECT RAISE(ABORT, 'NODE_CURRENT_WORKER_INSTANCE_NODE_MISMATCH');
         END
-        """
-    ).execute_if(dialect="sqlite"),
-)
-event.listen(
-    WorkerInstance.__table__,
-    "after_create",
-    DDL(
-        """
-        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_current_pointer_clear_on_delete
+    """,
+    "trg_nodes_current_worker_instance_owned_update": """
+        CREATE TRIGGER IF NOT EXISTS trg_nodes_current_worker_instance_owned_update
+        BEFORE UPDATE OF current_worker_instance_id ON nodes
+        WHEN NEW.current_worker_instance_id IS NOT NULL
+         AND NOT EXISTS (
+            SELECT 1 FROM worker_instances
+            WHERE worker_instances.id = NEW.current_worker_instance_id
+              AND worker_instances.node_id = NEW.id
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'NODE_CURRENT_WORKER_INSTANCE_NODE_MISMATCH');
+        END
+    """,
+    "trg_worker_instances_delete_prohibited": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_delete_prohibited
         BEFORE DELETE ON worker_instances
         BEGIN
-            UPDATE nodes
-            SET current_worker_instance_id = NULL
-            WHERE current_worker_instance_id = OLD.id;
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_DELETE_PROHIBITED');
         END
-        """
-    ).execute_if(dialect="sqlite"),
-)
+    """,
+    "trg_worker_instances_id_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_id_immutable
+        BEFORE UPDATE OF id ON worker_instances
+        WHEN NEW.id IS NOT OLD.id
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_ID_IMMUTABLE');
+        END
+    """,
+    "trg_worker_instances_node_id_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_node_id_immutable
+        BEFORE UPDATE OF node_id ON worker_instances
+        WHEN NEW.node_id IS NOT OLD.node_id
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_NODE_ID_IMMUTABLE');
+        END
+    """,
+    "trg_worker_instances_incarnation_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_incarnation_immutable
+        BEFORE UPDATE OF incarnation ON worker_instances
+        WHEN NEW.incarnation IS NOT OLD.incarnation
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_INCARNATION_IMMUTABLE');
+        END
+    """,
+    "trg_worker_instances_activation_intent_id_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_activation_intent_id_immutable
+        BEFORE UPDATE OF activation_intent_id ON worker_instances
+        WHEN NEW.activation_intent_id IS NOT OLD.activation_intent_id
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_ACTIVATION_INTENT_ID_IMMUTABLE');
+        END
+    """,
+    "trg_worker_instances_observed_state_transition": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_observed_state_transition
+        BEFORE UPDATE OF observed_state ON worker_instances
+        WHEN NEW.observed_state IS NOT OLD.observed_state
+         AND NOT (
+            (OLD.observed_state = 'PENDING' AND NEW.observed_state IN ('ACTIVE', 'FAILED'))
+            OR (OLD.observed_state = 'ACTIVE' AND NEW.observed_state IN ('EXITED', 'FAILED'))
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_STATE_TRANSITION_INVALID');
+        END
+    """,
+    "trg_worker_instances_activated_at_once_set": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_activated_at_once_set
+        BEFORE UPDATE OF activated_at ON worker_instances
+        WHEN OLD.activated_at IS NOT NULL AND NEW.activated_at IS NOT OLD.activated_at
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_ACTIVATED_AT_IMMUTABLE');
+        END
+    """,
+    "trg_worker_instances_terminal_at_once_set": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_terminal_at_once_set
+        BEFORE UPDATE OF terminal_at ON worker_instances
+        WHEN OLD.terminal_at IS NOT NULL AND NEW.terminal_at IS NOT OLD.terminal_at
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_TERMINAL_AT_IMMUTABLE');
+        END
+    """,
+    "trg_worker_instances_activated_revision_once_set": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_activated_revision_once_set
+        BEFORE UPDATE OF activated_revision ON worker_instances
+        WHEN OLD.activated_revision IS NOT NULL AND NEW.activated_revision IS NOT OLD.activated_revision
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_ACTIVATED_REVISION_IMMUTABLE');
+        END
+    """,
+    "trg_worker_instances_terminal_revision_once_set": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_terminal_revision_once_set
+        BEFORE UPDATE OF terminal_revision ON worker_instances
+        WHEN OLD.terminal_revision IS NOT NULL AND NEW.terminal_revision IS NOT OLD.terminal_revision
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_TERMINAL_REVISION_IMMUTABLE');
+        END
+    """,
+    "trg_worker_instances_credential_confirmed_at_once_set": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_credential_confirmed_at_once_set
+        BEFORE UPDATE OF credential_confirmed_at ON worker_instances
+        WHEN OLD.credential_confirmed_at IS NOT NULL AND NEW.credential_confirmed_at IS NOT OLD.credential_confirmed_at
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_CREDENTIAL_CONFIRMED_AT_IMMUTABLE');
+        END
+    """,
+}
+
+
+for _trigger_ddl in SCHEMA_INTEGRITY_TRIGGER_DDL.values():
+    event.listen(
+        WorkerInstance.__table__,
+        "after_create",
+        DDL(_trigger_ddl).execute_if(dialect="sqlite"),
+    )
 
 
 class ControlScope(Base):

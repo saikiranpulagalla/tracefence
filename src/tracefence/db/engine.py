@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from string import Template
 
@@ -17,7 +18,11 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from tracefence.config import settings
-from tracefence.db.models import Base, SchemaMetadata
+from tracefence.db.models import (
+    SCHEMA_INTEGRITY_TRIGGER_DDL,
+    Base,
+    SchemaMetadata,
+)
 
 # SQLite triggers make the proof revision a database-owned consistency
 # boundary. Service code cannot accidentally omit a bump when it mutates an
@@ -40,15 +45,8 @@ _RUNTIME_EVENT_TRIGGER_NAMES = {
     "trg_runtime_events_no_update",
     "trg_runtime_events_no_delete",
 }
-_SCHEMA_INTEGRITY_TRIGGER_NAMES = {
-    "trg_runs_execution_protocol_version_valid",
-    "trg_runs_execution_protocol_version_immutable",
-    "trg_nodes_current_worker_instance_owned_insert",
-    "trg_nodes_current_worker_instance_owned_update",
-    "trg_worker_instances_id_immutable",
-    "trg_worker_instances_current_pointer_node_guard",
-    "trg_worker_instances_current_pointer_clear_on_delete",
-}
+_SCHEMA_INTEGRITY_TRIGGER_NAMES = set(SCHEMA_INTEGRITY_TRIGGER_DDL)
+
 
 _PROOF_REVISION_TRIGGER_DDL = Template(
     """
@@ -102,25 +100,46 @@ def _install_proof_revision_triggers(selected_engine: Engine) -> None:
         )
 
 
+def _normalize_sql(sql: str) -> str:
+    normalized = re.sub(r"\bif\s+not\s+exists\b", "", sql, flags=re.IGNORECASE)
+    return " ".join(
+        re.findall(
+            r"[a-z_][a-z0-9_]*|'[^']*'|\d+|!=|==|>=|<=|<>|[(),.=]",
+            normalized.lower(),
+        )
+    )
+
+
 def _validate_required_triggers(selected_engine: Engine) -> None:
     if selected_engine.dialect.name != "sqlite":
         return
     with selected_engine.connect() as connection:
-        actual = set(
-            connection.exec_driver_sql(
-                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
-            ).scalars()
-        )
+        actual = {
+            str(name): str(sql)
+            for name, sql in connection.exec_driver_sql(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
     required = (
         _proof_revision_trigger_names()
         | _RUNTIME_EVENT_TRIGGER_NAMES
         | _SCHEMA_INTEGRITY_TRIGGER_NAMES
     )
-    missing = sorted(required - actual)
+    missing = sorted(required - actual.keys())
     if missing:
         raise RuntimeError(
             "SCHEMA_MIGRATION_REQUIRED: required database triggers are missing: "
             + ", ".join(missing)
+        )
+    malformed = sorted(
+        name
+        for name, expected in SCHEMA_INTEGRITY_TRIGGER_DDL.items()
+        if _normalize_sql(actual[name]) != _normalize_sql(expected)
+    )
+    if malformed:
+        raise RuntimeError(
+            "SCHEMA_MIGRATION_REQUIRED: required database triggers have unexpected "
+            "definitions: " + ", ".join(malformed)
         )
 
 
@@ -290,6 +309,45 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
             constraint_mismatches.append(
                 f"{table_name}(index {missing_ix!r})"
             )
+    v20_checks = {
+        "runs": {"ck_run_execution_protocol_version_allowed"},
+        "worker_instances": {
+            "ck_worker_instance_activated_revision_nonnegative",
+            "ck_worker_instance_terminal_revision_nonnegative",
+            "ck_worker_instance_revision_order",
+        },
+    }
+    for table_name, required_checks in v20_checks.items():
+        expected_checks = {
+            str(constraint.name): _normalize_sql(str(constraint.sqltext))
+            for constraint in Base.metadata.tables[table_name].constraints
+            if isinstance(constraint, CheckConstraint)
+            and str(constraint.name) in required_checks
+        }
+        actual_checks = {
+            str(item.get("name")): _normalize_sql(str(item.get("sqltext") or ""))
+            for item in inspector.get_check_constraints(table_name)
+            if item.get("name") in required_checks
+        }
+        wrong_checks = sorted(
+            name
+            for name, expected in expected_checks.items()
+            if actual_checks.get(name) != expected
+        )
+        if wrong_checks:
+            constraint_mismatches.append(
+                f"{table_name}(check definition {wrong_checks!r})"
+            )
+
+    protocol_column = next(
+        column
+        for column in inspector.get_columns("runs")
+        if column["name"] == "execution_protocol_version"
+    )
+    protocol_default = str(protocol_column.get("default") or "").strip("'\"() ")
+    if protocol_default != "1":
+        constraint_mismatches.append("runs(execution_protocol_version default 1)")
+
     if constraint_mismatches:
         raise RuntimeError(
             "SCHEMA_MIGRATION_REQUIRED: schema version is current but constraints or "

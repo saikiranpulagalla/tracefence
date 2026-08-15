@@ -350,7 +350,7 @@ async def test_current_behavior_creates_protocol_one_runs(session_factory):
 
 
 async def test_execution_protocol_version_rejects_invalid_value(session_factory):
-    with pytest.raises(DatabaseError, match="RUN_EXECUTION_PROTOCOL_VERSION_INVALID"):
+    with pytest.raises(IntegrityError, match="CHECK constraint failed"):
         with session_factory.begin() as session:
             session.execute(
                 text(
@@ -532,17 +532,17 @@ async def test_worker_instance_v2_storage_and_historical_revisions_are_nullable(
         assert instance is not None
         assert instance.credential_hash is None
         assert instance.credential_confirmed_at is None
-        assert instance.created_revision is None
+        assert instance.activated_revision is None
         assert instance.terminal_revision is None
 
 
 @pytest.mark.parametrize(
-    ("created_revision", "terminal_revision"),
-    [(-1, None), (None, -1), (4, 3)],
+    ("activated_revision", "terminal_revision"),
+    [(-1, None), (None, -1), (4, 4)],
 )
 async def test_worker_instance_rejects_invalid_revision_order(
     session_factory,
-    created_revision,
+    activated_revision,
     terminal_revision,
 ):
     run = await create_seeded_run(session_factory, "worker-revision-constraints")
@@ -555,7 +555,7 @@ async def test_worker_instance_rejects_invalid_revision_order(
                     node_id=run.root_node_id,
                     incarnation=1,
                     observed_state="PENDING",
-                    created_revision=created_revision,
+                    activated_revision=activated_revision,
                     terminal_revision=terminal_revision,
                 )
             )
@@ -592,6 +592,23 @@ def test_alembic_upgrade_from_phase1a_preserves_protocol_one_runs(tmp_path):
     engine = build_engine(f"sqlite+pysqlite:///{path}")
     with engine.begin() as connection:
         connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.execute(text("DROP TABLE runs"))
+        connection.execute(
+            text(
+                "CREATE TABLE runs ("
+                "id VARCHAR(36) NOT NULL PRIMARY KEY, "
+                "name VARCHAR(120) NOT NULL, status VARCHAR(24) NOT NULL, "
+                "root_node_id VARCHAR(36) NOT NULL, run_scope_id VARCHAR(36) NOT NULL, "
+                "created_at DATETIME NOT NULL, finished_at DATETIME, "
+                "proof_revision INTEGER NOT NULL DEFAULT 0, "
+                "CHECK (status IN ('CREATED','RUNNING','COMPLETED','CANCELLED','FAILED')), "
+                "CHECK (root_node_id IS NOT NULL), "
+                "CHECK ((status IN ('COMPLETED','CANCELLED','FAILED') "
+                "AND finished_at IS NOT NULL) OR "
+                "(status IN ('CREATED','RUNNING') AND finished_at IS NULL))"
+                ")"
+            )
+        )
         connection.execute(
             text(
                 "INSERT INTO runs "
@@ -600,6 +617,44 @@ def test_alembic_upgrade_from_phase1a_preserves_protocol_one_runs(tmp_path):
                 "'legacy-run', 'legacy', 'CREATED', 'legacy-root', 'legacy-scope', "
                 "'2026-01-01 00:00:00'"
                 ")"
+            )
+        )
+        connection.execute(text("DROP TABLE worker_instances"))
+        connection.execute(
+            text(
+                "CREATE TABLE worker_instances ("
+                "id VARCHAR(36) NOT NULL PRIMARY KEY, "
+                "node_id VARCHAR(36) NOT NULL, "
+                "incarnation INTEGER NOT NULL, "
+                "observed_state VARCHAR(16) NOT NULL, "
+                "created_at DATETIME NOT NULL, "
+                "activated_at DATETIME, terminal_at DATETIME, "
+                "FOREIGN KEY(node_id) REFERENCES nodes (id) ON DELETE CASCADE, "
+                "UNIQUE(node_id, incarnation), "
+                "CHECK (incarnation >= 1), "
+                "CHECK (observed_state IN ('PENDING','ACTIVE','EXITED','FAILED'))"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO nodes ("
+                "id, run_id, role, behavior, generation, lineage_path, status, "
+                "own_scope_id, scope_snapshot_json, instruction_version, "
+                "instruction_json, capabilities_json, registered_at"
+                ") VALUES ("
+                "'legacy-node', 'legacy-run', 'legacy', 'cooperative', 0, "
+                "'legacy-node', 'PENDING', 'legacy-scope', '[]', 1, '{}', '[]', "
+                "'2026-01-01 00:00:00'"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO worker_instances "
+                "(id, node_id, incarnation, observed_state, created_at) VALUES "
+                "('legacy-worker', 'legacy-node', 1, 'PENDING', "
+                "'2026-01-01 00:00:00')"
             )
         )
     engine.dispose()
@@ -617,4 +672,382 @@ def test_alembic_upgrade_from_phase1a_preserves_protocol_one_runs(tmp_path):
                 "WHERE id = 'legacy-run'"
             )
         ).scalar_one() == 1
+        assert connection.execute(
+            text(
+                "SELECT activation_intent_id, credential_hash, "
+                "credential_confirmed_at, activated_revision, terminal_revision "
+                "FROM worker_instances WHERE id = 'legacy-worker'"
+            )
+        ).one() == (None, None, None, None, None)
+        assert connection.execute(
+            text(
+                "SELECT current_worker_instance_id FROM nodes "
+                "WHERE id = 'legacy-node'"
+            )
+        ).scalar_one() is None
     engine.dispose()
+
+
+async def test_protocol_check_allows_v2_and_protocol_guards_are_narrow(session_factory):
+    run = await create_seeded_run(session_factory, "protocol-guard-narrow")
+
+    with session_factory.begin() as session:
+        session.execute(
+            text(
+                "UPDATE runs SET execution_protocol_version = execution_protocol_version "
+                "WHERE id = :run_id"
+            ),
+            {"run_id": run.run_id},
+        )
+        session.execute(
+            text("UPDATE runs SET name = :name WHERE id = :run_id"),
+            {"name": "ordinary update", "run_id": run.run_id},
+        )
+
+    with pytest.raises(DatabaseError, match="RUN_EXECUTION_PROTOCOL_VERSION_IMMUTABLE"):
+        with session_factory.begin() as session:
+            session.execute(
+                text(
+                    "UPDATE runs SET execution_protocol_version = 2 "
+                    "WHERE id = :run_id"
+                ),
+                {"run_id": run.run_id},
+            )
+
+
+def test_protocol_check_allows_explicit_v2_insert(tmp_path):
+    engine = build_engine(f"sqlite+pysqlite:///{tmp_path / 'protocol-v2.db'}")
+    init_db(engine)
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            text(
+                "INSERT INTO runs "
+                "(id, name, status, root_node_id, run_scope_id, created_at, "
+                "execution_protocol_version) VALUES "
+                "('protocol-v2', 'v2', 'CREATED', 'root', 'scope', "
+                "'2026-01-01 00:00:00', 2)"
+            )
+        )
+        connection.commit()
+        assert connection.execute(
+            text(
+                "SELECT execution_protocol_version FROM runs "
+                "WHERE id = 'protocol-v2'"
+            )
+        ).scalar_one() == 2
+        with pytest.raises(
+            DatabaseError, match="RUN_EXECUTION_PROTOCOL_VERSION_IMMUTABLE"
+        ):
+            connection.execute(
+                text(
+                    "UPDATE runs SET execution_protocol_version = 1 "
+                    "WHERE id = 'protocol-v2'"
+                )
+            )
+    engine.dispose()
+
+
+async def test_current_worker_instance_pointer_rejects_missing_and_switches_with_proof_revision(
+    session_factory,
+):
+    run = await create_seeded_run(session_factory, "current-pointer-switch")
+    first_id, second_id = str(uuid4()), str(uuid4())
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                WorkerInstance(
+                    id=first_id,
+                    node_id=run.root_node_id,
+                    incarnation=1,
+                    observed_state="PENDING",
+                ),
+                WorkerInstance(
+                    id=second_id,
+                    node_id=run.root_node_id,
+                    incarnation=2,
+                    observed_state="PENDING",
+                ),
+            ]
+        )
+
+    with pytest.raises(DatabaseError, match="NODE_CURRENT_WORKER_INSTANCE_NODE_MISMATCH"):
+        with session_factory.begin() as session:
+            session.execute(
+                text(
+                    "UPDATE nodes SET current_worker_instance_id = :instance_id "
+                    "WHERE id = :node_id"
+                ),
+                {"instance_id": str(uuid4()), "node_id": run.root_node_id},
+            )
+
+    with session_factory() as session:
+        before = session.scalar(select(Run.proof_revision).where(Run.id == run.run_id))
+    with session_factory.begin() as session:
+        session.execute(
+            text(
+                "UPDATE nodes SET current_worker_instance_id = :instance_id "
+                "WHERE id = :node_id"
+            ),
+            {"instance_id": first_id, "node_id": run.root_node_id},
+        )
+    with session_factory() as session:
+        after_first = session.scalar(
+            select(Run.proof_revision).where(Run.id == run.run_id)
+        )
+    with session_factory.begin() as session:
+        session.execute(
+            text(
+                "UPDATE nodes SET current_worker_instance_id = :instance_id "
+                "WHERE id = :node_id"
+            ),
+            {"instance_id": second_id, "node_id": run.root_node_id},
+        )
+    with session_factory() as session:
+        after_switch = session.scalar(
+            select(Run.proof_revision).where(Run.id == run.run_id)
+        )
+        assert session.scalar(
+            select(Node.current_worker_instance_id).where(Node.id == run.root_node_id)
+        ) == second_id
+    assert after_first == before + 1
+    assert after_switch == after_first + 1
+
+
+async def test_worker_instance_direct_delete_and_physical_identity_rewrites_are_rejected(
+    session_factory,
+):
+    run_a = await create_seeded_run(session_factory, "worker-delete-current")
+    run_b = await create_seeded_run(session_factory, "worker-delete-noncurrent")
+    first_id, second_id = str(uuid4()), str(uuid4())
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                WorkerInstance(
+                    id=first_id,
+                    node_id=run_a.root_node_id,
+                    incarnation=1,
+                    observed_state="PENDING",
+                ),
+                WorkerInstance(
+                    id=second_id,
+                    node_id=run_a.root_node_id,
+                    incarnation=2,
+                    observed_state="PENDING",
+                ),
+            ]
+        )
+        session.flush()
+        session.execute(
+            text(
+                "UPDATE nodes SET current_worker_instance_id = :instance_id "
+                "WHERE id = :node_id"
+            ),
+            {"instance_id": first_id, "node_id": run_a.root_node_id},
+        )
+
+    for instance_id in (first_id, second_id):
+        with pytest.raises(DatabaseError, match="WORKER_INSTANCE_DELETE_PROHIBITED"):
+            with session_factory.begin() as session:
+                session.execute(
+                    text("DELETE FROM worker_instances WHERE id = :instance_id"),
+                    {"instance_id": instance_id},
+                )
+
+    with pytest.raises(DatabaseError, match="WORKER_INSTANCE_NODE_ID_IMMUTABLE"):
+        with session_factory.begin() as session:
+            session.execute(
+                text("UPDATE worker_instances SET node_id = :node_id WHERE id = :id"),
+                {"node_id": run_b.root_node_id, "id": first_id},
+            )
+    with pytest.raises(DatabaseError, match="WORKER_INSTANCE_INCARNATION_IMMUTABLE"):
+        with session_factory.begin() as session:
+            session.execute(
+                text(
+                    "UPDATE worker_instances SET incarnation = 9 "
+                    "WHERE id = :id"
+                ),
+                {"id": first_id},
+            )
+
+
+async def test_activation_intent_identity_and_referenced_fk_are_immutable(session_factory):
+    run = await create_seeded_run(session_factory, "activation-intent-identity")
+    spawns = SpawnService(session_factory)
+    first = await spawns.create_spawn(
+        run.root_node_id, run.root_token, SpawnCreate(role="first", capabilities=[])
+    )
+    second = await spawns.create_spawn(
+        run.root_node_id, run.root_token, SpawnCreate(role="second", capabilities=[])
+    )
+    with session_factory() as session:
+        first_intent = session.scalar(
+            select(SpawnIntent.id).where(SpawnIntent.child_node_id == first.child_node_id)
+        )
+        second_intent = session.scalar(
+            select(SpawnIntent.id).where(SpawnIntent.child_node_id == second.child_node_id)
+        )
+    assert first_intent is not None
+    assert second_intent is not None
+
+    null_instance, bound_instance = str(uuid4()), str(uuid4())
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                WorkerInstance(
+                    id=null_instance,
+                    node_id=run.root_node_id,
+                    incarnation=1,
+                    observed_state="PENDING",
+                ),
+                WorkerInstance(
+                    id=bound_instance,
+                    node_id=first.child_node_id,
+                    incarnation=1,
+                    observed_state="PENDING",
+                    activation_intent_id=first_intent,
+                ),
+            ]
+        )
+
+    statements = (
+        (
+            "UPDATE worker_instances SET activation_intent_id = :intent WHERE id = :id",
+            {"intent": first_intent, "id": null_instance},
+        ),
+        (
+            "UPDATE worker_instances SET activation_intent_id = NULL WHERE id = :id",
+            {"id": bound_instance},
+        ),
+        (
+            "UPDATE worker_instances SET activation_intent_id = :intent WHERE id = :id",
+            {"intent": second_intent, "id": bound_instance},
+        ),
+    )
+    for statement, params in statements:
+        with pytest.raises(
+            DatabaseError, match="WORKER_INSTANCE_ACTIVATION_INTENT_ID_IMMUTABLE"
+        ):
+            with session_factory.begin() as session:
+                session.execute(text(statement), params)
+
+    for statement, params in (
+        ("DELETE FROM spawn_intents WHERE id = :id", {"id": first_intent}),
+        (
+            "UPDATE spawn_intents SET id = :replacement WHERE id = :id",
+            {"replacement": str(uuid4()), "id": first_intent},
+        ),
+    ):
+        with pytest.raises(IntegrityError):
+            with session_factory.begin() as session:
+                session.execute(text(statement), params)
+
+
+async def test_direct_sql_lifecycle_and_once_set_facts_are_hardened(session_factory):
+    run = await create_seeded_run(session_factory, "worker-lifecycle-db-guard")
+    active_id, failed_id, pending_failed_id = str(uuid4()), str(uuid4()), str(uuid4())
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                WorkerInstance(
+                    id=active_id,
+                    node_id=run.root_node_id,
+                    incarnation=1,
+                    observed_state="PENDING",
+                ),
+                WorkerInstance(
+                    id=failed_id,
+                    node_id=run.root_node_id,
+                    incarnation=2,
+                    observed_state="PENDING",
+                ),
+                WorkerInstance(
+                    id=pending_failed_id,
+                    node_id=run.root_node_id,
+                    incarnation=3,
+                    observed_state="PENDING",
+                ),
+            ]
+        )
+        session.flush()
+        session.execute(
+            text(
+                "UPDATE worker_instances SET observed_state = 'ACTIVE', "
+                "activated_at = '2026-01-01 00:00:00' WHERE id = :id"
+            ),
+            {"id": active_id},
+        )
+        session.execute(
+            text(
+                "UPDATE worker_instances SET observed_state = 'FAILED', "
+                "terminal_at = '2026-01-02 00:00:00' WHERE id = :id"
+            ),
+            {"id": pending_failed_id},
+        )
+        session.execute(
+            text(
+                "UPDATE worker_instances SET observed_state = 'ACTIVE', "
+                "activated_at = '2026-01-01 00:00:00' WHERE id = :id"
+            ),
+            {"id": failed_id},
+        )
+        session.execute(
+            text(
+                "UPDATE worker_instances SET observed_state = 'FAILED', "
+                "terminal_at = '2026-01-02 00:00:00' WHERE id = :id"
+            ),
+            {"id": failed_id},
+        )
+        session.execute(
+            text(
+                "UPDATE worker_instances SET observed_state = 'EXITED', "
+                "terminal_at = '2026-01-03 00:00:00' WHERE id = :id"
+            ),
+            {"id": active_id},
+        )
+        session.execute(
+            text(
+                "UPDATE worker_instances SET activated_revision = 5, "
+                "terminal_revision = 6, credential_confirmed_at = '2026-01-04 00:00:00' "
+                "WHERE id = :id"
+            ),
+            {"id": active_id},
+        )
+
+    for state_id in (active_id, failed_id):
+        with pytest.raises(DatabaseError):
+            with session_factory.begin() as session:
+                session.execute(
+                    text(
+                        "UPDATE worker_instances SET observed_state = 'ACTIVE' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": state_id},
+                )
+
+    for column, value, code in (
+        ("activated_at", "'2026-01-05 00:00:00'", "ACTIVATED_AT"),
+        ("terminal_at", "'2026-01-05 00:00:00'", "TERMINAL_AT"),
+        ("activated_revision", "7", "ACTIVATED_REVISION"),
+        ("terminal_revision", "7", "TERMINAL_REVISION"),
+        ("credential_confirmed_at", "'2026-01-05 00:00:00'", "CREDENTIAL_CONFIRMED_AT"),
+    ):
+        with pytest.raises(DatabaseError, match=f"WORKER_INSTANCE_{code}_IMMUTABLE"):
+            with session_factory.begin() as session:
+                session.execute(
+                    text(
+                        f"UPDATE worker_instances SET {column} = {value} "
+                        "WHERE id = :id"
+                    ),
+                    {"id": active_id},
+                )
+
+    with pytest.raises(IntegrityError):
+        with session_factory.begin() as session:
+            session.execute(
+                text(
+                    "UPDATE worker_instances SET activated_revision = 8, "
+                    "terminal_revision = 8 WHERE id = :id"
+                ),
+                {"id": pending_failed_id},
+            )
