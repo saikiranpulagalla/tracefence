@@ -1141,3 +1141,181 @@ for _operation in ("UPDATE", "DELETE"):
             """
         ).execute_if(dialect="sqlite"),
     )
+class RuntimeStopIntent(Base):
+    """Immutable causal record for later physical-stop convergence."""
+
+    __tablename__ = "runtime_stop_intents"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "source_command_id"],
+            ["control_commands.run_id", "control_commands.id"],
+            name="fk_runtime_stop_intent_source_command",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "source_scope_id"],
+            ["control_scopes.run_id", "control_scopes.id"],
+            name="fk_runtime_stop_intent_source_scope",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "source_node_id"],
+            ["nodes.run_id", "nodes.id"],
+            name="fk_runtime_stop_intent_source_node",
+        ),
+        CheckConstraint(
+            "cause_type IN ('COMMAND_CANCEL_RUN','COMMAND_CANCEL_SUBTREE',"
+            "'COMMAND_CORRECT_SUBTREE','LEASE_EXPIRED','LOGICAL_COMPLETION')",
+            name="ck_runtime_stop_intent_cause_type",
+        ),
+        CheckConstraint(
+            "target_domain IN ('RUN','SCOPE','NODE')",
+            name="ck_runtime_stop_intent_target_domain",
+        ),
+        CheckConstraint(
+            "source_revision >= 0",
+            name="ck_runtime_stop_intent_source_revision_nonnegative",
+        ),
+        CheckConstraint(
+            "(target_domain = 'RUN' AND source_scope_id IS NULL) OR "
+            "(target_domain = 'SCOPE' AND source_scope_id IS NOT NULL) OR "
+            "(target_domain = 'NODE' AND source_node_id IS NOT NULL)",
+            name="ck_runtime_stop_intent_domain_shape",
+        ),
+        CheckConstraint(
+            "(cause_type IN ('COMMAND_CANCEL_RUN','COMMAND_CANCEL_SUBTREE',"
+            "'COMMAND_CORRECT_SUBTREE') AND source_command_id IS NOT NULL) OR "
+            "(cause_type IN ('LEASE_EXPIRED','LOGICAL_COMPLETION') "
+            "AND source_command_id IS NULL)",
+            name="ck_runtime_stop_intent_cause_source_shape",
+        ),
+        UniqueConstraint(
+            "run_id", "cause_type", "source_node_id", "source_revision",
+            name="uq_runtime_stop_intent_autonomous_cause",
+        ),
+        Index("ix_runtime_stop_intents_run_revision", "run_id", "source_revision"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="RESTRICT"))
+    cause_type: Mapped[str] = mapped_column(String(40))
+    target_domain: Mapped[str] = mapped_column(String(12))
+    source_revision: Mapped[int] = mapped_column(Integer)
+    source_command_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    source_scope_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    source_node_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class RuntimeStopTarget(Base):
+    """Append-only, conservative causal candidate for one WorkerInstance."""
+
+    __tablename__ = "runtime_stop_targets"
+    __table_args__ = (
+        UniqueConstraint(
+            "stop_intent_id", "worker_instance_id",
+            name="uq_runtime_stop_target_intent_worker",
+        ),
+        Index("ix_runtime_stop_targets_worker", "worker_instance_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    stop_intent_id: Mapped[str] = mapped_column(
+        ForeignKey("runtime_stop_intents.id", ondelete="RESTRICT")
+    )
+    worker_instance_id: Mapped[str] = mapped_column(
+        ForeignKey("worker_instances.id", ondelete="RESTRICT")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+V22_SCHEMA_INTEGRITY_TRIGGER_DDL = {
+    "trg_nodes_runtime_stop_selector_identity_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_nodes_runtime_stop_selector_identity_immutable
+        BEFORE UPDATE OF id, run_id, scope_snapshot_json ON nodes
+        WHEN NEW.id IS NOT OLD.id
+          OR NEW.run_id IS NOT OLD.run_id
+          OR NEW.scope_snapshot_json IS NOT OLD.scope_snapshot_json
+        BEGIN
+            SELECT RAISE(ABORT, 'NODE_RUNTIME_STOP_SELECTOR_IDENTITY_IMMUTABLE');
+        END
+    """,
+    "trg_control_scopes_runtime_stop_selector_identity_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_control_scopes_runtime_stop_selector_identity_immutable
+        BEFORE UPDATE OF id, run_id ON control_scopes
+        WHEN NEW.id IS NOT OLD.id OR NEW.run_id IS NOT OLD.run_id
+        BEGIN
+            SELECT RAISE(ABORT, 'CONTROL_SCOPE_RUNTIME_STOP_SELECTOR_IDENTITY_IMMUTABLE');
+        END
+    """,
+    "trg_runtime_stop_intents_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_runtime_stop_intents_immutable
+        BEFORE UPDATE ON runtime_stop_intents
+        BEGIN
+            SELECT RAISE(ABORT, 'RUNTIME_STOP_INTENT_IMMUTABLE');
+        END
+    """,
+    "trg_runtime_stop_intents_delete_prohibited": """
+        CREATE TRIGGER IF NOT EXISTS trg_runtime_stop_intents_delete_prohibited
+        BEFORE DELETE ON runtime_stop_intents
+        BEGIN
+            SELECT RAISE(ABORT, 'RUNTIME_STOP_INTENT_DELETE_PROHIBITED');
+        END
+    """,
+    "trg_runtime_stop_targets_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_runtime_stop_targets_immutable
+        BEFORE UPDATE ON runtime_stop_targets
+        BEGIN
+            SELECT RAISE(ABORT, 'RUNTIME_STOP_TARGET_IMMUTABLE');
+        END
+    """,
+    "trg_runtime_stop_targets_delete_prohibited": """
+        CREATE TRIGGER IF NOT EXISTS trg_runtime_stop_targets_delete_prohibited
+        BEFORE DELETE ON runtime_stop_targets
+        BEGIN
+            SELECT RAISE(ABORT, 'RUNTIME_STOP_TARGET_DELETE_PROHIBITED');
+        END
+    """,
+    "trg_runtime_stop_targets_historical_selector": """
+        CREATE TRIGGER IF NOT EXISTS trg_runtime_stop_targets_historical_selector
+        BEFORE INSERT ON runtime_stop_targets
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM runtime_stop_intents AS intent
+            JOIN worker_instances AS worker
+              ON worker.id = NEW.worker_instance_id
+            JOIN nodes AS node ON node.id = worker.node_id
+            WHERE intent.id = NEW.stop_intent_id
+              AND node.run_id = intent.run_id
+              AND worker.activated_at IS NOT NULL
+              AND (
+                    worker.activated_revision IS NULL
+                    OR worker.activated_revision <= intent.source_revision
+              )
+              AND (
+                    intent.target_domain = 'RUN'
+                    OR (
+                        intent.target_domain = 'SCOPE'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM json_each(node.scope_snapshot_json) AS snapshot
+                            WHERE json_extract(snapshot.value, '$.scope_id')
+                                  = intent.source_scope_id
+                        )
+                    )
+                    OR (
+                        intent.target_domain = 'NODE'
+                        AND node.id = intent.source_node_id
+                    )
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'RUNTIME_STOP_TARGET_HISTORICAL_SELECTOR_MISMATCH');
+        END
+    """,
+}
+
+
+V22_PARTIAL_UNIQUE_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_runtime_stop_intent_source_command "
+    "ON runtime_stop_intents (source_command_id) "
+    "WHERE source_command_id IS NOT NULL",
+)

@@ -21,6 +21,8 @@ from tracefence.config import settings
 from tracefence.db.models import (
     SCHEMA_INTEGRITY_TRIGGER_DDL,
     V21_SCHEMA_INTEGRITY_TRIGGER_DDL,
+    V22_PARTIAL_UNIQUE_INDEX_DDL,
+    V22_SCHEMA_INTEGRITY_TRIGGER_DDL,
     Base,
     SchemaMetadata,
 )
@@ -49,6 +51,7 @@ _RUNTIME_EVENT_TRIGGER_NAMES = {
 _ALL_SCHEMA_INTEGRITY_TRIGGER_DDL = {
     **SCHEMA_INTEGRITY_TRIGGER_DDL,
     **V21_SCHEMA_INTEGRITY_TRIGGER_DDL,
+    **V22_SCHEMA_INTEGRITY_TRIGGER_DDL,
 }
 _SCHEMA_INTEGRITY_TRIGGER_NAMES = set(_ALL_SCHEMA_INTEGRITY_TRIGGER_DDL)
 
@@ -123,6 +126,16 @@ def _install_v21_schema_integrity_triggers(selected_engine: Engine) -> None:
         for index_ddl in _V21_PARTIAL_UNIQUE_INDEX_DDL:
             connection.exec_driver_sql(index_ddl)
         for trigger_ddl in V21_SCHEMA_INTEGRITY_TRIGGER_DDL.values():
+            connection.exec_driver_sql(trigger_ddl)
+
+
+def _install_v22_schema_integrity_triggers(selected_engine: Engine) -> None:
+    if selected_engine.dialect.name != "sqlite":
+        return
+    with selected_engine.begin() as connection:
+        for index_ddl in V22_PARTIAL_UNIQUE_INDEX_DDL:
+            connection.exec_driver_sql(index_ddl)
+        for trigger_ddl in V22_SCHEMA_INTEGRITY_TRIGGER_DDL.values():
             connection.exec_driver_sql(trigger_ddl)
 
 
@@ -346,6 +359,13 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
             "ck_credential_recovery_binding_version_allowed",
             "ck_credential_recovery_binding_shape",
         },
+        "runtime_stop_intents": {
+            "ck_runtime_stop_intent_cause_type",
+            "ck_runtime_stop_intent_target_domain",
+            "ck_runtime_stop_intent_source_revision_nonnegative",
+            "ck_runtime_stop_intent_domain_shape",
+            "ck_runtime_stop_intent_cause_source_shape",
+        },
     }
     for table_name, required_checks in versioned_checks.items():
         expected_checks = {
@@ -405,9 +425,16 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
                 "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
             )
         }
+    v22_partial_unique_indexes = {
+        "uq_runtime_stop_intent_source_command": V22_PARTIAL_UNIQUE_INDEX_DDL[0],
+    }
+    partial_unique_indexes = {
+        **v21_partial_unique_indexes,
+        **v22_partial_unique_indexes,
+    }
     malformed_indexes = sorted(
         name
-        for name, expected in v21_partial_unique_indexes.items()
+        for name, expected in partial_unique_indexes.items()
         if _normalize_sql(index_sql.get(name, "")) != _normalize_sql(expected)
     )
     if malformed_indexes:
@@ -427,8 +454,8 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 21
-ALEMBIC_HEAD = "005_schema_v21_v2_recovery_binding"
+SCHEMA_VERSION = 22
+ALEMBIC_HEAD = "006_schema_v22_runtime_stop_causality"
 
 
 def _stamp_alembic_head(selected_engine: Engine) -> None:
@@ -483,6 +510,7 @@ def init_db(target_engine: Engine | None = None) -> None:
         try:
             Base.metadata.create_all(selected_engine)
             _install_v21_schema_integrity_triggers(selected_engine)
+            _install_v22_schema_integrity_triggers(selected_engine)
             _install_proof_revision_triggers(selected_engine)
             with Session(selected_engine) as session:
                 session.add(SchemaMetadata(id=1, version=SCHEMA_VERSION))
