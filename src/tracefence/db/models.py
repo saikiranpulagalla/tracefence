@@ -1227,6 +1227,37 @@ class RuntimeStopTarget(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class WorkerStopTask(Base):
+    """Mutable, proof-neutral convergence work for one physical worker."""
+
+    __tablename__ = "worker_stop_tasks"
+    __table_args__ = (
+        UniqueConstraint("worker_instance_id", name="uq_worker_stop_task_worker_instance"),
+        CheckConstraint(
+            "state IN ('PENDING','STOP_REQUESTED','VERIFYING','BLOCKED','CONVERGED')",
+            name="ck_worker_stop_task_state",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_worker_stop_task_attempt_count_nonnegative",
+        ),
+        Index("ix_worker_stop_tasks_due", "state", "next_attempt_at", "id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    worker_instance_id: Mapped[str] = mapped_column(
+        ForeignKey("worker_instances.id", ondelete="RESTRICT"), nullable=False
+    )
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 V22_SCHEMA_INTEGRITY_TRIGGER_DDL = {
     "trg_nodes_runtime_stop_selector_identity_immutable": """
         CREATE TRIGGER IF NOT EXISTS trg_nodes_runtime_stop_selector_identity_immutable
@@ -1319,3 +1350,94 @@ V22_PARTIAL_UNIQUE_INDEX_DDL = (
     "ON runtime_stop_intents (source_command_id) "
     "WHERE source_command_id IS NOT NULL",
 )
+
+
+V23_SCHEMA_INTEGRITY_TRIGGER_DDL = {
+    "trg_runtime_stop_targets_historical_selector": """
+        CREATE TRIGGER IF NOT EXISTS trg_runtime_stop_targets_historical_selector
+        BEFORE INSERT ON runtime_stop_targets
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM runtime_stop_intents AS intent
+            JOIN worker_instances AS worker
+              ON worker.id = NEW.worker_instance_id
+            JOIN nodes AS node ON node.id = worker.node_id
+            WHERE intent.id = NEW.stop_intent_id
+              AND node.run_id = intent.run_id
+              AND worker.activated_at IS NOT NULL
+              AND (
+                    worker.activated_revision IS NULL
+                    OR worker.activated_revision <= intent.source_revision
+              )
+              AND (
+                    worker.terminal_revision IS NULL
+                    OR worker.terminal_revision > intent.source_revision
+              )
+              AND (
+                    intent.target_domain = 'RUN'
+                    OR (
+                        intent.target_domain = 'SCOPE'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM json_each(node.scope_snapshot_json) AS snapshot
+                            WHERE json_extract(snapshot.value, '$.scope_id')
+                                  = intent.source_scope_id
+                        )
+                    )
+                    OR (
+                        intent.target_domain = 'NODE'
+                        AND node.id = intent.source_node_id
+                    )
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'RUNTIME_STOP_TARGET_HISTORICAL_SELECTOR_MISMATCH');
+        END
+    """,
+    "trg_worker_instances_terminal_revision_requires_terminal_state": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_terminal_revision_requires_terminal_state
+        BEFORE UPDATE OF terminal_revision ON worker_instances
+        WHEN NEW.terminal_revision IS NOT NULL
+         AND (NEW.observed_state NOT IN ('EXITED', 'FAILED') OR NEW.terminal_at IS NULL)
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_INSTANCE_TERMINAL_REVISION_REQUIRES_TERMINAL_STATE');
+        END
+    """,
+    "trg_worker_stop_tasks_delete_prohibited": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_stop_tasks_delete_prohibited
+        BEFORE DELETE ON worker_stop_tasks
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_STOP_TASK_DELETE_PROHIBITED');
+        END
+    """,
+    "trg_worker_stop_tasks_id_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_stop_tasks_id_immutable
+        BEFORE UPDATE OF id ON worker_stop_tasks
+        WHEN NEW.id IS NOT OLD.id
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_STOP_TASK_ID_IMMUTABLE');
+        END
+    """,
+    "trg_worker_stop_tasks_worker_instance_immutable": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_stop_tasks_worker_instance_immutable
+        BEFORE UPDATE OF worker_instance_id ON worker_stop_tasks
+        WHEN NEW.worker_instance_id IS NOT OLD.worker_instance_id
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_STOP_TASK_WORKER_INSTANCE_IMMUTABLE');
+        END
+    """,
+    "trg_worker_stop_tasks_state_transition": """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_stop_tasks_state_transition
+        BEFORE UPDATE OF state ON worker_stop_tasks
+        WHEN NEW.state IS NOT OLD.state
+         AND NOT (
+            (OLD.state = 'PENDING' AND NEW.state = 'STOP_REQUESTED')
+            OR (OLD.state = 'STOP_REQUESTED' AND NEW.state IN ('VERIFYING', 'PENDING', 'BLOCKED', 'CONVERGED'))
+            OR (OLD.state = 'VERIFYING' AND NEW.state IN ('PENDING', 'BLOCKED', 'CONVERGED'))
+            OR (OLD.state = 'BLOCKED' AND NEW.state = 'PENDING')
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'WORKER_STOP_TASK_STATE_TRANSITION_INVALID');
+        END
+    """,
+}
