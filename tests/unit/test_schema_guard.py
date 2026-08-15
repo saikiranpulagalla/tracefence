@@ -413,7 +413,8 @@ def test_init_db_refuses_current_version_with_missing_constraints(tmp_path):
                     "id VARCHAR(36) PRIMARY KEY, name VARCHAR(120), status VARCHAR(24), "
                     "root_node_id VARCHAR(36) NOT NULL, run_scope_id VARCHAR(36) NOT NULL, "
                     "created_at DATETIME, finished_at DATETIME, "
-                    "proof_revision INTEGER NOT NULL DEFAULT 0)"
+                    "proof_revision INTEGER NOT NULL DEFAULT 0, "
+                    "execution_protocol_version INTEGER NOT NULL DEFAULT 1)"
                 )
             )
         connection.execute(text("DROP TABLE runs_safe"))

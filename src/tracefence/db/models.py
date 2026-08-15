@@ -82,6 +82,42 @@ class Run(Base):
         default=0,
         server_default="0",
     )
+    execution_protocol_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+
+
+event.listen(
+    Run.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_runs_execution_protocol_version_valid
+        BEFORE INSERT ON runs
+        WHEN NEW.execution_protocol_version NOT IN (1, 2)
+        BEGIN
+            SELECT RAISE(ABORT, 'RUN_EXECUTION_PROTOCOL_VERSION_INVALID');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    Run.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_runs_execution_protocol_version_immutable
+        BEFORE UPDATE OF execution_protocol_version ON runs
+        WHEN NEW.execution_protocol_version != OLD.execution_protocol_version
+        BEGIN
+            SELECT RAISE(ABORT, 'RUN_EXECUTION_PROTOCOL_VERSION_IMMUTABLE');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
 
 
 class Node(Base):
@@ -161,6 +197,50 @@ class Node(Base):
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     process_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_worker_instance_id: Mapped[str | None] = mapped_column(
+        String(36),
+        nullable=True,
+    )
+
+
+event.listen(
+    Node.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_nodes_current_worker_instance_owned_insert
+        BEFORE INSERT ON nodes
+        WHEN NEW.current_worker_instance_id IS NOT NULL
+         AND NOT EXISTS (
+            SELECT 1 FROM worker_instances
+            WHERE worker_instances.id = NEW.current_worker_instance_id
+              AND worker_instances.node_id = NEW.id
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'NODE_CURRENT_WORKER_INSTANCE_NODE_MISMATCH');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    Node.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_nodes_current_worker_instance_owned_update
+        BEFORE UPDATE OF current_worker_instance_id ON nodes
+        WHEN NEW.current_worker_instance_id IS NOT NULL
+         AND NOT EXISTS (
+            SELECT 1 FROM worker_instances
+            WHERE worker_instances.id = NEW.current_worker_instance_id
+              AND worker_instances.node_id = NEW.id
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'NODE_CURRENT_WORKER_INSTANCE_NODE_MISMATCH');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
 
 
 class WorkerInstance(Base):
@@ -193,6 +273,23 @@ class WorkerInstance(Base):
             "OR (observed_state = 'FAILED' AND terminal_at IS NOT NULL)",
             name="ck_worker_instance_lifecycle_timestamps",
         ),
+        UniqueConstraint(
+            "activation_intent_id",
+            name="uq_worker_instance_activation_intent",
+        ),
+        CheckConstraint(
+            "created_revision IS NULL OR created_revision >= 0",
+            name="ck_worker_instance_created_revision_nonnegative",
+        ),
+        CheckConstraint(
+            "terminal_revision IS NULL OR terminal_revision >= 0",
+            name="ck_worker_instance_terminal_revision_nonnegative",
+        ),
+        CheckConstraint(
+            "terminal_revision IS NULL OR created_revision IS NULL "
+            "OR terminal_revision >= created_revision",
+            name="ck_worker_instance_revision_order",
+        ),
         Index("ix_worker_instances_node", "node_id"),
     )
 
@@ -206,6 +303,18 @@ class WorkerInstance(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     terminal_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    activation_intent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("spawn_intents.id"),
+        nullable=True,
+    )
+    credential_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    credential_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+    reported_process_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    terminal_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 event.listen(
@@ -218,6 +327,39 @@ event.listen(
         WHEN NEW.id != OLD.id
         BEGIN
             SELECT RAISE(ABORT, 'WORKER_INSTANCE_ID_IMMUTABLE');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    WorkerInstance.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_current_pointer_node_guard
+        BEFORE UPDATE OF node_id ON worker_instances
+        WHEN EXISTS (
+            SELECT 1 FROM nodes
+            WHERE nodes.current_worker_instance_id = OLD.id
+              AND nodes.id != NEW.node_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'NODE_CURRENT_WORKER_INSTANCE_NODE_MISMATCH');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    WorkerInstance.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_worker_instances_current_pointer_clear_on_delete
+        BEFORE DELETE ON worker_instances
+        BEGIN
+            UPDATE nodes
+            SET current_worker_instance_id = NULL
+            WHERE current_worker_instance_id = OLD.id;
         END
         """
     ).execute_if(dialect="sqlite"),

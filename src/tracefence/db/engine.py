@@ -40,6 +40,15 @@ _RUNTIME_EVENT_TRIGGER_NAMES = {
     "trg_runtime_events_no_update",
     "trg_runtime_events_no_delete",
 }
+_SCHEMA_INTEGRITY_TRIGGER_NAMES = {
+    "trg_runs_execution_protocol_version_valid",
+    "trg_runs_execution_protocol_version_immutable",
+    "trg_nodes_current_worker_instance_owned_insert",
+    "trg_nodes_current_worker_instance_owned_update",
+    "trg_worker_instances_id_immutable",
+    "trg_worker_instances_current_pointer_node_guard",
+    "trg_worker_instances_current_pointer_clear_on_delete",
+}
 
 _PROOF_REVISION_TRIGGER_DDL = Template(
     """
@@ -102,7 +111,11 @@ def _validate_required_triggers(selected_engine: Engine) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             ).scalars()
         )
-    required = _proof_revision_trigger_names() | _RUNTIME_EVENT_TRIGGER_NAMES
+    required = (
+        _proof_revision_trigger_names()
+        | _RUNTIME_EVENT_TRIGGER_NAMES
+        | _SCHEMA_INTEGRITY_TRIGGER_NAMES
+    )
     missing = sorted(required - actual)
     if missing:
         raise RuntimeError(
@@ -288,8 +301,8 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 19
-ALEMBIC_HEAD = "003_schema_v19_worker_instances"
+SCHEMA_VERSION = 20
+ALEMBIC_HEAD = "004_schema_v20_execution_protocol_activation"
 
 
 def _stamp_alembic_head(selected_engine: Engine) -> None:

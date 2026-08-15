@@ -10,8 +10,10 @@ from sqlalchemy.exc import DatabaseError, IntegrityError
 
 from tests.helpers import create_seeded_run
 from tracefence.db.engine import ALEMBIC_HEAD, SCHEMA_VERSION, build_engine, init_db
-from tracefence.db.models import WorkerInstance
+from tracefence.db.models import Node, Run, SpawnIntent, WorkerInstance
 from tracefence.domain.errors import ConflictError, NotFoundError
+from tracefence.domain.schemas import SpawnCreate
+from tracefence.services.spawn_service import SpawnService
 from tracefence.services.worker_instance_service import WorkerInstanceService
 
 
@@ -335,4 +337,284 @@ def test_schema_guard_rejects_missing_worker_instance_table(tmp_path):
 
     with pytest.raises(RuntimeError, match="worker_instances"):
         init_db(engine)
+    engine.dispose()
+
+
+async def test_current_behavior_creates_protocol_one_runs(session_factory):
+    run = await create_seeded_run(session_factory, "protocol-one-default")
+
+    with session_factory() as session:
+        assert session.scalar(
+            select(Run.execution_protocol_version).where(Run.id == run.run_id)
+        ) == 1
+
+
+async def test_execution_protocol_version_rejects_invalid_value(session_factory):
+    with pytest.raises(DatabaseError, match="RUN_EXECUTION_PROTOCOL_VERSION_INVALID"):
+        with session_factory.begin() as session:
+            session.execute(
+                text(
+                    "INSERT INTO runs ("
+                    "id, name, status, root_node_id, run_scope_id, created_at, "
+                    "execution_protocol_version"
+                    ") VALUES ("
+                    "'invalid-protocol', 'invalid', 'CREATED', 'invalid-root', "
+                    "'invalid-scope', '2026-01-01 00:00:00', 3"
+                    ")"
+                )
+            )
+
+
+async def test_execution_protocol_version_is_immutable(session_factory):
+    run = await create_seeded_run(session_factory, "protocol-immutable")
+
+    with pytest.raises(DatabaseError, match="RUN_EXECUTION_PROTOCOL_VERSION_IMMUTABLE"):
+        with session_factory.begin() as session:
+            session.execute(
+                text(
+                    "UPDATE runs SET execution_protocol_version = 2 "
+                    "WHERE id = :run_id"
+                ),
+                {"run_id": run.run_id},
+            )
+
+
+async def test_node_current_worker_instance_pointer_allows_null_and_same_node(
+    session_factory,
+):
+    run = await create_seeded_run(session_factory, "current-instance-same-node")
+    instance_id = str(uuid4())
+
+    with session_factory() as session:
+        assert session.scalar(
+            select(Node.current_worker_instance_id).where(
+                Node.id == run.root_node_id
+            )
+        ) is None
+
+    with session_factory.begin() as session:
+        session.add(
+            WorkerInstance(
+                id=instance_id,
+                node_id=run.root_node_id,
+                incarnation=1,
+                observed_state="PENDING",
+            )
+        )
+
+    with session_factory.begin() as session:
+        session.execute(
+            text(
+                "UPDATE nodes SET current_worker_instance_id = :instance_id "
+                "WHERE id = :node_id"
+            ),
+            {"instance_id": instance_id, "node_id": run.root_node_id},
+        )
+
+    with session_factory() as session:
+        assert session.scalar(
+            select(Node.current_worker_instance_id).where(
+                Node.id == run.root_node_id
+            )
+        ) == instance_id
+
+
+async def test_node_current_worker_instance_pointer_rejects_cross_node(
+    session_factory,
+):
+    run_a = await create_seeded_run(session_factory, "current-instance-a")
+    run_b = await create_seeded_run(session_factory, "current-instance-b")
+    foreign_instance_id = str(uuid4())
+
+    with session_factory.begin() as session:
+        session.add(
+            WorkerInstance(
+                id=foreign_instance_id,
+                node_id=run_b.root_node_id,
+                incarnation=1,
+                observed_state="PENDING",
+            )
+        )
+
+    with pytest.raises(DatabaseError, match="NODE_CURRENT_WORKER_INSTANCE_NODE_MISMATCH"):
+        with session_factory.begin() as session:
+            session.execute(
+                text(
+                    "UPDATE nodes SET current_worker_instance_id = :instance_id "
+                    "WHERE id = :node_id"
+                ),
+                {
+                    "instance_id": foreign_instance_id,
+                    "node_id": run_a.root_node_id,
+                },
+            )
+
+
+async def test_activation_intent_id_is_unique_but_allows_multiple_nulls(
+    session_factory,
+):
+    run = await create_seeded_run(session_factory, "activation-intent-unique")
+    spawns = SpawnService(session_factory)
+    created = await spawns.create_spawn(
+        run.root_node_id,
+        run.root_token,
+        SpawnCreate(role="intent-child", capabilities=[]),
+    )
+    with session_factory() as session:
+        intent = session.scalar(
+            select(SpawnIntent).where(
+                SpawnIntent.child_node_id == created.child_node_id
+            )
+        )
+        assert intent is not None
+        intent_id = intent.id
+
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                WorkerInstance(
+                    id=str(uuid4()),
+                    node_id=run.root_node_id,
+                    incarnation=1,
+                    observed_state="PENDING",
+                ),
+                WorkerInstance(
+                    id=str(uuid4()),
+                    node_id=created.child_node_id,
+                    incarnation=1,
+                    observed_state="PENDING",
+                ),
+            ]
+        )
+
+    with session_factory.begin() as session:
+        session.add(
+            WorkerInstance(
+                id=str(uuid4()),
+                node_id=created.child_node_id,
+                incarnation=2,
+                observed_state="PENDING",
+                activation_intent_id=intent_id,
+            )
+        )
+
+    with pytest.raises(IntegrityError):
+        with session_factory.begin() as session:
+            session.add(
+                WorkerInstance(
+                    id=str(uuid4()),
+                    node_id=run.root_node_id,
+                    incarnation=2,
+                    observed_state="PENDING",
+                    activation_intent_id=intent_id,
+                )
+            )
+
+
+async def test_worker_instance_v2_storage_and_historical_revisions_are_nullable(
+    session_factory,
+):
+    run = await create_seeded_run(session_factory, "worker-v2-storage-null")
+    instance_id = str(uuid4())
+
+    with session_factory.begin() as session:
+        session.add(
+            WorkerInstance(
+                id=instance_id,
+                node_id=run.root_node_id,
+                incarnation=1,
+                observed_state="PENDING",
+            )
+        )
+
+    with session_factory() as session:
+        instance = session.get(WorkerInstance, instance_id)
+        assert instance is not None
+        assert instance.credential_hash is None
+        assert instance.credential_confirmed_at is None
+        assert instance.created_revision is None
+        assert instance.terminal_revision is None
+
+
+@pytest.mark.parametrize(
+    ("created_revision", "terminal_revision"),
+    [(-1, None), (None, -1), (4, 3)],
+)
+async def test_worker_instance_rejects_invalid_revision_order(
+    session_factory,
+    created_revision,
+    terminal_revision,
+):
+    run = await create_seeded_run(session_factory, "worker-revision-constraints")
+
+    with pytest.raises(IntegrityError):
+        with session_factory.begin() as session:
+            session.add(
+                WorkerInstance(
+                    id=str(uuid4()),
+                    node_id=run.root_node_id,
+                    incarnation=1,
+                    observed_state="PENDING",
+                    created_revision=created_revision,
+                    terminal_revision=terminal_revision,
+                )
+            )
+
+
+def test_phase1b1_schema_has_no_current_incarnation_and_guards_triggers(tmp_path):
+    from sqlalchemy import inspect
+
+    from tracefence.db.engine import _validate_required_triggers
+
+    engine = build_engine(f"sqlite+pysqlite:///{tmp_path / 'phase1b1-schema.db'}")
+    init_db(engine)
+
+    assert {
+        column["name"] for column in inspect(engine).get_columns("nodes")
+    }.isdisjoint({"current_incarnation"})
+    _validate_required_triggers(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text("DROP TRIGGER trg_runs_execution_protocol_version_immutable")
+        )
+    with pytest.raises(RuntimeError, match="trg_runs_execution_protocol_version_immutable"):
+        _validate_required_triggers(engine)
+    engine.dispose()
+
+
+def test_alembic_upgrade_from_phase1a_preserves_protocol_one_runs(tmp_path):
+    from alembic import command
+
+    path = tmp_path / "upgrade-phase1a.db"
+    config = _alembic_config(path)
+    command.upgrade(config, "003_schema_v19_worker_instances")
+
+    engine = build_engine(f"sqlite+pysqlite:///{path}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            text(
+                "INSERT INTO runs "
+                "(id, name, status, root_node_id, run_scope_id, created_at) "
+                "VALUES ("
+                "'legacy-run', 'legacy', 'CREATED', 'legacy-root', 'legacy-scope', "
+                "'2026-01-01 00:00:00'"
+                ")"
+            )
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+
+    engine = build_engine(f"sqlite+pysqlite:///{path}")
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT version FROM schema_metadata WHERE id = 1")
+        ).scalar_one() == SCHEMA_VERSION
+        assert connection.execute(
+            text(
+                "SELECT execution_protocol_version FROM runs "
+                "WHERE id = 'legacy-run'"
+            )
+        ).scalar_one() == 1
     engine.dispose()
