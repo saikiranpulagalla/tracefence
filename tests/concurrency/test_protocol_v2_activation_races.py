@@ -302,3 +302,199 @@ async def test_v2_first_authentication_writer_prevents_expired_recovery_rotation
         ).scalar_one()
         assert worker.credential_confirmed_at is not None
         assert token_matches(first.node_token, worker.credential_hash)
+
+
+
+async def _activate_v2_child_with_live_envelope(session_factory, name: str):
+    run, service, spawned = await _spawn_v2_child(session_factory, name)
+    activated = await service.activate(
+        spawned.child_node_id,
+        NodeActivate(activation_token=spawned.activation_token),
+    )
+    return run, service, spawned, activated
+
+
+async def test_v2_recovery_writer_first_linearizes_before_cancellation(
+    session_factory, monkeypatch
+):
+    """A recovery already past revalidation commits before cancellation."""
+
+    _run, service, spawned, first = await _activate_v2_child_with_live_envelope(
+        session_factory,
+        "v2-recovery-cancellation-recovery-first",
+    )
+    recovery_revalidated = Event()
+    release_recovery = Event()
+    cancellation_attempted = Event()
+    original_open = spawn_module.open_envelope
+
+    def paused_open(envelope, response_type):
+        # _recover_v2_activation_locked calls this only after validating the
+        # current worker, lease, scope, and run inside BEGIN IMMEDIATE.
+        recovery_revalidated.set()
+        assert release_recovery.wait(timeout=5)
+        return original_open(envelope, response_type)
+
+    monkeypatch.setattr(spawn_module, "open_envelope", paused_open)
+
+    def recover():
+        return asyncio.run(
+            service.activate(
+                spawned.child_node_id,
+                NodeActivate(activation_token=spawned.activation_token, process_id=5301),
+            )
+        )
+
+    def cancel():
+        cancellation_attempted.set()
+        return asyncio.run(
+            ControlService(session_factory).issue_command(
+                _cancel_request(
+                    spawned.child_node_id,
+                    "v2-recovery-cancellation-recovery-first-cancel",
+                ),
+                Principal(issuer_type=IssuerType.HUMAN),
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        recovery = pool.submit(recover)
+        assert recovery_revalidated.wait(timeout=5)
+        cancellation = pool.submit(cancel)
+        assert cancellation_attempted.wait(timeout=5)
+        # The cancellation writer cannot enter until the recovery transaction
+        # releases its SQLite BEGIN IMMEDIATE lock.
+        assert not cancellation.done()
+        release_recovery.set()
+        assert recovery.result(timeout=10) == first
+        command = cancellation.result(timeout=10)
+
+    assert command.status == ScopeStatus.CANCELLED
+    with pytest.raises(ConflictError) as captured:
+        await service.activate(
+            spawned.child_node_id,
+            NodeActivate(activation_token=spawned.activation_token, process_id=5302),
+        )
+    assert captured.value.code in {"SCOPE_CANCELLED", "ACTIVATION_RECOVERY_DENIED"}
+
+
+async def test_v2_cancellation_writer_first_blocks_recovery_disclosure(
+    session_factory, monkeypatch
+):
+    """Cancellation committed first prevents decrypting or mutating recovery."""
+
+    _run, service, spawned, first = await _activate_v2_child_with_live_envelope(
+        session_factory,
+        "v2-recovery-cancellation-cancellation-first",
+    )
+    with session_factory() as session:
+        node = session.get(Node, first.node_id)
+        worker = session.execute(
+            select(WorkerInstance).where(WorkerInstance.node_id == first.node_id)
+        ).scalar_one()
+        envelope = session.execute(
+            select(CredentialRecoveryEnvelope).where(
+                CredentialRecoveryEnvelope.binding_version == 2,
+                CredentialRecoveryEnvelope.subject_node_id == first.node_id,
+            )
+        ).scalar_one()
+        before = {
+            "current_worker_instance_id": node.current_worker_instance_id,
+            "worker_id": worker.id,
+            "incarnation": worker.incarnation,
+            "credential_hash": worker.credential_hash,
+            "credential_confirmed_at": worker.credential_confirmed_at,
+            "envelope_id": envelope.id,
+            "nonce": envelope.nonce,
+            "ciphertext": envelope.ciphertext,
+            "expires_at": envelope.expires_at,
+            "updated_at": envelope.updated_at,
+        }
+
+    cancellation_state_written = Event()
+    release_cancellation = Event()
+    recovery_attempted = Event()
+    envelope_opened = Event()
+    original_event = control_module.record_runtime_event
+    original_open = spawn_module.open_envelope
+
+    def paused_event(*args, **kwargs):
+        result = original_event(*args, **kwargs)
+        if kwargs.get("event_type") == "SCOPE_CANCELLED":
+            cancellation_state_written.set()
+            assert release_cancellation.wait(timeout=5)
+        return result
+
+    def tracked_open(envelope, response_type):
+        envelope_opened.set()
+        return original_open(envelope, response_type)
+
+    monkeypatch.setattr(control_module, "record_runtime_event", paused_event)
+    monkeypatch.setattr(spawn_module, "open_envelope", tracked_open)
+
+    def cancel():
+        return asyncio.run(
+            ControlService(session_factory).issue_command(
+                _cancel_request(
+                    spawned.child_node_id,
+                    "v2-recovery-cancellation-cancellation-first-cancel",
+                ),
+                Principal(issuer_type=IssuerType.HUMAN),
+            )
+        )
+
+    def recover():
+        recovery_attempted.set()
+        return asyncio.run(
+            service.activate(
+                spawned.child_node_id,
+                NodeActivate(activation_token=spawned.activation_token, process_id=5401),
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cancellation = pool.submit(cancel)
+        assert cancellation_state_written.wait(timeout=5)
+        recovery = pool.submit(recover)
+        assert recovery_attempted.wait(timeout=5)
+        # Recovery cannot enter its authoritative transaction while the control
+        # writer owns BEGIN IMMEDIATE and has applied cancellation.
+        assert not recovery.done()
+        release_cancellation.set()
+        assert cancellation.result(timeout=10).status == ScopeStatus.CANCELLED
+        with pytest.raises(ConflictError) as captured:
+            recovery.result(timeout=10)
+
+    assert captured.value.code in {"SCOPE_CANCELLED", "ACTIVATION_RECOVERY_DENIED"}
+    assert not envelope_opened.is_set()
+    assert first.node_token not in str(captured.value)
+    with session_factory() as session:
+        node = session.get(Node, first.node_id)
+        worker = session.execute(
+            select(WorkerInstance).where(WorkerInstance.node_id == first.node_id)
+        ).scalar_one()
+        envelope = session.execute(
+            select(CredentialRecoveryEnvelope).where(
+                CredentialRecoveryEnvelope.binding_version == 2,
+                CredentialRecoveryEnvelope.subject_node_id == first.node_id,
+            )
+        ).scalar_one()
+        after = {
+            "current_worker_instance_id": node.current_worker_instance_id,
+            "worker_id": worker.id,
+            "incarnation": worker.incarnation,
+            "credential_hash": worker.credential_hash,
+            "credential_confirmed_at": worker.credential_confirmed_at,
+            "envelope_id": envelope.id,
+            "nonce": envelope.nonce,
+            "ciphertext": envelope.ciphertext,
+            "expires_at": envelope.expires_at,
+            "updated_at": envelope.updated_at,
+        }
+        assert session.scalar(
+            select(func.count(WorkerInstance.id)).where(
+                WorkerInstance.node_id == first.node_id
+            )
+        ) == 1
+
+    assert after == before
