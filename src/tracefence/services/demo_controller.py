@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
+
+# Security: fixed interpreter/module and list argv use shell=False; the worker token travels via stdin.
+import subprocess  # nosec B404
 import sys
 import threading
 import time
@@ -1213,6 +1215,7 @@ class DemoController:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            shell=False,
             cwd=_REPO_ROOT,
             env=environment,
         )

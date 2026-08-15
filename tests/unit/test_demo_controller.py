@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
 from tracefence.db.models import Node
-from tracefence.domain.enums import ProofVerdict, RunStatus
+from tracefence.domain.enums import NodeStatus, ProofVerdict, RunStatus
 from tracefence.domain.errors import ConflictError, NotFoundError
 from tracefence.domain.schemas import ActionExecute
+from tracefence.services import demo_controller
 from tracefence.services.action_gateway import ActionGateway
 from tracefence.services.common import utcnow
 from tracefence.services.control_service import ControlService
@@ -41,6 +44,79 @@ class _InProcessWorker:
 
     def terminate(self) -> None:
         return
+
+
+class _CapturedStdin:
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+
+    def write(self, value: str) -> int:
+        self.writes.append(value)
+        return len(value)
+
+    def flush(self) -> None:
+        return
+
+
+class _CapturedProcess:
+    def __init__(self) -> None:
+        self.stdin = _CapturedStdin()
+
+    def poll(self) -> None:
+        return None
+
+
+class _WaitingSession:
+    def __enter__(self) -> _WaitingSession:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
+
+    def get(self, model, node_id: str) -> SimpleNamespace:
+        return SimpleNamespace(status=NodeStatus.WAITING)
+
+
+async def test_subprocess_worker_launch_is_fixed_and_secret_aware(monkeypatch):
+    captured: dict[str, object] = {}
+    process = _CapturedProcess()
+
+    async def capture_to_thread(function, *args, **kwargs):
+        captured["function"] = function
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return process
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=secret")
+    monkeypatch.setenv("SIGNOZ_API_KEY", "secret")
+    monkeypatch.setenv("TRACEFENCE_NOTIFICATION_CHANNEL", "live-channel")
+    monkeypatch.setattr(demo_controller.asyncio, "to_thread", capture_to_thread)
+    controller = DemoController(
+        lambda: _WaitingSession(),
+        maintain_heartbeats=False,
+    )
+
+    activation_token = "worker-token-must-not-be-an-argument"
+    await controller._start_subprocess_worker(
+        "internally-created-node-id",
+        activation_token,
+        "internally-created-action-key",
+    )
+
+    assert captured["function"] is demo_controller.subprocess.Popen
+    argv = captured["args"][0]
+    assert isinstance(argv, list)
+    assert argv[:3] == [sys.executable, "-m", "tracefence.runtime.demo_worker"]
+    assert activation_token not in argv
+    kwargs = captured["kwargs"]
+    assert kwargs["shell"] is False
+    assert kwargs["cwd"] == demo_controller._REPO_ROOT
+    environment = kwargs["env"]
+    assert environment["OTEL_SDK_DISABLED"] == "true"
+    assert environment["OTEL_EXPORTER_OTLP_ENDPOINT"] == ""
+    assert "OTEL_EXPORTER_OTLP_HEADERS" not in environment
+    assert "SIGNOZ_API_KEY" not in environment
+    assert "TRACEFENCE_NOTIFICATION_CHANNEL" not in environment
 
 
 async def test_canonical_demo_uses_real_authority_and_gateway(session_factory):
