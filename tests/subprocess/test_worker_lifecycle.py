@@ -24,6 +24,8 @@ class _WorkerApi:
         self.completion_status = 204
         self.activation_token = "activation-secret-value-123456"
         self.node_token = "node-secret-value-123456789"
+        self.activation_payloads: list[dict[str, object]] = []
+        self.drop_first_activation_response = False
         self.heartbeat_seen = threading.Event()
 
 
@@ -37,7 +39,12 @@ def worker_api():
             body = self.rfile.read(content_length)
             state.paths.append(self.path)
             if self.path.endswith("/activate"):
-                assert json.loads(body)["activation_token"] == state.activation_token
+                payload = json.loads(body)
+                assert payload["activation_token"] == state.activation_token
+                state.activation_payloads.append(payload)
+                if state.drop_first_activation_response and len(state.activation_payloads) == 1:
+                    self.close_connection = True
+                    return
                 self._json(
                     200,
                     {
@@ -163,6 +170,19 @@ def test_successful_worker_requires_allowed_checkpoint_and_completes(worker_api)
     assert result.returncode == 0, result.stderr
     assert any(path.endswith("/checkpoint") for path in state.paths)
     assert any(path.endswith("/complete") for path in state.paths)
+
+
+def test_worker_retries_the_identical_activation_payload_after_lost_response(worker_api):
+    state, api_url = worker_api
+    state.drop_first_activation_response = True
+
+    result = _run_worker(state, api_url)
+
+    assert result.returncode == 0, result.stderr
+    assert len(state.activation_payloads) == 2
+    assert state.activation_payloads[0] == state.activation_payloads[1]
+    assert state.activation_token not in result.stdout + result.stderr
+    assert state.node_token not in result.stdout + result.stderr
 
 
 def test_http_200_denied_checkpoint_is_not_success(worker_api):

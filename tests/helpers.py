@@ -17,7 +17,21 @@ async def create_seeded_run(session_factory, name: str = "test-run"):
     runs = RunService(session_factory)
     states = StateService(session_factory)
     run = await runs.create_run(
-        RunCreate(name=name, root_capabilities=FULL_ROOT_CAPABILITIES)
+        RunCreate(name=name, root_capabilities=FULL_ROOT_CAPABILITIES),
+        execution_protocol_version=1,
+    )
+    await states.seed_scenario(run.run_id)
+    return run
+
+
+async def create_v2_run(session_factory, name: str = "test-v2-run"):
+    """Create a test-owned protocol-v2 run before the production default flips."""
+
+    runs = RunService(session_factory)
+    states = StateService(session_factory)
+    run = await runs.create_run(
+        RunCreate(name=name, root_capabilities=FULL_ROOT_CAPABILITIES),
+        execution_protocol_version=2,
     )
     await states.seed_scenario(run.run_id)
     return run
