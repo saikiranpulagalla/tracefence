@@ -407,13 +407,13 @@ webcolors==25.10.0 \
     --hash=sha256:032c727334856fc0b968f63daa252a1ac93d33db2f5267756623c210e57a4f1d \
     --hash=sha256:62abae86504f66d0f6364c2a8520de4a0c47b80c03fc3a5f1815fedbef7c19bf
     # via jsonschema
-wheel==0.47.0 \
-    --hash=sha256:212281cab4dff978f6cedd499cd893e1f620791ca6ff7107cf270781e587eced \
-    --hash=sha256:cc72bd1009ba0cf63922e28f94d9d83b920aa2bb28f798a31d0691b02fa3c9b3
+wheel==0.48.0 \
+    --hash=sha256:3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab \
+    --hash=sha256:94800765601e9171bf5d58d066e640662842bcedcbab982b2c90787a2c987322
     # via -r requirements-build.in
 
 # The following packages are considered to be unsafe in a requirements file:
-setuptools==83.0.0 \
-    --hash=sha256:025bccbbf0fa05b6192bc64ae1e7b16e001fd6d6d4d5de03c97b1c1ade523bef \
-    --hash=sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3
+setuptools==84.0.0 \
+    --hash=sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670 \
+    --hash=sha256:f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73
     # via -r requirements-build.in
