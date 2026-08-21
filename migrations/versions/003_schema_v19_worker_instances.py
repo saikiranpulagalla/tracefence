@@ -7,7 +7,7 @@ Revises: 002_schema_v18_runtime_inspector
 from alembic import op
 from sqlalchemy import inspect, text
 
-from tracefence.db.models import WorkerInstance
+from migrations.schema_baselines.v19 import V19_WORKER_INSTANCE
 
 revision = "003_schema_v19_worker_instances"
 down_revision = "002_schema_v18_runtime_inspector"
@@ -22,7 +22,7 @@ def upgrade() -> None:
     if connection.dialect.name != "sqlite":
         raise RuntimeError("TraceFence migrations support only SQLite")
     if "worker_instances" not in set(inspect(connection).get_table_names()):
-        WorkerInstance.__table__.create(connection)
+        V19_WORKER_INSTANCE.create(connection)
     connection.execute(
         text("UPDATE schema_metadata SET version = :version WHERE id = 1"),
         {"version": SCHEMA_VERSION},
@@ -31,6 +31,5 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     raise RuntimeError(
-        "The WorkerInstance migration downgrade is destructive; "
-        "restore a verified backup instead"
+        "The WorkerInstance migration downgrade is destructive; restore a verified backup instead"
     )
