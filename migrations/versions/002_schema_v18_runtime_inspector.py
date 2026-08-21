@@ -7,7 +7,7 @@ Revises: 001_schema_v17
 from alembic import op
 from sqlalchemy import JSON, Column, inspect, text
 
-from tracefence.db.models import RuntimeEvent
+from migrations.schema_baselines.v18 import V18_RUNTIME_EVENT
 
 revision = "002_schema_v18_runtime_inspector"
 down_revision = "001_schema_v17"
@@ -23,7 +23,7 @@ def upgrade() -> None:
         raise RuntimeError("TraceFence migrations support only SQLite")
     inspector = inspect(connection)
     if "runtime_events" not in set(inspector.get_table_names()):
-        RuntimeEvent.__table__.create(connection)
+        V18_RUNTIME_EVENT.create(connection)
     action_columns = {
         column["name"] for column in inspect(connection).get_columns("action_attempts")
     }

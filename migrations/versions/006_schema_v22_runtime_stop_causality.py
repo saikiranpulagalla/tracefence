@@ -7,10 +7,10 @@ Revises: 005_schema_v21_v2_recovery_binding
 from alembic import op
 from sqlalchemy import inspect, text
 
-from tracefence.db.models import (
-    RuntimeStopIntent,
-    RuntimeStopTarget,
+from migrations.schema_baselines.v22 import (
     V22_PARTIAL_UNIQUE_INDEX_DDL,
+    V22_RUNTIME_STOP_INTENT,
+    V22_RUNTIME_STOP_TARGET,
     V22_SCHEMA_INTEGRITY_TRIGGER_DDL,
 )
 
@@ -37,9 +37,9 @@ def upgrade() -> None:
 
     tables = set(inspect(connection).get_table_names())
     if "runtime_stop_intents" not in tables:
-        RuntimeStopIntent.__table__.create(connection)
+        V22_RUNTIME_STOP_INTENT.create(connection)
     if "runtime_stop_targets" not in tables:
-        RuntimeStopTarget.__table__.create(connection)
+        V22_RUNTIME_STOP_TARGET.create(connection)
     _install_v22_integrity_triggers()
     connection.execute(
         text("UPDATE schema_metadata SET version = :version WHERE id = 1"),

@@ -7,7 +7,7 @@ Revises:
 from alembic import op
 from sqlalchemy import insert
 
-from tracefence.db.models import Base, SchemaMetadata
+from migrations.schema_baselines.v17 import V17_METADATA, V17_SCHEMA_METADATA
 
 revision = "001_schema_v17"
 down_revision = None
@@ -34,7 +34,7 @@ def upgrade() -> None:
     connection = op.get_bind()
     if connection.dialect.name != "sqlite":
         raise RuntimeError("TraceFence migrations support only SQLite")
-    Base.metadata.create_all(connection)
+    V17_METADATA.create_all(connection)
     for table in _PROOF_TABLES:
         for operation in ("INSERT", "UPDATE", "DELETE"):
             row = "OLD" if operation == "DELETE" else "NEW"
@@ -62,13 +62,10 @@ def upgrade() -> None:
         END
         """
     )
-    connection.execute(
-        insert(SchemaMetadata).values(id=1, version=SCHEMA_VERSION)
-    )
+    connection.execute(insert(V17_SCHEMA_METADATA).values(id=1, version=SCHEMA_VERSION))
 
 
 def downgrade() -> None:
     raise RuntimeError(
-        "The initial TraceFence schema downgrade is destructive; "
-        "restore a verified backup instead"
+        "The initial TraceFence schema downgrade is destructive; restore a verified backup instead"
     )
