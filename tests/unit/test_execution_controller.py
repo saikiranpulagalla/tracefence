@@ -122,7 +122,7 @@ def test_v23_migration_lifecycle_and_schema_guard(tmp_path):
     engine = build_engine(f"sqlite+pysqlite:///{path}")
     with engine.connect() as connection:
         names = set(connection.exec_driver_sql("SELECT name FROM sqlite_master").scalars())
-    assert "worker_stop_tasks" in names
+    assert "worker_stop_tasks" not in names
     assert "trg_worker_stop_tasks_state_transition" not in names
     engine.dispose()
 
