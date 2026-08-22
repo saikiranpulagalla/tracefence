@@ -55,7 +55,7 @@ jobs:
       - name: Verify built wheel in a clean environment
         run: |
           python -m venv /tmp/tracefence-wheel
-          /tmp/tracefence-wheel/bin/python -m pip install --require-hashes -r requirements-lock/runtime.txt
+          /tmp/tracefence-wheel/bin/python -m pip install --require-hashes -r requirements-lock/runtime-linux.txt
           /tmp/tracefence-wheel/bin/python -m pip install --no-deps dist/*.whl
           /tmp/tracefence-wheel/bin/tracefence --help
           /tmp/tracefence-wheel/bin/python - <<'PY'
