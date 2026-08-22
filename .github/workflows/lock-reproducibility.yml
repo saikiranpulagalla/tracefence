@@ -1,0 +1,39 @@
+name: Lock reproducibility
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  native-locks:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux
+            full_lock: requirements-lock/full-linux.txt
+          - runner: windows-latest
+            platform: windows
+            full_lock: requirements-lock/full-windows.txt
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Regenerate native locks twice
+        run: |
+          python scripts/compile_locks.py --platform ${{ matrix.platform }}
+          git diff --exit-code
+          python scripts/compile_locks.py --platform ${{ matrix.platform }}
+          git diff --exit-code
+      - name: Install and audit native full lock
+        run: |
+          python -m pip install --require-hashes -r requirements-lock/development.txt -r ${{ matrix.full_lock }}
+          pip-audit -r ${{ matrix.full_lock }} --require-hashes --progress-spinner off
+      - name: Locked import smoke test
+        run: python -c "import mcp"

@@ -54,8 +54,8 @@ release-artifacts:
 	mkdir -p reports
 	$(PYTHON) scripts/lock_casting.py
 	$(PYTHON) scripts/secret_scan.py --output reports/secret-scan.json
-	cyclonedx-py requirements requirements-lock/full.txt --pyproject pyproject.toml --output-reproducible --output-format JSON --output-file reports/sbom.cdx.json --validate
-	pip-audit -r requirements-lock/full.txt --require-hashes --progress-spinner off --format json --output reports/dependency-audit.json
+	cyclonedx-py requirements requirements-lock/full-linux.txt --pyproject pyproject.toml --output-reproducible --output-format JSON --output-file reports/sbom.cdx.json --validate
+	pip-audit -r requirements-lock/full-linux.txt --require-hashes --progress-spinner off --format json --output reports/dependency-audit.json
 
 api:
 	PYTHONPATH=src $(PYTHON) -m uvicorn tracefence.api.main:app --host 127.0.0.1 --port 9000
