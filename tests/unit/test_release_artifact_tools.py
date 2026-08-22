@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from scripts.lock_casting import lock_payload, write_lock
-from scripts.normalize_lock_markers import normalize_full_lock
 from scripts.secret_scan import scan_paths
 from scripts.verify_end_to_end import VerificationError, _verify_telemetry_gate
 from scripts.verify_foundry_receipt import (
@@ -123,23 +122,6 @@ def test_public_verdict_documentation_matches_canonical_lattice() -> None:
     assert "overall proof                           PARTIAL" not in combined
     assert "`PARTIAL`: runtime verifies but telemetry is unavailable" not in combined
     assert "runtime `VERIFIED` + telemetry `UNAVAILABLE` = overall `UNAVAILABLE`" in combined
-
-
-def test_full_hash_lock_keeps_mcp_pywin32_platform_conditional() -> None:
-    root = Path(__file__).resolve().parents[2]
-    lock = (root / "requirements-lock" / "full.txt").read_text(encoding="utf-8")
-
-    assert 'pywin32==312 ; sys_platform == "win32"' in lock
-
-
-def test_lock_normalizer_restores_upstream_windows_marker(tmp_path: Path) -> None:
-    lock = tmp_path / "full.txt"
-    lock.write_text("pywin32==312 \\\n    --hash=sha256:abc\n", encoding="utf-8")
-
-    assert normalize_full_lock(lock)
-    assert 'pywin32==312 ; sys_platform == "win32"' in lock.read_text(
-        encoding="utf-8"
-    )
 
 
 def test_cyclonedx_cli_is_declared_and_hash_locked_for_release_artifacts() -> None:

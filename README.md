@@ -225,7 +225,7 @@ then install the package without resolving dependencies again:
 ```bash
 python -m pip install --require-hashes \
   -r requirements-lock/development.txt \
-  -r requirements-lock/full.txt
+  -r requirements-lock/full-linux.txt
 python -m pip install --no-deps -e .
 ```
 
