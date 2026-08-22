@@ -15,9 +15,11 @@ jobs:
         include:
           - runner: ubuntu-latest
             platform: linux
+            runtime_lock: requirements-lock/runtime-linux.txt
             full_lock: requirements-lock/full-linux.txt
           - runner: windows-latest
             platform: windows
+            runtime_lock: requirements-lock/runtime-windows.txt
             full_lock: requirements-lock/full-windows.txt
     runs-on: ${{ matrix.runner }}
     steps:
@@ -25,15 +27,57 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Regenerate native locks twice
+      - name: Regenerate native locks in a fresh compiler environment
+        run: python scripts/compile_locks.py --platform ${{ matrix.platform }}
+      - name: Detect first native regeneration difference
+        id: first_regeneration
+        shell: pwsh
+        run: |
+          git diff -- requirements-lock | Out-File -FilePath native-lock-diff.txt -Encoding utf8NoBOM
+          if (git diff --quiet -- requirements-lock) {
+            "changed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8NoBOM
+          } else {
+            "changed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8NoBOM
+          }
+      - name: Preserve Windows native bootstrap evidence
+        if: matrix.platform == 'windows' && steps.first_regeneration.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path native-lock-evidence/requirements-lock | Out-Null
+          $locks = @(
+            "requirements-lock/runtime-${{ matrix.platform }}.txt",
+            "requirements-lock/development.txt",
+            "requirements-lock/build.txt",
+            "requirements-lock/full-${{ matrix.platform }}.txt"
+          )
+          Copy-Item -Path $locks -Destination native-lock-evidence/requirements-lock/
+          Copy-Item native-lock-diff.txt native-lock-evidence/
+          Get-FileHash -Algorithm SHA256 -Path $locks |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), $_.Path } |
+            Set-Content -Path native-lock-evidence/sha256.txt -Encoding utf8NoBOM
+      - name: Upload Windows bootstrap evidence before failure
+        if: matrix.platform == 'windows' && steps.first_regeneration.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-lock-bootstrap-${{ github.sha }}
+          path: native-lock-evidence
+          if-no-files-found: error
+      - name: Require first native regeneration to match committed locks
+        run: git diff --exit-code -- requirements-lock
+      - name: Regenerate native locks in a second fresh compiler environment
         run: |
           python scripts/compile_locks.py --platform ${{ matrix.platform }}
-          git diff --exit-code
-          python scripts/compile_locks.py --platform ${{ matrix.platform }}
-          git diff --exit-code
-      - name: Install and audit native full lock
+          git diff --exit-code -- requirements-lock
+      - name: Install and audit native full environment
+        shell: pwsh
         run: |
+          python -m pip install --upgrade pip==26.2.1
           python -m pip install --require-hashes -r requirements-lock/development.txt -r ${{ matrix.full_lock }}
-          pip-audit -r ${{ matrix.full_lock }} --require-hashes --progress-spinner off
+          python -m pip_audit --local --progress-spinner off
       - name: Locked import smoke test
-        run: python -c "import mcp"
+        run: python -c "import cryptography, mcp, tracefence"
+      - name: Verify Windows-only dependency is installed natively
+        if: matrix.platform == 'windows'
+        run: python -c "import win32api"
+      - name: Run native platform tooling tests
+        run: python -m pytest tests/unit/test_lock_platform_selection.py -q

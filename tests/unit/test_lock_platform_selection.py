@@ -9,6 +9,9 @@ def test_linux_platform_selects_linux_full_lock(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(compile_locks.platform, "system", lambda: "Linux")
 
     assert compile_locks.current_lock_platform() == "linux"
+    assert compile_locks.runtime_lock_for_current_platform().as_posix() == (
+        "requirements-lock/runtime-linux.txt"
+    )
     assert compile_locks.full_lock_for_current_platform().as_posix() == (
         "requirements-lock/full-linux.txt"
     )
@@ -19,6 +22,9 @@ def test_windows_platform_selects_windows_full_lock(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(compile_locks.platform, "system", lambda: "Windows")
 
     assert compile_locks.current_lock_platform() == "windows"
+    assert compile_locks.runtime_lock_for_current_platform().as_posix() == (
+        "requirements-lock/runtime-windows.txt"
+    )
     assert compile_locks.full_lock_for_current_platform().as_posix() == (
         "requirements-lock/full-windows.txt"
     )
@@ -38,11 +44,13 @@ def test_cross_platform_lock_request_is_rejected(monkeypatch: pytest.MonkeyPatch
         compile_locks.main(["--platform", "windows", "--print-full-lock"])
 
 
-def test_lock_compiler_uses_lf_and_never_selects_ambiguous_full_lock() -> None:
+def test_lock_compiler_never_selects_ambiguous_platform_locks() -> None:
     compiler = compile_locks.ROOT / "scripts" / "compile_locks.py"
     source = compiler.read_text(encoding="utf-8")
 
-    assert "--newline=LF" in source
+    assert "requirements-lock/runtime.txt" not in source
     assert "requirements-lock/full.txt" not in source
+    assert compile_locks.runtime_lock_for_platform("linux").name == "runtime-linux.txt"
+    assert compile_locks.runtime_lock_for_platform("windows").name == "runtime-windows.txt"
     assert compile_locks.full_lock_for_platform("linux").name == "full-linux.txt"
     assert compile_locks.full_lock_for_platform("windows").name == "full-windows.txt"

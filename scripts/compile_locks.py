@@ -22,11 +22,6 @@ COMPILER_PIP_TOOLS = "pip-tools==7.6.0"
 ROOT = Path(__file__).resolve().parents[1]
 SHARED_LOCK_SPECS = (
     (
-        "requirements-lock/runtime.txt",
-        ("requirements.txt",),
-        (),
-    ),
-    (
         "requirements-lock/development.txt",
         ("requirements-dev.txt",),
         ("--allow-unsafe",),
@@ -52,10 +47,23 @@ def current_lock_platform() -> str:
     )
 
 
+def platform_lock_for_platform(kind: str, lock_platform: str) -> Path:
+    """Return a platform-qualified lock; never cross-resolve it."""
+    if kind not in {"runtime", "full"} or lock_platform not in {"linux", "windows"}:
+        raise ValueError(f"Unsupported TraceFence lock selection: {kind!r}/{lock_platform!r}")
+    return Path("requirements-lock") / f"{kind}-{lock_platform}.txt"
+
+
+def runtime_lock_for_platform(lock_platform: str) -> Path:
+    return platform_lock_for_platform("runtime", lock_platform)
+
+
 def full_lock_for_platform(lock_platform: str) -> Path:
-    if lock_platform not in {"linux", "windows"}:
-        raise ValueError(f"Unsupported TraceFence lock platform: {lock_platform!r}")
-    return Path("requirements-lock") / f"full-{lock_platform}.txt"
+    return platform_lock_for_platform("full", lock_platform)
+
+
+def runtime_lock_for_current_platform() -> Path:
+    return runtime_lock_for_platform(current_lock_platform())
 
 
 def full_lock_for_current_platform() -> Path:
@@ -99,12 +107,14 @@ def _run(arguments: Sequence[str]) -> None:
 
 def main(arguments: Sequence[str] | None = None) -> int:
     arguments = _arguments(arguments)
+    runtime_lock = runtime_lock_for_current_platform()
     full_lock = full_lock_for_current_platform()
     if arguments.print_full_lock:
         print(full_lock.as_posix())
         return 0
 
     lock_specs = (
+        (runtime_lock.as_posix(), ("requirements.txt",), ()),
         *SHARED_LOCK_SPECS,
         (full_lock.as_posix(), ("requirements-full.txt",), ()),
     )
