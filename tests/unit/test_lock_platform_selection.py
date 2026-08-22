@@ -54,3 +54,25 @@ def test_lock_compiler_never_selects_ambiguous_platform_locks() -> None:
     assert compile_locks.runtime_lock_for_platform("windows").name == "runtime-windows.txt"
     assert compile_locks.full_lock_for_platform("linux").name == "full-linux.txt"
     assert compile_locks.full_lock_for_platform("windows").name == "full-windows.txt"
+
+
+def test_windows_bootstrap_workflow_preserves_evidence_before_failure() -> None:
+    workflow = (
+        compile_locks.ROOT / ".github" / "workflows" / "lock-reproducibility.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "git diff --quiet" not in workflow
+    assert "git diff --exit-code" not in workflow
+    assert "git diff --name-only -- $paths" in workflow
+    assert 'steps.first_regeneration.outputs.changed == \'true\'' in workflow
+    assert "actions/upload-artifact@v4" in workflow
+    assert "windows-lock-sha256.txt" in workflow
+    assert "Fail after preserving Windows bootstrap evidence" in workflow
+    assert workflow.index("Upload Windows bootstrap evidence before failure") < workflow.index(
+        "Fail after preserving Windows bootstrap evidence"
+    )
+    assert workflow.index("Fail after preserving Windows bootstrap evidence") < workflow.index(
+        "Regenerate native locks in a second fresh compiler environment"
+    )
+    assert workflow.count("python scripts/compile_locks.py --platform") == 2
+    assert "git diff --name-only failed with exit code $LASTEXITCODE" in workflow

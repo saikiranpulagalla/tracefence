@@ -33,11 +33,24 @@ jobs:
         id: first_regeneration
         shell: pwsh
         run: |
-          git diff -- requirements-lock | Out-File -FilePath native-lock-diff.txt -Encoding utf8NoBOM
-          if (git diff --quiet -- requirements-lock) {
-            "changed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8NoBOM
-          } else {
-            "changed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8NoBOM
+          $paths = @(
+            "requirements-lock/runtime-${{ matrix.platform }}.txt",
+            "requirements-lock/development.txt",
+            "requirements-lock/build.txt",
+            "requirements-lock/full-${{ matrix.platform }}.txt"
+          )
+          $changedFiles = @(git diff --name-only -- $paths)
+          if ($LASTEXITCODE -ne 0) {
+            throw "git diff --name-only failed with exit code $LASTEXITCODE"
+          }
+          $hasDiff = $changedFiles.Count -gt 0
+          "changed=$($hasDiff.ToString().ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8NoBOM
+          if ($hasDiff) {
+            git diff -- $paths | Out-File -FilePath windows-lock-diff.txt -Encoding utf8NoBOM
+            if ($LASTEXITCODE -ne 0) {
+              throw "git diff failed with exit code $LASTEXITCODE"
+            }
           }
       - name: Preserve Windows native bootstrap evidence
         if: matrix.platform == 'windows' && steps.first_regeneration.outputs.changed == 'true'
@@ -45,16 +58,20 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path native-lock-evidence/requirements-lock | Out-Null
           $locks = @(
-            "requirements-lock/runtime-${{ matrix.platform }}.txt",
+            "requirements-lock/runtime-windows.txt",
             "requirements-lock/development.txt",
             "requirements-lock/build.txt",
-            "requirements-lock/full-${{ matrix.platform }}.txt"
+            "requirements-lock/full-windows.txt"
           )
-          Copy-Item -Path $locks -Destination native-lock-evidence/requirements-lock/
-          Copy-Item native-lock-diff.txt native-lock-evidence/
-          Get-FileHash -Algorithm SHA256 -Path $locks |
-            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), $_.Path } |
-            Set-Content -Path native-lock-evidence/sha256.txt -Encoding utf8NoBOM
+          foreach ($lock in $locks) {
+            Copy-Item -LiteralPath $lock -Destination (Join-Path "native-lock-evidence" $lock)
+          }
+          Copy-Item -LiteralPath windows-lock-diff.txt -Destination native-lock-evidence/
+          $manifest = foreach ($lock in $locks) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $lock).Hash.ToLowerInvariant()
+            "$hash  $lock"
+          }
+          $manifest | Set-Content -Path native-lock-evidence/windows-lock-sha256.txt -Encoding utf8NoBOM
       - name: Upload Windows bootstrap evidence before failure
         if: matrix.platform == 'windows' && steps.first_regeneration.outputs.changed == 'true'
         uses: actions/upload-artifact@v4
@@ -62,12 +79,29 @@ jobs:
           name: windows-lock-bootstrap-${{ github.sha }}
           path: native-lock-evidence
           if-no-files-found: error
-      - name: Require first native regeneration to match committed locks
-        run: git diff --exit-code -- requirements-lock
+      - name: Fail after preserving Windows bootstrap evidence
+        if: matrix.platform == 'windows' && steps.first_regeneration.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          Write-Error "Native Windows generated locks differ from committed bootstrap candidates; evidence was uploaded for review."
+          exit 1
       - name: Regenerate native locks in a second fresh compiler environment
+        shell: pwsh
         run: |
           python scripts/compile_locks.py --platform ${{ matrix.platform }}
-          git diff --exit-code -- requirements-lock
+          $paths = @(
+            "requirements-lock/runtime-${{ matrix.platform }}.txt",
+            "requirements-lock/development.txt",
+            "requirements-lock/build.txt",
+            "requirements-lock/full-${{ matrix.platform }}.txt"
+          )
+          $changedFiles = @(git diff --name-only -- $paths)
+          if ($LASTEXITCODE -ne 0) {
+            throw "git diff --name-only failed with exit code $LASTEXITCODE"
+          }
+          if ($changedFiles.Count -gt 0) {
+            throw "Second native regeneration differs from committed locks: $($changedFiles -join ', ')"
+          }
       - name: Install and audit native full environment
         shell: pwsh
         run: |
