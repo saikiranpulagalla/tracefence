@@ -26,7 +26,7 @@ jobs:
           node-version: '22'
       - name: Install complete development environment
         run: |
-          python -m pip install --require-hashes -r requirements-lock/development.txt
+          python -m pip install --require-hashes -r requirements-lock/development-linux.txt
           python -m pip install --require-hashes -r requirements-lock/full-linux.txt
           python -m pip install -e . --no-deps
       - name: Compile Python
@@ -68,9 +68,9 @@ jobs:
         run: |
           python -m venv /tmp/tracefence-release-tools
           /tmp/tracefence-release-tools/bin/python -m pip install --require-hashes \
-            -r requirements-lock/development.txt \
+            -r requirements-lock/development-linux.txt \
             -r requirements-lock/full-linux.txt \
-            -r requirements-lock/build.txt
+            -r requirements-lock/build-linux.txt
           /tmp/tracefence-release-tools/bin/python -m pip install -e . --no-deps
           test -x /tmp/tracefence-release-tools/bin/cyclonedx-py
           PATH="/tmp/tracefence-release-tools/bin:$PATH" \

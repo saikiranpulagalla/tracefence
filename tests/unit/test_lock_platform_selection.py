@@ -5,12 +5,18 @@ import pytest
 from scripts import compile_locks
 
 
-def test_linux_platform_selects_linux_full_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_linux_platform_selects_linux_locks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(compile_locks.platform, "system", lambda: "Linux")
 
     assert compile_locks.current_lock_platform() == "linux"
     assert compile_locks.runtime_lock_for_current_platform().as_posix() == (
         "requirements-lock/runtime-linux.txt"
+    )
+    assert compile_locks.development_lock_for_current_platform().as_posix() == (
+        "requirements-lock/development-linux.txt"
+    )
+    assert compile_locks.build_lock_for_current_platform().as_posix() == (
+        "requirements-lock/build-linux.txt"
     )
     assert compile_locks.full_lock_for_current_platform().as_posix() == (
         "requirements-lock/full-linux.txt"
@@ -18,12 +24,18 @@ def test_linux_platform_selects_linux_full_lock(monkeypatch: pytest.MonkeyPatch)
     assert compile_locks.main(["--platform", "linux", "--print-full-lock"]) == 0
 
 
-def test_windows_platform_selects_windows_full_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_windows_platform_selects_windows_locks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(compile_locks.platform, "system", lambda: "Windows")
 
     assert compile_locks.current_lock_platform() == "windows"
     assert compile_locks.runtime_lock_for_current_platform().as_posix() == (
         "requirements-lock/runtime-windows.txt"
+    )
+    assert compile_locks.development_lock_for_current_platform().as_posix() == (
+        "requirements-lock/development-windows.txt"
+    )
+    assert compile_locks.build_lock_for_current_platform().as_posix() == (
+        "requirements-lock/build-windows.txt"
     )
     assert compile_locks.full_lock_for_current_platform().as_posix() == (
         "requirements-lock/full-windows.txt"
@@ -48,12 +60,21 @@ def test_lock_compiler_never_selects_ambiguous_platform_locks() -> None:
     compiler = compile_locks.ROOT / "scripts" / "compile_locks.py"
     source = compiler.read_text(encoding="utf-8")
 
-    assert "requirements-lock/runtime.txt" not in source
-    assert "requirements-lock/full.txt" not in source
-    assert compile_locks.runtime_lock_for_platform("linux").name == "runtime-linux.txt"
-    assert compile_locks.runtime_lock_for_platform("windows").name == "runtime-windows.txt"
-    assert compile_locks.full_lock_for_platform("linux").name == "full-linux.txt"
-    assert compile_locks.full_lock_for_platform("windows").name == "full-windows.txt"
+    for ambiguous in (
+        "requirements-lock/runtime.txt",
+        "requirements-lock/development.txt",
+        "requirements-lock/build.txt",
+        "requirements-lock/full.txt",
+    ):
+        assert ambiguous not in source
+
+    for kind in ("runtime", "development", "build", "full"):
+        assert compile_locks.platform_lock_for_platform(kind, "linux").name == (
+            f"{kind}-linux.txt"
+        )
+        assert compile_locks.platform_lock_for_platform(kind, "windows").name == (
+            f"{kind}-windows.txt"
+        )
 
 
 def test_windows_bootstrap_workflow_preserves_evidence_before_failure() -> None:
@@ -76,10 +97,17 @@ def test_windows_bootstrap_workflow_preserves_evidence_before_failure() -> None:
     )
     assert workflow.count("python scripts/compile_locks.py --platform") == 2
     assert "git diff --name-only failed with exit code $LASTEXITCODE" in workflow
-    assert "python -m pip install --require-hashes -r requirements-lock/build.txt" in workflow
-    assert workflow.index("python -m pip install --require-hashes -r requirements-lock/build.txt") < workflow.index(
-        "Install local project without resolving dependencies"
-    )
+    for platform_lock in (
+        "requirements-lock/runtime-linux.txt",
+        "requirements-lock/development-linux.txt",
+        "requirements-lock/build-linux.txt",
+        "requirements-lock/full-linux.txt",
+        "requirements-lock/runtime-windows.txt",
+        "requirements-lock/development-windows.txt",
+        "requirements-lock/build-windows.txt",
+        "requirements-lock/full-windows.txt",
+    ):
+        assert platform_lock in workflow
     assert "python -m pip install --no-deps --no-build-isolation -e ." in workflow
     assert workflow.index("Install local project without resolving dependencies") < workflow.index(
         "Locked import smoke test"

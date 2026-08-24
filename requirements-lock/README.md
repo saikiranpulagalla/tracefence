@@ -3,33 +3,32 @@
 These lock files are generated with `pip-compile --generate-hashes` on CPython
 3.12. Install them with `pip install --require-hashes -r <file>`.
 
-## Shared locks
+## Native platform locks
 
-`development.txt` and `build.txt` are shared locks. They must reproduce
-byte-for-byte on each supported native target: Linux/WSL and Windows.
+Every compiled lock family is platform-specific:
 
-`runtime-linux.txt` and `runtime-windows.txt` are generated from the same
-`requirements.txt` input, but each is compiled on its native target.
+- `runtime-linux.txt` and `runtime-windows.txt` derive from
+  `requirements.txt`.
+- `development-linux.txt` and `development-windows.txt` derive from
+  `requirements-dev.txt`.
+- `build-linux.txt` and `build-windows.txt` derive from
+  `requirements-build.in`.
+- `full-linux.txt` and `full-windows.txt` derive from
+  `requirements-full.txt`.
 
-## Platform runtime and full locks
-
-`full-linux.txt` and `full-windows.txt` are both generated from
-`requirements-full.txt`, but each must be compiled on its native target.
-Linux/WSL must not regenerate the Windows graph, and Windows must not
-regenerate the Linux graph.
-
-The current `full-windows.txt` is a bootstrap candidate inherited from the
-former full lock. Native Windows CI must regenerate and certify it before it
-is treated as a certified Windows lock.
+Linux/WSL must not regenerate a Windows graph, and Windows must not regenerate
+a Linux graph. No compiled lock is assumed portable across those targets.
+The initial Windows development and build files preserve verified native dependency
+graphs as bootstrap candidates; their platform-qualified generated headers require
+one native Windows recertification pass.
 
 ## Toolchains
 
 Lock compilation uses released `pip-tools==7.6.0` with
 `pip==26.1.2` in a disposable compiler environment. Security certification
-uses the separate, secure environment with `pip==26.2.1`.
+uses a separate environment with `pip==26.2.1`.
 
-For each supported target E, two fresh native compiler environments must
-produce the committed runtime and full locks for E byte-for-byte. Shared
-development and build locks must reproduce on both targets. Each target full
-lock must be audited on its native target; a Linux audit does not certify
-Windows-only dependencies.
+For each lock family F and supported native target E, two fresh compiler
+environments must produce `lock(F, E)` byte-for-byte. Linux/WSL and Windows
+audit their effective native lock sets separately; one target's audit does not
+certify target-specific dependencies on the other.
