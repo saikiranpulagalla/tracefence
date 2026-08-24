@@ -76,3 +76,11 @@ def test_windows_bootstrap_workflow_preserves_evidence_before_failure() -> None:
     )
     assert workflow.count("python scripts/compile_locks.py --platform") == 2
     assert "git diff --name-only failed with exit code $LASTEXITCODE" in workflow
+    assert "python -m pip install --require-hashes -r requirements-lock/build.txt" in workflow
+    assert workflow.index("python -m pip install --require-hashes -r requirements-lock/build.txt") < workflow.index(
+        "Install local project without resolving dependencies"
+    )
+    assert "python -m pip install --no-deps --no-build-isolation -e ." in workflow
+    assert workflow.index("Install local project without resolving dependencies") < workflow.index(
+        "Locked import smoke test"
+    )
