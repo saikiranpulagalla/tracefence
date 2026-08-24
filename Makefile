@@ -2,6 +2,7 @@ PYTHON ?= python
 API_URL ?= http://127.0.0.1:9000
 EXPECTED_COMMIT ?= $(shell git rev-parse HEAD)
 EVIDENCE_MAX_AGE_SECONDS ?= 900
+FULL_LOCK ?= $(shell $(PYTHON) scripts/compile_locks.py --print-full-lock)
 
 .PHONY: help install install-core install-dev install-full test audit locks release-artifacts api demo demo-test scenario verify reset signoz provision-signoz verify-signoz verify-all clean
 
@@ -54,8 +55,8 @@ release-artifacts:
 	mkdir -p reports
 	$(PYTHON) scripts/lock_casting.py
 	$(PYTHON) scripts/secret_scan.py --output reports/secret-scan.json
-	cyclonedx-py requirements requirements-lock/full-linux.txt --pyproject pyproject.toml --output-reproducible --output-format JSON --output-file reports/sbom.cdx.json --validate
-	pip-audit -r requirements-lock/full-linux.txt --require-hashes --progress-spinner off --format json --output reports/dependency-audit.json
+	cyclonedx-py requirements $(FULL_LOCK) --pyproject pyproject.toml --output-reproducible --output-format JSON --output-file reports/sbom.cdx.json --validate
+	pip-audit -r $(FULL_LOCK) --require-hashes --progress-spinner off --format json --output reports/dependency-audit.json
 
 api:
 	PYTHONPATH=src $(PYTHON) -m uvicorn tracefence.api.main:app --host 127.0.0.1 --port 9000

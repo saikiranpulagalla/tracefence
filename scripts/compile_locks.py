@@ -20,18 +20,13 @@ from pathlib import Path
 COMPILER_PIP = "pip==26.1.2"
 COMPILER_PIP_TOOLS = "pip-tools==7.6.0"
 ROOT = Path(__file__).resolve().parents[1]
-SHARED_LOCK_SPECS = (
-    (
-        "requirements-lock/development.txt",
-        ("requirements-dev.txt",),
-        ("--allow-unsafe",),
-    ),
-    (
-        "requirements-lock/build.txt",
-        ("requirements-build.in",),
-        ("--allow-unsafe",),
-    ),
-)
+LOCK_INPUTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "runtime": (("requirements.txt",), ()),
+    "development": (("requirements-dev.txt",), ("--allow-unsafe",)),
+    "build": (("requirements-build.in",), ("--allow-unsafe",)),
+    "full": (("requirements-full.txt",), ()),
+}
+LOCK_KINDS = tuple(LOCK_INPUTS)
 
 
 def current_lock_platform() -> str:
@@ -49,7 +44,7 @@ def current_lock_platform() -> str:
 
 def platform_lock_for_platform(kind: str, lock_platform: str) -> Path:
     """Return a platform-qualified lock; never cross-resolve it."""
-    if kind not in {"runtime", "full"} or lock_platform not in {"linux", "windows"}:
+    if kind not in LOCK_KINDS or lock_platform not in {"linux", "windows"}:
         raise ValueError(f"Unsupported TraceFence lock selection: {kind!r}/{lock_platform!r}")
     return Path("requirements-lock") / f"{kind}-{lock_platform}.txt"
 
@@ -58,12 +53,28 @@ def runtime_lock_for_platform(lock_platform: str) -> Path:
     return platform_lock_for_platform("runtime", lock_platform)
 
 
+def development_lock_for_platform(lock_platform: str) -> Path:
+    return platform_lock_for_platform("development", lock_platform)
+
+
+def build_lock_for_platform(lock_platform: str) -> Path:
+    return platform_lock_for_platform("build", lock_platform)
+
+
 def full_lock_for_platform(lock_platform: str) -> Path:
     return platform_lock_for_platform("full", lock_platform)
 
 
 def runtime_lock_for_current_platform() -> Path:
     return runtime_lock_for_platform(current_lock_platform())
+
+
+def development_lock_for_current_platform() -> Path:
+    return development_lock_for_platform(current_lock_platform())
+
+
+def build_lock_for_current_platform() -> Path:
+    return build_lock_for_platform(current_lock_platform())
 
 
 def full_lock_for_current_platform() -> Path:
@@ -107,16 +118,18 @@ def _run(arguments: Sequence[str]) -> None:
 
 def main(arguments: Sequence[str] | None = None) -> int:
     arguments = _arguments(arguments)
-    runtime_lock = runtime_lock_for_current_platform()
-    full_lock = full_lock_for_current_platform()
+    lock_platform = current_lock_platform()
     if arguments.print_full_lock:
-        print(full_lock.as_posix())
+        print(full_lock_for_platform(lock_platform).as_posix())
         return 0
 
-    lock_specs = (
-        (runtime_lock.as_posix(), ("requirements.txt",), ()),
-        *SHARED_LOCK_SPECS,
-        (full_lock.as_posix(), ("requirements-full.txt",), ()),
+    lock_specs = tuple(
+        (
+            platform_lock_for_platform(kind, lock_platform).as_posix(),
+            inputs,
+            extra_arguments,
+        )
+        for kind, (inputs, extra_arguments) in LOCK_INPUTS.items()
     )
     (ROOT / "requirements-lock").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="tracefence-lock-compiler-") as temporary:

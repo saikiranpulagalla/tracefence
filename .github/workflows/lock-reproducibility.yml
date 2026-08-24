@@ -16,10 +16,14 @@ jobs:
           - runner: ubuntu-latest
             platform: linux
             runtime_lock: requirements-lock/runtime-linux.txt
+            development_lock: requirements-lock/development-linux.txt
+            build_lock: requirements-lock/build-linux.txt
             full_lock: requirements-lock/full-linux.txt
           - runner: windows-latest
             platform: windows
             runtime_lock: requirements-lock/runtime-windows.txt
+            development_lock: requirements-lock/development-windows.txt
+            build_lock: requirements-lock/build-windows.txt
             full_lock: requirements-lock/full-windows.txt
     runs-on: ${{ matrix.runner }}
     steps:
@@ -34,10 +38,10 @@ jobs:
         shell: pwsh
         run: |
           $paths = @(
-            "requirements-lock/runtime-${{ matrix.platform }}.txt",
-            "requirements-lock/development.txt",
-            "requirements-lock/build.txt",
-            "requirements-lock/full-${{ matrix.platform }}.txt"
+            "${{ matrix.runtime_lock }}",
+            "${{ matrix.development_lock }}",
+            "${{ matrix.build_lock }}",
+            "${{ matrix.full_lock }}"
           )
           $changedFiles = @(git diff --name-only -- $paths)
           if ($LASTEXITCODE -ne 0) {
@@ -58,10 +62,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path native-lock-evidence/requirements-lock | Out-Null
           $locks = @(
-            "requirements-lock/runtime-windows.txt",
-            "requirements-lock/development.txt",
-            "requirements-lock/build.txt",
-            "requirements-lock/full-windows.txt"
+            "${{ matrix.runtime_lock }}",
+            "${{ matrix.development_lock }}",
+            "${{ matrix.build_lock }}",
+            "${{ matrix.full_lock }}"
           )
           foreach ($lock in $locks) {
             Copy-Item -LiteralPath $lock -Destination (Join-Path "native-lock-evidence" $lock)
@@ -90,10 +94,10 @@ jobs:
         run: |
           python scripts/compile_locks.py --platform ${{ matrix.platform }}
           $paths = @(
-            "requirements-lock/runtime-${{ matrix.platform }}.txt",
-            "requirements-lock/development.txt",
-            "requirements-lock/build.txt",
-            "requirements-lock/full-${{ matrix.platform }}.txt"
+            "${{ matrix.runtime_lock }}",
+            "${{ matrix.development_lock }}",
+            "${{ matrix.build_lock }}",
+            "${{ matrix.full_lock }}"
           )
           $changedFiles = @(git diff --name-only -- $paths)
           if ($LASTEXITCODE -ne 0) {
@@ -106,8 +110,8 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip==26.2.1
-          python -m pip install --require-hashes -r requirements-lock/development.txt -r ${{ matrix.full_lock }}
-          python -m pip install --require-hashes -r requirements-lock/build.txt
+          python -m pip install --require-hashes -r ${{ matrix.development_lock }} -r ${{ matrix.full_lock }}
+          python -m pip install --require-hashes -r ${{ matrix.build_lock }}
           python -m pip_audit --local --progress-spinner off
       - name: Install local project without resolving dependencies
         run: python -m pip install --no-deps --no-build-isolation -e .
