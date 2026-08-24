@@ -127,9 +127,15 @@ def test_public_verdict_documentation_matches_canonical_lattice() -> None:
 def test_cyclonedx_cli_is_declared_and_hash_locked_for_release_artifacts() -> None:
     root = Path(__file__).resolve().parents[2]
     build_input = (root / "requirements-build.in").read_text(encoding="utf-8")
-    build_lock = (root / "requirements-lock" / "build.txt").read_text(
-        encoding="utf-8"
-    )
 
     assert "cyclonedx-bom==7.3.1" in build_input
-    assert "cyclonedx-bom==7.3.1" in build_lock
+
+    for build_lock_name in ("build-linux.txt", "build-windows.txt"):
+        build_lock = (root / "requirements-lock" / build_lock_name).read_text(
+            encoding="utf-8"
+        )
+        _before, requirement, remainder = build_lock.partition("cyclonedx-bom==7.3.1")
+
+        assert requirement == "cyclonedx-bom==7.3.1"
+        cyclonedx_stanza = requirement + remainder.split("\n# via", maxsplit=1)[0]
+        assert "--hash=sha256:" in cyclonedx_stanza
