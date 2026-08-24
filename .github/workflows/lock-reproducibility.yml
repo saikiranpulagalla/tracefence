@@ -107,7 +107,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip==26.2.1
           python -m pip install --require-hashes -r requirements-lock/development.txt -r ${{ matrix.full_lock }}
+          python -m pip install --require-hashes -r requirements-lock/build.txt
           python -m pip_audit --local --progress-spinner off
+      - name: Install local project without resolving dependencies
+        run: python -m pip install --no-deps --no-build-isolation -e .
       - name: Locked import smoke test
         run: python -c "import cryptography, mcp, tracefence"
       - name: Verify Windows-only dependency is installed natively
