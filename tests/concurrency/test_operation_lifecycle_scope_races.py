@@ -10,15 +10,61 @@ from sqlalchemy import select
 from tests.concurrency.test_operation_lifecycle_races import (
     REPETITIONS,
     _accept,
-    _cancel,
-    _dispatched,
     _human,
     _pause_cancellation,
     _pause_result,
     _wait,
 )
-from tracefence.db.models import ActionAuthorityBinding, ControlScope, Run
+from tests.helpers import create_v2_run
+from tracefence.db.models import ActionAuthorityBinding, ControlScope, Node, Run, WorkerInstance
+from tracefence.domain.enums import CommandType
+from tracefence.domain.schemas import ActionExecute, CommandCreate, NodeActivate, SpawnCreate
 from tracefence.services.control_service import ControlService
+from tracefence.services.operation_lifecycle import OperationLifecycleService
+from tracefence.services.spawn_service import SpawnService
+
+
+def _cancel(node_id: str, key: str) -> CommandCreate:
+    return CommandCreate(
+        idempotency_key=key,
+        command_type=CommandType.CANCEL_SUBTREE,
+        target_node_id=node_id,
+        reason_code="TEST",
+        reason_text="deterministic bound-scope version transition",
+    )
+
+
+async def _dispatched(session_factory, name: str):
+    run = await create_v2_run(session_factory, name)
+    spawns = SpawnService(session_factory)
+    created = await spawns.create_spawn(
+        run.root_node_id,
+        run.root_token,
+        SpawnCreate(role="operation-scope-race", capabilities=["tool:restart_postgres"]),
+    )
+    activated = await spawns.activate(
+        created.child_node_id,
+        NodeActivate(activation_token=created.activation_token),
+    )
+    lifecycle = OperationLifecycleService(session_factory)
+    action = await lifecycle.reserve(
+        node_id=created.child_node_id,
+        credential=activated.node_token,
+        request=ActionExecute(
+            idempotency_key=f"{name}-action", tool_name="restart_postgres", arguments={}
+        ),
+    )
+    with session_factory() as session:
+        node = session.get(Node, created.child_node_id)
+        assert node is not None and node.current_worker_instance_id is not None
+        worker = session.get(WorkerInstance, node.current_worker_instance_id)
+        assert worker is not None
+    lifecycle.mark_dispatched(
+        action_id=action.id,
+        worker_instance_id=worker.id,
+        worker_incarnation=worker.incarnation,
+    )
+    return run, lifecycle, action, worker
 
 
 @pytest.mark.parametrize("iteration", REPETITIONS)
@@ -34,7 +80,7 @@ async def test_result_before_scope_change_remains_authoritative(
     def cancel_scope():
         return asyncio.run(
             ControlService(session_factory).issue_command(
-                _cancel(run.root_node_id, f"d1-cancel-{iteration}"), _human(f"d1-{iteration}")
+                _cancel(worker.node_id, f"d1-cancel-{iteration}"), _human(f"d1-{iteration}")
             )
         )
 
@@ -69,7 +115,7 @@ async def test_scope_change_before_result_is_stale(session_factory, monkeypatch,
     def cancel_scope():
         return asyncio.run(
             ControlService(session_factory).issue_command(
-                _cancel(run.root_node_id, f"d2-cancel-{iteration}"), _human(f"d2-{iteration}")
+                _cancel(worker.node_id, f"d2-cancel-{iteration}"), _human(f"d2-{iteration}")
             )
         )
 
