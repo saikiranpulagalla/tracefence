@@ -103,8 +103,13 @@ async def test_scope_change_before_result_is_stale(session_factory, monkeypatch,
         session_factory, f"operation-race-d2-{iteration}"
     )
     with session_factory() as session:
+        node = session.get(Node, worker.node_id)
+        assert node is not None
         binding = session.scalar(
-            select(ActionAuthorityBinding).where(ActionAuthorityBinding.action_id == action.id)
+            select(ActionAuthorityBinding).where(
+                ActionAuthorityBinding.action_id == action.id,
+                ActionAuthorityBinding.scope_id == node.own_scope_id,
+            )
         )
         assert binding is not None
         bound_version = binding.bound_version
