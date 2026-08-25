@@ -67,6 +67,20 @@ def upgrade() -> None:
                 "fk_action_bound_worker", "worker_instances", ["worker_instance_id"], ["id"], ondelete="RESTRICT"
             )
             batch.create_index("ix_actions_worker_state", ["worker_instance_id", "execution_state"], unique=False)
+    # Alembic batch recreation drops triggers attached to action_attempts.
+    # Restore the database-owned proof-revision triggers introduced before v24;
+    # lifecycle facts then continue to have exactly one revision owner.
+    for operation, row in (("insert", "NEW"), ("update", "NEW"), ("delete", "OLD")):
+        connection.exec_driver_sql(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS trg_action_attempts_{operation}_proof_revision
+            AFTER {operation.upper()} ON action_attempts
+            BEGIN
+                UPDATE runs SET proof_revision = proof_revision + 1
+                WHERE id = {row}.run_id;
+            END
+            """
+        )
     if "action_authority_bindings" not in set(inspect(connection).get_table_names()):
         connection.exec_driver_sql(V24_ACTION_AUTHORITY_BINDING_DDL)
         for index_ddl in V24_ACTION_AUTHORITY_BINDING_INDEX_DDL:
