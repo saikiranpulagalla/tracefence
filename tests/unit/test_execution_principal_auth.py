@@ -7,7 +7,7 @@ from sqlalchemy import text
 
 from tests.helpers import create_seeded_run
 from tracefence.db.models import Node, Run, WorkerInstance
-from tracefence.domain.errors import AuthenticationError
+from tracefence.domain.errors import AuthenticationError, ConflictError
 from tracefence.domain.schemas import ActionExecute
 from tracefence.security import hash_token
 from tracefence.services.action_gateway import ActionGateway
@@ -119,8 +119,9 @@ async def test_v2_action_authenticates_before_node_scoped_replay(session_factory
     await _switch_current_worker(session_factory, run.run_id, run.root_node_id, second)
     with pytest.raises(AuthenticationError):
         await gateway.execute(run.root_node_id, first, request)
-    replay = await gateway.execute(run.root_node_id, second, request)
-    assert replay.duplicate is True
+    with pytest.raises(ConflictError) as owner_error:
+        await gateway.execute(run.root_node_id, second, request)
+    assert owner_error.value.code == "IDEMPOTENCY_OWNER_MISMATCH"
 
     current_request = ActionExecute(
         tool_name="read_metrics",
