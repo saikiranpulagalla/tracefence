@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from tracefence.db.models import ControlCommand, ControlScope, Node, Run, WorkerInstance
 from tracefence.domain.enums import NodeStatus, RunStatus, ScopeStatus
 from tracefence.domain.errors import AuthenticationError, NotFoundError
-from tracefence.security import token_matches
+from tracefence.security import payload_digest, token_matches
 
 
 def utcnow() -> datetime:
@@ -177,6 +177,21 @@ async def evaluate_scopes(session: Session, node: Node) -> ScopeEvaluation:
         mismatches=tuple(mismatches),
         live_scopes=tuple(live_payload),
     )
+
+
+def authority_vector(evaluation: ScopeEvaluation) -> tuple[dict[str, str | int], ...]:
+    """Return canonical positive authority facts in deterministic order."""
+    if not evaluation.allowed:
+        return ()
+    return tuple(
+        {"scope_id": str(item["scope_id"]), "bound_version": int(item["version"])}
+        for item in sorted(evaluation.live_scopes, key=lambda item: str(item["scope_id"]))
+    )
+
+
+def authority_vector_digest(evaluation: ScopeEvaluation) -> str | None:
+    vector = authority_vector(evaluation)
+    return payload_digest({"scopes": vector}) if vector else None
 
 
 async def validate_node_runtime_state(

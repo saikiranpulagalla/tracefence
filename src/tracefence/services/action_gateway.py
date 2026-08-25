@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from tracefence.config import settings
 from tracefence.db.models import (
     ActionAttempt,
+    ActionAuthorityBinding,
     ActionCommandMatch,
     CommandAcknowledgement,
     ControlCommand,
@@ -26,6 +27,8 @@ from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.security import payload_digest
 from tracefence.services.common import (
     authenticate_execution_principal,
+    authority_vector,
+    authority_vector_digest,
     commands_for_scope_mismatches,
     evaluate_scopes,
     get_run,
@@ -60,11 +63,10 @@ class ActionGateway:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
-                node = (
-                    await authenticate_execution_principal(
-                        session, node_id=node_id, credential=node_token
-                    )
-                ).node
+                principal = await authenticate_execution_principal(
+                    session, node_id=node_id, credential=node_token
+                )
+                node = principal.node
 
                 existing = session.execute(
                     select(ActionAttempt).where(
@@ -77,6 +79,16 @@ class ActionGateway:
                         raise ConflictError(
                             "Idempotency key was reused with a different action payload",
                             code="IDEMPOTENCY_PAYLOAD_MISMATCH",
+                        )
+                    if (
+                        principal.protocol_version == 2
+                        and principal.worker_instance is not None
+                        and existing.lifecycle_version == 1
+                        and existing.worker_instance_id != principal.worker_instance.id
+                    ):
+                        raise ConflictError(
+                            "Idempotency key belongs to a different worker incarnation",
+                            code="IDEMPOTENCY_OWNER_MISMATCH",
                         )
                     session.commit()
                     return self._result(existing, duplicate=True)
@@ -225,8 +237,34 @@ class ActionGateway:
                     arguments_json=dict(request.arguments),
                     arguments_digest=payload_digest(request.arguments),
                     attempted_at=utcnow(),
+                    lifecycle_version=1,
+                    execution_state=("DENIED" if denial_reason else "SUCCEEDED"),
+                    worker_instance_id=(
+                        principal.worker_instance.id if principal.worker_instance is not None else None
+                    ),
+                    worker_incarnation=(
+                        principal.worker_instance.incarnation
+                        if principal.worker_instance is not None
+                        else None
+                    ),
+                    authority_vector_digest=(
+                        authority_vector_digest(evaluation) if denial_reason is None else None
+                    ),
+                    authorization_proof_revision=(
+                        run.proof_revision + 1 if denial_reason is None else None
+                    ),
                 )
                 session.add(attempt)
+                if denial_reason is None:
+                    for authority_scope in authority_vector(evaluation):
+                        session.add(
+                            ActionAuthorityBinding(
+                                run_id=node.run_id,
+                                action_id=attempt.id,
+                                scope_id=authority_scope["scope_id"],
+                                bound_version=authority_scope["bound_version"],
+                            )
+                        )
                 record_runtime_event(
                     session,
                     run_id=node.run_id,

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tracefence.config import settings
 from tracefence.db.models import (
+    ActionAttempt,
     CommandAcknowledgement,
     ControlCommand,
     ControlScope,
@@ -742,7 +743,10 @@ class SpawnService:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
-                node = (await authenticate_execution_principal(session, node_id=node_id, credential=node_token)).node
+                principal = await authenticate_execution_principal(
+                    session, node_id=node_id, credential=node_token
+                )
+                node = principal.node
                 authenticated_rate_limiter.check(
                     "heartbeat",
                     f"{node.run_id}:{node.id}",
@@ -753,6 +757,20 @@ class SpawnService:
                         f"Node cannot complete: {reason}",
                         code=reason or "COMPLETE_DENIED",
                     )
+                if principal.worker_instance is not None:
+                    unresolved = session.scalar(
+                        select(ActionAttempt.id).where(
+                            ActionAttempt.worker_instance_id == principal.worker_instance.id,
+                            ActionAttempt.execution_state.in_(
+                                ("AUTHORIZED", "DISPATCHED", "AMBIGUOUS")
+                            ),
+                        ).limit(1)
+                    )
+                    if unresolved is not None:
+                        raise ConflictError(
+                            "Worker cannot complete while owned operations remain unresolved",
+                            code="WORKER_HAS_UNRESOLVED_ACTIONS",
+                        )
 
                 run = session.get(Run, node.run_id)
                 if run is None:
