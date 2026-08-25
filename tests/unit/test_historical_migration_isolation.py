@@ -29,6 +29,7 @@ REVISIONS = (
     ("005_schema_v21_v2_recovery_binding", 21),
     ("006_schema_v22_runtime_stop_causality", 22),
     ("007_schema_v23_worker_stop_tasks", 23),
+    ("008_schema_v24_action_lifecycle", 24),
 )
 
 V17_TABLES = {
@@ -106,6 +107,8 @@ def test_blank_database_has_exact_historical_table_and_column_boundaries(
             expected_tables.update({"runtime_stop_intents", "runtime_stop_targets"})
         if version >= 23:
             expected_tables.add("worker_stop_tasks")
+        if version >= 24:
+            expected_tables.add("action_authority_bindings")
         assert _tables(connection) == expected_tables
 
         run_columns = _columns(connection, "runs")
@@ -152,7 +155,7 @@ def test_blank_database_has_exact_historical_table_and_column_boundaries(
             }
         if version == 22:
             assert "worker_stop_tasks" not in _tables(connection)
-        if version == 23:
+        if version >= 23:
             assert _columns(connection, "worker_stop_tasks") == {
                 "id",
                 "worker_instance_id",
@@ -165,6 +168,11 @@ def test_blank_database_has_exact_historical_table_and_column_boundaries(
                 "created_at",
                 "updated_at",
             }
+        action_columns = _columns(connection, "action_attempts")
+        assert ("lifecycle_version" in action_columns) is (version >= 24)
+        assert ("execution_state" in action_columns) is (version >= 24)
+        assert ("worker_instance_id" in action_columns) is (version >= 24)
+        assert ("action_authority_bindings" in _tables(connection)) is (version >= 24)
     finally:
         connection.close()
 
@@ -185,6 +193,8 @@ def test_historical_trigger_and_index_ownership(
         )
         assert ("trg_runtime_stop_targets_historical_selector" in triggers) is (version >= 22)
         assert ("trg_worker_stop_tasks_state_transition" in triggers) is (version >= 23)
+        assert ("trg_action_attempts_lifecycle_state_transition" in triggers) is (version >= 24)
+        assert ("trg_action_authority_bindings_immutable" in triggers) is (version >= 24)
         assert ("uq_runtime_stop_intent_source_command" in indexes) is (version >= 22)
         assert ("ix_worker_stop_tasks_due" in indexes) is (version >= 23)
     finally:
@@ -198,6 +208,7 @@ def test_historical_trigger_and_index_ownership(
         ("004_schema_v20_execution_protocol_activation", "005_schema_v21_v2_recovery_binding"),
         ("005_schema_v21_v2_recovery_binding", "006_schema_v22_runtime_stop_causality"),
         ("006_schema_v22_runtime_stop_causality", "007_schema_v23_worker_stop_tasks"),
+        ("007_schema_v23_worker_stop_tasks", "008_schema_v24_action_lifecycle"),
     ),
 )
 def test_legacy_current_metadata_contamination_remains_upgradeable(

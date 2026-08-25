@@ -846,12 +846,31 @@ class ActionAttempt(Base):
         UniqueConstraint("run_id", "id", name="uq_action_run_id"),
         CheckConstraint("decision IN ('ALLOW','DENY')", name="ck_action_decision"),
         CheckConstraint(
-            "(decision = 'DENY' AND denial_reason IS NOT NULL "
+            "(lifecycle_version = 0 AND ((decision = 'DENY' AND denial_reason IS NOT NULL "
             "AND committed_at IS NULL AND result_json IS NULL AND result_digest IS NULL) OR "
             "(decision = 'ALLOW' AND denial_reason IS NULL AND committed_at IS NOT NULL "
-            "AND result_json IS NOT NULL AND result_digest IS NOT NULL)",
+            "AND result_json IS NOT NULL AND result_digest IS NOT NULL))) OR "
+            "(lifecycle_version = 1 AND ((decision = 'DENY' AND execution_state = 'DENIED' "
+            "AND denial_reason IS NOT NULL AND committed_at IS NULL AND result_json IS NULL "
+            "AND result_digest IS NULL AND stale_result_digest IS NULL AND stale_reason_code IS NULL) OR "
+            "(decision = 'ALLOW' AND denial_reason IS NULL AND execution_state IN ('AUTHORIZED','DISPATCHED','AMBIGUOUS') "
+            "AND committed_at IS NULL AND result_json IS NULL AND result_digest IS NULL "
+            "AND stale_result_digest IS NULL AND stale_reason_code IS NULL) OR "
+            "(decision = 'ALLOW' AND denial_reason IS NULL AND execution_state IN ('SUCCEEDED','FAILED') "
+            "AND committed_at IS NOT NULL AND result_json IS NOT NULL AND result_digest IS NOT NULL "
+            "AND stale_result_digest IS NULL AND stale_reason_code IS NULL) OR "
+            "(decision = 'ALLOW' AND denial_reason IS NULL AND execution_state = 'STALE' "
+            "AND committed_at IS NULL AND result_json IS NULL AND result_digest IS NULL "
+            "AND stale_result_digest IS NOT NULL AND stale_reason_code IS NOT NULL AND stale_observed_at IS NOT NULL)))",
             name="ck_action_result_shape",
         ),
+        CheckConstraint("lifecycle_version IN (0, 1)", name="ck_action_lifecycle_version"),
+        CheckConstraint(
+            "execution_state IS NULL OR execution_state IN "
+            "('DENIED','AUTHORIZED','DISPATCHED','SUCCEEDED','FAILED','STALE','AMBIGUOUS')",
+            name="ck_action_execution_state",
+        ),
+        ForeignKeyConstraint(["worker_instance_id"], ["worker_instances.id"], name="fk_action_bound_worker"),
         CheckConstraint(
             "(matched_command_id IS NULL AND matched_scope_id IS NULL "
             "AND matched_snapshot_version IS NULL AND matched_live_version IS NULL "
@@ -864,6 +883,7 @@ class ActionAttempt(Base):
         Index("ix_actions_run", "run_id"),
         Index("ix_actions_node", "node_id"),
         Index("ix_actions_command", "matched_command_id"),
+        Index("ix_actions_worker_state", "worker_instance_id", "execution_state"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -892,6 +912,31 @@ class ActionAttempt(Base):
     result_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     attempted_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     committed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    lifecycle_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    execution_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    worker_instance_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    worker_incarnation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    authority_vector_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    authorization_proof_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    stale_result_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    stale_reason_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    stale_observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ActionAuthorityBinding(Base):
+    __tablename__ = "action_authority_bindings"
+    __table_args__ = (
+        PrimaryKeyConstraint("action_id", "scope_id", name="pk_action_authority_binding"),
+        ForeignKeyConstraint(["run_id", "action_id"], ["action_attempts.run_id", "action_attempts.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["run_id", "scope_id"], ["control_scopes.run_id", "control_scopes.id"], ondelete="RESTRICT"),
+        CheckConstraint("bound_version >= 1", name="ck_action_authority_binding_version"),
+        Index("ix_action_authority_bindings_scope", "scope_id"),
+    )
+    run_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    action_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    scope_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    bound_version: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class ActionCommandMatch(Base):
