@@ -7,10 +7,12 @@ network or process-control tool.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, cast
 from uuid import uuid4
 
 from sqlalchemy import select, text
+from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from tracefence.db.models import ActionAttempt, ActionAuthorityBinding, Node, WorkerInstance
@@ -32,6 +34,188 @@ class ResultAcceptance:
     action: ActionAttempt
     accepted: bool
     stale_reason: str | None = None
+
+
+class OperationAuthorityStatus(StrEnum):
+    """The live authority state of an already-bound lifecycle operation."""
+
+    ALLOWED = "ALLOWED"
+    REVOKED = "REVOKED"
+    UNCERTAIN = "UNCERTAIN"
+
+
+@dataclass(frozen=True, slots=True)
+class OperationAuthorityDecision:
+    """Non-persistent authority decision for one exact evaluation point."""
+
+    status: OperationAuthorityStatus
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OperationCancellationContext:
+    """Read-only cooperative authority observer for one lifecycle action.
+
+    The context stores immutable expected identity only. Every checkpoint
+    opens a fresh read session and re-evaluates durable authority; it never
+    caches an ALLOWED decision or records a cancellation fact.
+    """
+
+    session_factory: sessionmaker
+    action_id: str
+    run_id: str
+    node_id: str
+    worker_instance_id: str
+    worker_incarnation: int
+
+    @classmethod
+    def from_action(
+        cls, session_factory: sessionmaker, action: ActionAttempt
+    ) -> OperationCancellationContext:
+        if (
+            action.lifecycle_version != 1
+            or action.worker_instance_id is None
+            or action.worker_incarnation is None
+        ):
+            raise ValueError("Operation cancellation requires a bound lifecycle action")
+        return cls(
+            session_factory=session_factory,
+            action_id=action.id,
+            run_id=action.run_id,
+            node_id=action.node_id,
+            worker_instance_id=action.worker_instance_id,
+            worker_incarnation=action.worker_incarnation,
+        )
+
+    async def check(self) -> OperationAuthorityDecision:
+        """Return a fresh, read-only authority decision.
+
+        SQLAlchemy uses synchronous I/O in this repository's service layer;
+        callers run that layer through the established blocking-service
+        boundary. This method stays async to share the existing canonical
+        runtime-state evaluator without introducing a second evaluator.
+        """
+        try:
+            with self.session_factory() as session:
+                action = session.get(ActionAttempt, self.action_id)
+                if action is None:
+                    return _uncertain("OPERATION_BINDING_INVALID")
+                return await evaluate_live_bound_action_authority(
+                    session,
+                    action,
+                    expected_run_id=self.run_id,
+                    expected_node_id=self.node_id,
+                    expected_worker_instance_id=self.worker_instance_id,
+                    expected_worker_incarnation=self.worker_incarnation,
+                )
+        except (OperationalError, DisconnectionError, InterfaceError):
+            return _uncertain()
+
+
+def _allowed() -> OperationAuthorityDecision:
+    return OperationAuthorityDecision(OperationAuthorityStatus.ALLOWED)
+
+
+def _revoked(reason_code: str) -> OperationAuthorityDecision:
+    return OperationAuthorityDecision(OperationAuthorityStatus.REVOKED, reason_code)
+async def evaluate_live_bound_action_authority(
+    session: Session,
+    action: ActionAttempt,
+    *,
+    expected_run_id: str | None = None,
+    expected_node_id: str | None = None,
+    expected_worker_instance_id: str | None = None,
+    expected_worker_incarnation: int | None = None,
+) -> OperationAuthorityDecision:
+    """Return one structured live-authority decision for a bound action."""
+    try:
+        return await _evaluate_live_bound_action_authority(
+            session,
+            action,
+            expected_run_id=expected_run_id,
+            expected_node_id=expected_node_id,
+            expected_worker_instance_id=expected_worker_instance_id,
+            expected_worker_incarnation=expected_worker_incarnation,
+        )
+    except (OperationalError, DisconnectionError, InterfaceError):
+        return _uncertain()
+
+
+
+
+def _uncertain(
+    reason_code: str = "OPERATION_AUTHORITY_UNCERTAIN",
+) -> OperationAuthorityDecision:
+    return OperationAuthorityDecision(OperationAuthorityStatus.UNCERTAIN, reason_code)
+
+
+async def _evaluate_live_bound_action_authority(
+    session: Session,
+    action: ActionAttempt,
+    *,
+    expected_run_id: str | None = None,
+    expected_node_id: str | None = None,
+    expected_worker_instance_id: str | None = None,
+    expected_worker_incarnation: int | None = None,
+) -> OperationAuthorityDecision:
+    """Evaluate durable, live authority for an already-bound v24 action.
+
+    This sole post-reservation evaluator layers exact ActionAttempt,
+    WorkerInstance, and authority-binding checks over
+    validate_node_runtime_state, the canonical run/node/lease/scope evaluator
+    shared with reservation and result acceptance.
+    """
+    if (
+        action.lifecycle_version != 1
+        or action.decision != "ALLOW"
+        or action.worker_instance_id is None
+        or action.worker_incarnation is None
+        or action.authority_vector_digest is None
+    ):
+        return _uncertain("OPERATION_BINDING_INVALID")
+
+    if expected_run_id is not None and action.run_id != expected_run_id:
+        return _revoked("OPERATION_CONTEXT_IDENTITY_MISMATCH")
+    if expected_node_id is not None and action.node_id != expected_node_id:
+        return _revoked("OPERATION_CONTEXT_IDENTITY_MISMATCH")
+    if (
+        expected_worker_instance_id is not None
+        and action.worker_instance_id != expected_worker_instance_id
+    ) or (
+        expected_worker_incarnation is not None
+        and action.worker_incarnation != expected_worker_incarnation
+    ):
+        return _revoked("ACTION_WORKER_OWNER_MISMATCH")
+
+    node = session.get(Node, action.node_id)
+    worker = session.get(WorkerInstance, action.worker_instance_id)
+    if node is None or worker is None or worker.node_id != action.node_id:
+        return _uncertain("OPERATION_BINDING_INVALID")
+    if worker.incarnation != action.worker_incarnation:
+        return _revoked("WORKER_INCARNATION_MISMATCH")
+    if node.current_worker_instance_id != worker.id or worker.observed_state != "ACTIVE":
+        return _revoked("WORKER_NOT_CURRENT")
+
+    allowed, reason, evaluation = await validate_node_runtime_state(session, node)
+    if not allowed:
+        if reason == "SCOPE_NOT_FOUND":
+            return _uncertain("OPERATION_BINDING_INVALID")
+        return _revoked(reason or "AUTHORITY_NOT_LIVE")
+
+    bindings = session.execute(
+        select(ActionAuthorityBinding)
+        .where(ActionAuthorityBinding.action_id == action.id)
+        .order_by(ActionAuthorityBinding.scope_id)
+    ).scalars().all()
+    if not bindings:
+        return _uncertain("OPERATION_BINDING_INVALID")
+    bound = tuple(
+        {"scope_id": row.scope_id, "bound_version": row.bound_version} for row in bindings
+    )
+    current = authority_vector(evaluation)
+    if bound != current or action.authority_vector_digest != authority_vector_digest(evaluation):
+        return _uncertain("OPERATION_BINDING_INVALID")
+    return _allowed()
 
 
 class OperationLifecycleService:
@@ -201,14 +385,20 @@ class OperationLifecycleService:
                         code="ACTION_RESULT_STATE_INVALID",
                     )
 
-                stale_reason = await self._stale_reason(session, action)
-                if stale_reason is not None:
+                authority = await evaluate_live_bound_action_authority(session, action)
+                if authority.status == OperationAuthorityStatus.REVOKED:
+                    stale_reason = authority.reason_code or "AUTHORITY_NOT_LIVE"
                     action.execution_state = "STALE"
                     action.stale_result_digest = result_digest
                     action.stale_reason_code = stale_reason
                     action.stale_observed_at = utcnow()
                     session.commit()
                     return ResultAcceptance(action, accepted=False, stale_reason=stale_reason)
+                if authority.status == OperationAuthorityStatus.UNCERTAIN:
+                    raise ConflictError(
+                        "Operation result authority could not be established",
+                        code=authority.reason_code or "OPERATION_AUTHORITY_UNCERTAIN",
+                    )
 
                 action.execution_state = "FAILED" if failed else "SUCCEEDED"
                 action.result_json = result
@@ -260,34 +450,6 @@ class OperationLifecycleService:
             except Exception:
                 session.rollback()
                 raise
-
-    async def _stale_reason(self, session: Session, action: ActionAttempt) -> str | None:
-        node = session.get(Node, action.node_id)
-        worker = session.get(WorkerInstance, action.worker_instance_id)
-        if node is None or worker is None:
-            return "ACTION_BINDING_MISSING"
-        if worker.incarnation != action.worker_incarnation:
-            return "WORKER_INCARNATION_MISMATCH"
-        if node.current_worker_instance_id != worker.id or worker.observed_state != "ACTIVE":
-            return "WORKER_NOT_CURRENT"
-        allowed, reason, evaluation = await validate_node_runtime_state(session, node)
-        if not allowed:
-            return reason or "AUTHORITY_NOT_LIVE"
-        bindings = session.execute(
-            select(ActionAuthorityBinding)
-            .where(ActionAuthorityBinding.action_id == action.id)
-            .order_by(ActionAuthorityBinding.scope_id)
-        ).scalars().all()
-        current = authority_vector(evaluation)
-        bound = tuple(
-            {"scope_id": row.scope_id, "bound_version": row.bound_version} for row in bindings
-        )
-        if (
-            action.authority_vector_digest != authority_vector_digest(evaluation)
-            or bound != current
-        ):
-            return "AUTHORITY_VECTOR_CHANGED"
-        return None
 
     @staticmethod
     def _action(session: Session, action_id: str) -> ActionAttempt:

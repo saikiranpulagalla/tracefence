@@ -112,16 +112,16 @@ def _pause_cancellation(monkeypatch, *, ready: Event, release: Event) -> None:
 
 
 def _pause_result(
-    monkeypatch, lifecycle: OperationLifecycleService, *, ready: Event, release: Event
+    monkeypatch, _lifecycle: OperationLifecycleService, *, ready: Event, release: Event
 ) -> None:
-    original = lifecycle._stale_reason
+    original = lifecycle_module.evaluate_live_bound_action_authority
 
     async def paused(*args, **kwargs):
         ready.set()
         _wait(release)
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(lifecycle, "_stale_reason", paused)
+    monkeypatch.setattr(lifecycle_module, "evaluate_live_bound_action_authority", paused)
 
 
 def _switch_to_w2(session_factory, *, node_id: str, ready: Event, release: Event) -> str:
