@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from tracefence.evidence import _atomic_private_write
+from tracefence.signoz.alert_templates import (
+    ALERT_CHANNEL_PLACEHOLDER,
+    validate_alert_templates,
+)
 from tracefence.signoz.mcp_client import (
     MCPToolResultError,
     ResponseSchemaError,
@@ -31,7 +35,6 @@ from tracefence.telemetry.schema import (
 )
 
 DASHBOARD_TITLE = "TraceFence Control Integrity"
-ALERT_CHANNEL_PLACEHOLDER = "${TRACEFENCE_NOTIFICATION_CHANNEL}"
 REQUIRED_TOOLS = {
     "signoz_list_metrics",
     "signoz_query_metrics",
@@ -227,43 +230,7 @@ def _validate_dashboard(dashboard: dict[str, Any]) -> None:
 
 
 def _validate_alerts(alerts: list[dict[str, Any]]) -> None:
-    if not alerts:
-        raise ValueError("At least one alert template is required")
-    names: set[str] = set()
-    for alert in alerts:
-        for field in (
-            "alert", "alertType", "ruleType", "version", "schemaVersion", "condition",
-            "evaluation", "notificationSettings", "labels", "annotations",
-        ):
-            if field not in alert:
-                raise ValueError(f"Alert {alert.get('alert', '<unknown>')} is missing {field}")
-        name = alert["alert"]
-        if name in names:
-            raise ValueError(f"Duplicate alert name: {name}")
-        names.add(name)
-        if alert["ruleType"] != "threshold_rule" or alert["schemaVersion"] != "v2alpha1":
-            raise ValueError(f"Alert {name} must use the v2alpha1 threshold-rule schema")
-        thresholds = alert["condition"].get("thresholds", {}).get("spec", [])
-        if not thresholds:
-            raise ValueError(f"Alert {name} has no threshold tier")
-        if not any(
-            ALERT_CHANNEL_PLACEHOLDER in tier.get("channels", [])
-            for tier in thresholds
-        ):
-            raise ValueError(f"Alert {name} must use the notification-channel placeholder")
-        composite = alert["condition"].get("compositeQuery")
-        if not isinstance(composite, dict):
-            raise ValueError(f"Alert {name} has no valid composite query")
-        queries = composite.get("queries")
-        if not isinstance(queries, list) or not queries:
-            raise ValueError(f"Alert {name} has no catalog-validated metric query")
-        for query in queries:
-            if not isinstance(query, dict) or query.get("type") != "builder_query":
-                raise ValueError(f"Alert {name} must use a builder metric query")
-            spec = query.get("spec")
-            aggregations = spec.get("aggregations") if isinstance(spec, dict) else None
-            if not isinstance(aggregations, list) or not aggregations:
-                raise ValueError(f"Alert {name} has no metric aggregation")
+    validate_alert_templates(alerts)
 
 
 def _metric_references(
