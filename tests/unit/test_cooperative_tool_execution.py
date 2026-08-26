@@ -1,20 +1,27 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, replace
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
+import tracefence.services.action_gateway as action_gateway_module
 import tracefence.services.operation_lifecycle as lifecycle_module
 from tests.helpers import create_v2_run
+from tracefence.config import settings
 from tracefence.db.models import ActionAttempt, Node, Run
 from tracefence.domain.enums import CommandType, IssuerType
 from tracefence.domain.errors import ConflictError
 from tracefence.domain.schemas import ActionExecute, CommandCreate, Principal
+from tracefence.rate_limits import authenticated_rate_limiter
 from tracefence.services.action_gateway import ActionGateway
 from tracefence.services.control_service import ControlService
-from tracefence.services.operation_lifecycle import OperationLifecycleService
+from tracefence.services.operation_lifecycle import (
+    DispatchClaimStatus,
+    OperationLifecycleService,
+)
 from tracefence.services.tool_registry import TOOL_REGISTRY, ToolSpec
 
 TOOL_NAME = "test_cooperative_checkpoint"
@@ -71,6 +78,22 @@ def _install_tool(monkeypatch, counts: Counts, *, after_effect_1=None):
         counts.returned += 1
         return {"effects": counts.effect_2}
 
+    monkeypatch.setitem(
+        TOOL_REGISTRY,
+        TOOL_NAME,
+        ToolSpec(
+            name=TOOL_NAME,
+            capability=CAPABILITY,
+            side_effecting=True,
+            allowed_argument_keys=frozenset(),
+            resources=frozenset({"test"}),
+            execution_mode="cooperative",
+            cooperative_executor=executor,
+        ),
+    )
+
+
+def _install_cooperative_executor(monkeypatch, executor) -> None:
     monkeypatch.setitem(
         TOOL_REGISTRY,
         TOOL_NAME,
@@ -228,4 +251,158 @@ async def test_dispatched_duplicate_never_invokes_cooperative_executor(
     )
     assert result.duplicate is True
     assert result.committed is False
+    assert counts.executor == 0
+
+
+async def test_concurrent_authorized_duplicates_claim_once(session_factory, monkeypatch):
+    counts = Counts()
+    executor_started = asyncio.Event()
+    release_executor = asyncio.Event()
+
+    async def executor(_context, _arguments):
+        counts.executor += 1
+        executor_started.set()
+        await release_executor.wait()
+        counts.returned += 1
+        return {"effects": 0}
+
+    _install_cooperative_executor(monkeypatch, executor)
+    run = await _run_with_cooperative_capability(session_factory, "b2-concurrent-duplicate")
+    gateway = ActionGateway(session_factory)
+    first_at_claim = asyncio.Event()
+    second_at_claim = asyncio.Event()
+    release_claims = asyncio.Event()
+    claim_statuses = []
+    original_claim = OperationLifecycleService.mark_dispatched
+    claim_calls = 0
+
+    async def delayed_claim(self, **kwargs):
+        nonlocal claim_calls
+        claim_calls += 1
+        if claim_calls == 1:
+            first_at_claim.set()
+        else:
+            second_at_claim.set()
+        await release_claims.wait()
+        claim = await original_claim(self, **kwargs)
+        claim_statuses.append(claim.status)
+        return claim
+
+    monkeypatch.setattr(OperationLifecycleService, "mark_dispatched", delayed_claim)
+    first = asyncio.create_task(
+        gateway.execute(run.root_node_id, run.root_token, _request("concurrent-duplicate"))
+    )
+    await first_at_claim.wait()
+    with session_factory() as session:
+        before = session.get(Run, run.run_id)
+        assert before is not None
+        proof_before = before.proof_revision
+
+    second = asyncio.create_task(
+        gateway.execute(run.root_node_id, run.root_token, _request("concurrent-duplicate"))
+    )
+    await second_at_claim.wait()
+    release_claims.set()
+    await executor_started.wait()
+    with session_factory() as session:
+        during = session.get(Run, run.run_id)
+        action = session.scalar(select(ActionAttempt).where(ActionAttempt.run_id == run.run_id))
+        assert during is not None and action is not None
+        assert during.proof_revision == proof_before + 1
+        assert action.execution_state == "DISPATCHED"
+
+    release_executor.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    assert {first_result.action_id, second_result.action_id} == {_action(session_factory, first_result.action_id).id}
+    assert claim_statuses.count(DispatchClaimStatus.CLAIMED) == 1
+    assert claim_statuses.count(DispatchClaimStatus.ALREADY_DISPATCHED) == 1
+    assert counts.executor == counts.returned == 1
+    assert _action(session_factory, first_result.action_id).execution_state == "SUCCEEDED"
+
+
+async def test_claimed_dispatch_crash_window_never_redispatches(session_factory, monkeypatch):
+    counts = Counts()
+    executor_started = asyncio.Event()
+    release_executor = asyncio.Event()
+
+    async def executor(_context, _arguments):
+        counts.executor += 1
+        executor_started.set()
+        await release_executor.wait()
+        return {"effects": 0}
+
+    _install_cooperative_executor(monkeypatch, executor)
+    run = await _run_with_cooperative_capability(session_factory, "b2-crash-window")
+    gateway = ActionGateway(session_factory)
+    first = asyncio.create_task(
+        gateway.execute(run.root_node_id, run.root_token, _request("crash-window"))
+    )
+    await executor_started.wait()
+    duplicate = await gateway.execute(
+        run.root_node_id, run.root_token, _request("crash-window")
+    )
+    assert duplicate.duplicate is True
+    assert duplicate.committed is False
+    assert counts.executor == 1
+    assert _action(session_factory, duplicate.action_id).execution_state == "DISPATCHED"
+
+    release_executor.set()
+    await first
+    assert counts.executor == 1
+
+
+async def test_cooperative_request_uses_rate_limit_gate(session_factory, monkeypatch):
+    counts = Counts()
+    _install_tool(monkeypatch, counts)
+
+    def rate_limited(*_args, **_kwargs):
+        raise ConflictError("rate limited", code="RATE_LIMITED")
+
+    monkeypatch.setattr(authenticated_rate_limiter, "check", rate_limited)
+    run = await _run_with_cooperative_capability(session_factory, "b2-rate-limit")
+    with pytest.raises(ConflictError) as error:
+        await ActionGateway(session_factory).execute(
+            run.root_node_id, run.root_token, _request("rate-limit")
+        )
+    assert error.value.code == "RATE_LIMITED"
+    assert counts.executor == 0
+    with session_factory() as session:
+        assert session.scalar(select(ActionAttempt).where(ActionAttempt.run_id == run.run_id)) is None
+
+
+async def test_cooperative_request_uses_action_quota_gate(session_factory, monkeypatch):
+    counts = Counts()
+    _install_tool(monkeypatch, counts)
+    monkeypatch.setattr(
+        action_gateway_module,
+        "settings",
+        replace(settings, max_actions_per_run=0),
+    )
+    run = await _run_with_cooperative_capability(session_factory, "b2-quota")
+    with pytest.raises(ConflictError) as error:
+        await ActionGateway(session_factory).execute(
+            run.root_node_id, run.root_token, _request("quota")
+        )
+    assert error.value.code == "RUN_ACTION_QUOTA_EXCEEDED"
+    assert counts.executor == 0
+    with session_factory() as session:
+        assert session.scalar(select(ActionAttempt).where(ActionAttempt.run_id == run.run_id)) is None
+
+
+async def test_cooperative_request_uses_recovery_contract_gate(session_factory, monkeypatch):
+    counts = Counts()
+    _install_tool(monkeypatch, counts)
+    run = await _run_with_cooperative_capability(session_factory, "b2-recovery-contract")
+    monkeypatch.setattr(
+        ActionGateway,
+        "_recovery_contract_denial",
+        staticmethod(lambda *_args: "RECOVERY_TOOL_MISMATCH"),
+    )
+
+    result = await ActionGateway(session_factory).execute(
+        run.root_node_id, run.root_token, _request("recovery-contract")
+    )
+    row = _action(session_factory, result.action_id)
+    assert result.decision.value == "DENY"
+    assert row.denial_reason == "RECOVERY_TOOL_MISMATCH"
     assert counts.executor == 0

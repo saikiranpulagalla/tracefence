@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -16,7 +17,7 @@ from tracefence.domain.schemas import ActionExecute, CommandCreate, Principal
 from tracefence.security import hash_token
 from tracefence.services.action_gateway import ActionGateway
 from tracefence.services.control_service import ControlService
-from tracefence.services.operation_lifecycle import OperationLifecycleService
+from tracefence.services.operation_lifecycle import DispatchClaimStatus, OperationLifecycleService
 from tracefence.services.tool_registry import TOOL_REGISTRY, ToolSpec
 
 REPETITIONS = range(25)
@@ -24,13 +25,14 @@ TOOL_NAME = "test_b2_ordering_tool"
 CAPABILITY = "tool:test_b2_ordering_tool"
 CASES = (
     "cancel-before-dispatch",
-    "dispatch-before-cancel",
-    "cancel-before-first-effect",
+    "dispatch-before-cancel-before-first-effect",
     "cancel-between-effects",
-    "final-check-before-cancel",
+    "final-check-before-cancel-before-result",
     "uncertain-before-first-effect",
-    "dispatched-duplicate",
+    "uncertain-between-effects",
     "w2-before-w1-checkpoint",
+    "concurrent-authorized-duplicate",
+    "sequential-already-dispatched-duplicate",
 )
 
 
@@ -128,6 +130,64 @@ async def test_cooperative_ordering_matrix(session_factory, monkeypatch, iterati
         counts.returned += 1
         return {"effects": 2}
 
+    if case == "uncertain-between-effects":
+        async def uncertain_between(context, _arguments):
+            counts.executor += 1
+            await context.checkpoint()
+            counts.effect_1 += 1
+            async def unavailable(*_args, **_kwargs):
+                raise OperationalError("SELECT", {}, Exception("busy"))
+            monkeypatch.setattr(lifecycle_module, "_evaluate_live_bound_action_authority", unavailable)
+            await context.checkpoint()
+            return {"unreachable": True}
+        _install(monkeypatch, counts, uncertain_between)
+        with pytest.raises(ConflictError) as error:
+            await gateway.execute(run.root_node_id, run.root_token, request)
+        assert error.value.code == "OPERATION_AUTHORITY_UNCERTAIN"
+        assert _action(session_factory, run.run_id).execution_state == "DISPATCHED"
+        assert counts.effect_1 == 1
+        assert counts.effect_2 == counts.returned == 0
+        return
+
+    if case == "concurrent-authorized-duplicate":
+        executor_started = asyncio.Event()
+        release_executor = asyncio.Event()
+        first_at_claim = asyncio.Event()
+        second_at_claim = asyncio.Event()
+        release_claims = asyncio.Event()
+        claim_statuses = []
+        claim_calls = 0
+        original_claim = OperationLifecycleService.mark_dispatched
+        async def executor(_context, _arguments):
+            counts.executor += 1
+            executor_started.set()
+            await release_executor.wait()
+            counts.returned += 1
+            return {"effects": 0}
+        async def delayed_claim(self, **kwargs):
+            nonlocal claim_calls
+            claim_calls += 1
+            (first_at_claim if claim_calls == 1 else second_at_claim).set()
+            await release_claims.wait()
+            claim = await original_claim(self, **kwargs)
+            claim_statuses.append(claim.status)
+            return claim
+        _install(monkeypatch, counts, executor)
+        monkeypatch.setattr(OperationLifecycleService, "mark_dispatched", delayed_claim)
+        first = asyncio.create_task(gateway.execute(run.root_node_id, run.root_token, request))
+        await first_at_claim.wait()
+        second = asyncio.create_task(gateway.execute(run.root_node_id, run.root_token, request))
+        await second_at_claim.wait()
+        release_claims.set()
+        await executor_started.wait()
+        release_executor.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        assert first_result.action_id == second_result.action_id
+        assert claim_statuses.count(DispatchClaimStatus.CLAIMED) == 1
+        assert claim_statuses.count(DispatchClaimStatus.ALREADY_DISPATCHED) == 1
+        assert counts.executor == counts.returned == 1
+        return
+
     if case == "cancel-before-dispatch":
         _install(monkeypatch, counts, success)
         reserved = await lifecycle.reserve(
@@ -144,7 +204,7 @@ async def test_cooperative_ordering_matrix(session_factory, monkeypatch, iterati
         assert counts.executor == counts.effect_1 == counts.effect_2 == 0
         return
 
-    if case in {"dispatch-before-cancel", "cancel-before-first-effect"}:
+    if case == "dispatch-before-cancel-before-first-effect":
         async def cancel_then_check(context, _arguments):
             counts.executor += 1
             await _cancel(session_factory, run, f"{case}-cancel-{iteration}")
@@ -174,7 +234,7 @@ async def test_cooperative_ordering_matrix(session_factory, monkeypatch, iterati
         assert counts.effect_2 == 0
         return
 
-    if case == "final-check-before-cancel":
+    if case == "final-check-before-cancel-before-result":
         async def final_check(context, _arguments):
             counts.executor += 1
             await context.checkpoint()
@@ -211,7 +271,7 @@ async def test_cooperative_ordering_matrix(session_factory, monkeypatch, iterati
         assert counts.effect_1 == counts.effect_2 == 0
         return
 
-    if case == "dispatched-duplicate":
+    if case == "sequential-already-dispatched-duplicate":
         _install(monkeypatch, counts, success)
         action = await lifecycle.reserve(
             node_id=run.root_node_id,
