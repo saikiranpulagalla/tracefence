@@ -36,6 +36,7 @@ from tracefence.services.common import (
 )
 from tracefence.services.operation_lifecycle import (
     CooperativeOperationContext,
+    DispatchClaimStatus,
     OperationAuthorityUncertain,
     OperationLifecycleService,
     OperationRevoked,
@@ -103,23 +104,14 @@ class ActionGateway:
                     ):
                         session.commit()
                         return await self._execute_cooperative(
-                            node_id=node_id,
-                            node_token=node_token,
                             request=request,
                             spec=spec,
+                            action=existing,
                         )
                     session.commit()
                     return self._result(existing, duplicate=True)
 
                 spec = get_tool_spec(request.tool_name)
-                if spec.execution_mode == "cooperative":
-                    session.commit()
-                    return await self._execute_cooperative(
-                        node_id=node_id,
-                        node_token=node_token,
-                        request=request,
-                        spec=spec,
-                    )
                 authenticated_rate_limiter.check(
                     "action",
                     f"{node.run_id}:{node.id}",
@@ -265,7 +257,11 @@ class ActionGateway:
                     arguments_digest=payload_digest(request.arguments),
                     attempted_at=utcnow(),
                     lifecycle_version=1,
-                    execution_state=("DENIED" if denial_reason else "SUCCEEDED"),
+                    execution_state=(
+                        "DENIED"
+                        if denial_reason
+                        else ("AUTHORIZED" if spec.execution_mode == "cooperative" else "SUCCEEDED")
+                    ),
                     worker_instance_id=(
                         principal.worker_instance.id if principal.worker_instance is not None else None
                     ),
@@ -397,6 +393,14 @@ class ActionGateway:
                         )
                     return self._result(attempt)
 
+                if spec.execution_mode == "cooperative":
+                    session.commit()
+                    return await self._execute_cooperative(
+                        request=request,
+                        spec=spec,
+                        action=attempt,
+                    )
+
                 # The persisted ALLOW row is constrained to contain its final
                 # result and commit timestamp. Tool executors may query/update
                 # ServiceState, which would otherwise trigger a premature ORM
@@ -457,35 +461,26 @@ class ActionGateway:
     async def _execute_cooperative(
         self,
         *,
-        node_id: str,
-        node_token: str,
         request: ActionExecute,
         spec: ToolSpec,
+        action: ActionAttempt,
     ) -> ActionResult:
-        """Run a future/test cooperative tool outside every SQLite writer lock."""
-        spec.validate_arguments(request.arguments)
+        """Run one durably claimed cooperative handoff outside writer locks."""
         lifecycle = OperationLifecycleService(self.session_factory)
-        action = await lifecycle.reserve(
-            node_id=node_id,
-            credential=node_token,
-            request=request,
-            required_capability=spec.capability,
-        )
-        if action.execution_state in {
-            "SUCCEEDED",
-            "FAILED",
-            "STALE",
-            "DENIED",
-            "DISPATCHED",
-        }:
-            return self._result(action, duplicate=True)
-        dispatched = await lifecycle.mark_dispatched(
+        claim = await lifecycle.mark_dispatched(
             action_id=action.id,
             worker_instance_id=action.worker_instance_id or "",
             worker_incarnation=action.worker_incarnation or 0,
         )
-        if dispatched.execution_state != "DISPATCHED":
-            return self._result(dispatched, duplicate=True)
+        if claim.status == DispatchClaimStatus.UNCERTAIN:
+            raise ConflictError(
+                "Cooperative operation dispatch authority could not be established",
+                code="OPERATION_AUTHORITY_UNCERTAIN",
+            )
+        if claim.status != DispatchClaimStatus.CLAIMED:
+            return self._result(claim.action, duplicate=True)
+
+        dispatched = claim.action
         context = CooperativeOperationContext.from_action(self.session_factory, dispatched)
         try:
             result = await spec.execute_cooperative(context, request.arguments)
@@ -514,6 +509,7 @@ class ActionGateway:
         return self._result(accepted.action)
 
     @staticmethod
+
     def _recovery_contract_denial(
         session: Session,
         node: Node,

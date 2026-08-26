@@ -44,12 +44,30 @@ class OperationAuthorityStatus(StrEnum):
     UNCERTAIN = "UNCERTAIN"
 
 
+class DispatchClaimStatus(StrEnum):
+    """One caller's durable cooperative-dispatch outcome."""
+
+    CLAIMED = "CLAIMED"
+    ALREADY_DISPATCHED = "ALREADY_DISPATCHED"
+    REVOKED = "REVOKED"
+    UNCERTAIN = "UNCERTAIN"
+    TERMINAL = "TERMINAL"
+
+
 @dataclass(frozen=True, slots=True)
 class OperationAuthorityDecision:
     """Non-persistent authority decision for one exact evaluation point."""
 
     status: OperationAuthorityStatus
     reason_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchClaim:
+    """The outcome of one serialized attempt to claim cooperative dispatch."""
+
+    action: ActionAttempt
+    status: DispatchClaimStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,7 +403,7 @@ class OperationLifecycleService:
 
     async def mark_dispatched(
         self, *, action_id: str, worker_instance_id: str, worker_incarnation: int
-    ) -> ActionAttempt:
+    ) -> DispatchClaim:
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
@@ -393,12 +411,10 @@ class OperationLifecycleService:
                 self._require_owner(action, worker_instance_id, worker_incarnation)
                 if action.execution_state == "DISPATCHED":
                     session.commit()
-                    return action
+                    return DispatchClaim(action, DispatchClaimStatus.ALREADY_DISPATCHED)
                 if action.execution_state != "AUTHORIZED":
-                    raise ConflictError(
-                        "Operation cannot be dispatched from its current lifecycle state",
-                        code="ACTION_DISPATCH_STATE_INVALID",
-                    )
+                    session.commit()
+                    return DispatchClaim(action, DispatchClaimStatus.TERMINAL)
                 authority = await evaluate_live_bound_action_authority(session, action)
                 if authority.status == OperationAuthorityStatus.REVOKED:
                     action.execution_state = "STALE"
@@ -408,21 +424,20 @@ class OperationLifecycleService:
                     action.stale_reason_code = authority.reason_code or "AUTHORITY_NOT_LIVE"
                     action.stale_observed_at = utcnow()
                     session.commit()
-                    return action
+                    return DispatchClaim(action, DispatchClaimStatus.REVOKED)
                 if authority.status == OperationAuthorityStatus.UNCERTAIN:
-                    raise ConflictError(
-                        "Operation dispatch authority could not be established",
-                        code=authority.reason_code or "OPERATION_AUTHORITY_UNCERTAIN",
-                    )
+                    session.commit()
+                    return DispatchClaim(action, DispatchClaimStatus.UNCERTAIN)
                 action.execution_state = "DISPATCHED"
                 action.dispatched_at = utcnow()
                 session.commit()
-                return action
+                return DispatchClaim(action, DispatchClaimStatus.CLAIMED)
             except Exception:
                 session.rollback()
                 raise
 
     async def accept_result(
+
         self,
         *,
         action_id: str,
