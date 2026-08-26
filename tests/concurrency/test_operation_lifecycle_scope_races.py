@@ -59,7 +59,7 @@ async def _dispatched(session_factory, name: str):
         assert node is not None and node.current_worker_instance_id is not None
         worker = session.get(WorkerInstance, node.current_worker_instance_id)
         assert worker is not None
-    lifecycle.mark_dispatched(
+    await lifecycle.mark_dispatched(
         action_id=action.id,
         worker_instance_id=worker.id,
         worker_incarnation=worker.incarnation,

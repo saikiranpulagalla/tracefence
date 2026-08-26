@@ -238,7 +238,7 @@ async def test_uncertain_result_acceptance_rolls_back_without_stale(session_fact
         assert node is not None and node.current_worker_instance_id is not None
         worker = session.get(WorkerInstance, node.current_worker_instance_id)
         assert worker is not None
-    service.mark_dispatched(
+    await service.mark_dispatched(
         action_id=action.id, worker_instance_id=worker.id, worker_incarnation=worker.incarnation
     )
     before = _state(session_factory, action.id)

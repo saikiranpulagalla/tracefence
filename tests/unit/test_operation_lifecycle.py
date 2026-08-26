@@ -70,7 +70,7 @@ async def test_dispatched_result_accepts_after_unrelated_proof_revision_change(s
         node_id=run.root_node_id, credential=run.root_token, request=_request("proof-neutral")
     )
     worker = await _worker(session_factory, run.root_node_id)
-    service.mark_dispatched(
+    await service.mark_dispatched(
         action_id=reserved.id,
         worker_instance_id=worker.id,
         worker_incarnation=worker.incarnation,
@@ -99,7 +99,7 @@ async def test_scope_change_records_idempotent_stale_evidence(session_factory):
         node_id=run.root_node_id, credential=run.root_token, request=_request("stale")
     )
     worker = await _worker(session_factory, run.root_node_id)
-    service.mark_dispatched(
+    await service.mark_dispatched(
         action_id=reserved.id,
         worker_instance_id=worker.id,
         worker_incarnation=worker.incarnation,

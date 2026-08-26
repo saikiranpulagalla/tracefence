@@ -34,6 +34,12 @@ from tracefence.services.common import (
     get_run,
     utcnow,
 )
+from tracefence.services.operation_lifecycle import (
+    CooperativeOperationContext,
+    OperationAuthorityUncertain,
+    OperationLifecycleService,
+    OperationRevoked,
+)
 from tracefence.services.runtime_events import record_runtime_event
 from tracefence.services.tool_registry import ToolSpec, get_tool_spec
 from tracefence.telemetry.instruments import telemetry
@@ -90,8 +96,30 @@ class ActionGateway:
                             "Idempotency key belongs to a different worker incarnation",
                             code="IDEMPOTENCY_OWNER_MISMATCH",
                         )
+                    spec = get_tool_spec(request.tool_name)
+                    if (
+                        spec.execution_mode == "cooperative"
+                        and existing.execution_state == "AUTHORIZED"
+                    ):
+                        session.commit()
+                        return await self._execute_cooperative(
+                            node_id=node_id,
+                            node_token=node_token,
+                            request=request,
+                            spec=spec,
+                        )
                     session.commit()
                     return self._result(existing, duplicate=True)
+
+                spec = get_tool_spec(request.tool_name)
+                if spec.execution_mode == "cooperative":
+                    session.commit()
+                    return await self._execute_cooperative(
+                        node_id=node_id,
+                        node_token=node_token,
+                        request=request,
+                        spec=spec,
+                    )
                 authenticated_rate_limiter.check(
                     "action",
                     f"{node.run_id}:{node.id}",
@@ -101,7 +129,6 @@ class ActionGateway:
                 # node authentication and exact replay handling, so the gateway
                 # cannot become an unauthenticated tool oracle and a committed
                 # response remains recoverable if policy changes later.
-                spec = get_tool_spec(request.tool_name)
                 action_count = session.scalar(
                     select(func.count(ActionAttempt.id)).where(
                         ActionAttempt.run_id == node.run_id
@@ -426,6 +453,65 @@ class ActionGateway:
             except Exception:
                 session.rollback()
                 raise
+
+    async def _execute_cooperative(
+        self,
+        *,
+        node_id: str,
+        node_token: str,
+        request: ActionExecute,
+        spec: ToolSpec,
+    ) -> ActionResult:
+        """Run a future/test cooperative tool outside every SQLite writer lock."""
+        spec.validate_arguments(request.arguments)
+        lifecycle = OperationLifecycleService(self.session_factory)
+        action = await lifecycle.reserve(
+            node_id=node_id,
+            credential=node_token,
+            request=request,
+            required_capability=spec.capability,
+        )
+        if action.execution_state in {
+            "SUCCEEDED",
+            "FAILED",
+            "STALE",
+            "DENIED",
+            "DISPATCHED",
+        }:
+            return self._result(action, duplicate=True)
+        dispatched = await lifecycle.mark_dispatched(
+            action_id=action.id,
+            worker_instance_id=action.worker_instance_id or "",
+            worker_incarnation=action.worker_incarnation or 0,
+        )
+        if dispatched.execution_state != "DISPATCHED":
+            return self._result(dispatched, duplicate=True)
+        context = CooperativeOperationContext.from_action(self.session_factory, dispatched)
+        try:
+            result = await spec.execute_cooperative(context, request.arguments)
+        except OperationRevoked as revoked:
+            stale = lifecycle.reject_stale_result(
+                action_id=dispatched.id,
+                worker_instance_id=context.worker_instance_id,
+                worker_incarnation=context.worker_incarnation,
+                result={"cooperative": "revoked"},
+                reason_code=revoked.reason_code,
+            )
+            return self._result(stale.action)
+        except OperationAuthorityUncertain as uncertain:
+            raise ConflictError(
+                "Cooperative operation authority could not be established",
+                code=uncertain.reason_code,
+            ) from uncertain
+        accepted = await lifecycle.accept_result(
+            action_id=dispatched.id,
+            worker_instance_id=context.worker_instance_id,
+            worker_incarnation=context.worker_incarnation,
+            tool_name=request.tool_name,
+            arguments_digest=payload_digest(request.arguments),
+            result=result,
+        )
+        return self._result(accepted.action)
 
     @staticmethod
     def _recovery_contract_denial(

@@ -77,7 +77,7 @@ async def _dispatched(session_factory, name: str):
         node_id=run.root_node_id, credential=run.root_token, request=_request(f"{name}-action")
     )
     worker = await _worker(session_factory, run.root_node_id)
-    lifecycle.mark_dispatched(
+    await lifecycle.mark_dispatched(
         action_id=action.id,
         worker_instance_id=worker.id,
         worker_incarnation=worker.incarnation,

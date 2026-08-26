@@ -112,6 +112,63 @@ class OperationCancellationContext:
             return _uncertain()
 
 
+class OperationRevoked(Exception):
+    """A cooperative checkpoint positively observed revoked authority."""
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+class OperationAuthorityUncertain(Exception):
+    """A cooperative checkpoint could not safely establish authority."""
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+@dataclass(frozen=True, slots=True)
+class CooperativeOperationContext:
+    """Immutable identity and checkpoint capability for cooperative execution.
+
+    It deliberately holds no SQLAlchemy session. Each checkpoint delegates to
+    the B1 read-only cancellation context, which opens its own short-lived read
+    session and never caches a positive decision.
+    """
+
+    action_id: str
+    run_id: str
+    node_id: str
+    worker_instance_id: str
+    worker_incarnation: int
+    cancellation: OperationCancellationContext
+
+    @classmethod
+    def from_action(
+        cls, session_factory: sessionmaker, action: ActionAttempt
+    ) -> CooperativeOperationContext:
+        cancellation = OperationCancellationContext.from_action(session_factory, action)
+        return cls(
+            action_id=action.id,
+            run_id=action.run_id,
+            node_id=action.node_id,
+            worker_instance_id=cancellation.worker_instance_id,
+            worker_incarnation=cancellation.worker_incarnation,
+            cancellation=cancellation,
+        )
+
+    async def checkpoint(self) -> None:
+        decision = await self.cancellation.check()
+        if decision.status == OperationAuthorityStatus.ALLOWED:
+            return
+        if decision.status == OperationAuthorityStatus.REVOKED:
+            raise OperationRevoked(decision.reason_code or "AUTHORITY_NOT_LIVE")
+        raise OperationAuthorityUncertain(
+            decision.reason_code or "OPERATION_AUTHORITY_UNCERTAIN"
+        )
+
+
 def _allowed() -> OperationAuthorityDecision:
     return OperationAuthorityDecision(OperationAuthorityStatus.ALLOWED)
 
@@ -225,7 +282,12 @@ class OperationLifecycleService:
         self.session_factory = session_factory
 
     async def reserve(
-        self, *, node_id: str, credential: str, request: ActionExecute
+        self,
+        *,
+        node_id: str,
+        credential: str,
+        request: ActionExecute,
+        required_capability: str | None = None,
     ) -> ActionAttempt:
         request_digest = payload_digest(request.model_dump(mode="json"))
         with self.session_factory() as session:
@@ -266,6 +328,13 @@ class OperationLifecycleService:
                     raise ConflictError(
                         f"Operation cannot be reserved: {reason}",
                         code=reason or "OPERATION_RESERVATION_DENIED",
+                    )
+                if required_capability is not None and required_capability not in set(
+                    node.capabilities_json or []
+                ):
+                    raise ConflictError(
+                        "Tool capability is not allowed for this node",
+                        code="TOOL_NOT_ALLOWED",
                     )
                 run = await get_run(session, node.run_id)
                 action = ActionAttempt(
@@ -314,7 +383,7 @@ class OperationLifecycleService:
                 session.rollback()
                 raise
 
-    def mark_dispatched(
+    async def mark_dispatched(
         self, *, action_id: str, worker_instance_id: str, worker_incarnation: int
     ) -> ActionAttempt:
         with self.session_factory() as session:
@@ -329,6 +398,21 @@ class OperationLifecycleService:
                     raise ConflictError(
                         "Operation cannot be dispatched from its current lifecycle state",
                         code="ACTION_DISPATCH_STATE_INVALID",
+                    )
+                authority = await evaluate_live_bound_action_authority(session, action)
+                if authority.status == OperationAuthorityStatus.REVOKED:
+                    action.execution_state = "STALE"
+                    action.stale_result_digest = payload_digest(
+                        {"dispatch": "not_started", "reason": authority.reason_code}
+                    )
+                    action.stale_reason_code = authority.reason_code or "AUTHORITY_NOT_LIVE"
+                    action.stale_observed_at = utcnow()
+                    session.commit()
+                    return action
+                if authority.status == OperationAuthorityStatus.UNCERTAIN:
+                    raise ConflictError(
+                        "Operation dispatch authority could not be established",
+                        code=authority.reason_code or "OPERATION_AUTHORITY_UNCERTAIN",
                     )
                 action.execution_state = "DISPATCHED"
                 action.dispatched_at = utcnow()

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -13,8 +13,12 @@ from tracefence.db.models import ServiceState, utcnow
 from tracefence.domain.errors import ConflictError
 from tracefence.domain.schemas import RecoveryContract
 from tracefence.security import payload_digest
+from tracefence.services.operation_lifecycle import CooperativeOperationContext
 
 ToolExecutor = Callable[[Session, str, str, dict[str, Any]], dict[str, Any]]
+CooperativeToolExecutor = Callable[
+    [CooperativeOperationContext, dict[str, Any]], Awaitable[dict[str, Any]]
+]
 RecoveryContractBuilder = Callable[[Session, str, str, dict[str, Any], int], dict[str, Any]]
 
 
@@ -33,9 +37,26 @@ class ToolSpec:
     side_effecting: bool
     allowed_argument_keys: frozenset[str]
     resources: frozenset[str]
-    executor: ToolExecutor
+    executor: ToolExecutor | None = None
+    execution_mode: Literal["sqlite_atomic", "cooperative"] = "sqlite_atomic"
+    cooperative_executor: CooperativeToolExecutor | None = None
     recommended_replacement_role: str | None = None
     recovery_contract_builder: RecoveryContractBuilder | None = None
+
+    def __post_init__(self) -> None:
+        if self.execution_mode == "sqlite_atomic":
+            if self.executor is None or self.cooperative_executor is not None:
+                raise ValueError(
+                    "sqlite_atomic tools require exactly one synchronous executor"
+                )
+            return
+        if self.execution_mode == "cooperative":
+            if self.executor is not None or self.cooperative_executor is None:
+                raise ValueError(
+                    "cooperative tools require exactly one cooperative executor"
+                )
+            return
+        raise ValueError(f"Unsupported tool execution mode: {self.execution_mode}")
 
     def validate_arguments(self, arguments: dict[str, Any]) -> None:
         unknown = set(arguments) - set(self.allowed_argument_keys)
@@ -53,7 +74,17 @@ class ToolSpec:
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
         self.validate_arguments(arguments)
+        if self.execution_mode != "sqlite_atomic" or self.executor is None:
+            raise RuntimeError("Cooperative tools cannot execute in a SQLite transaction")
         return self.executor(session, run_id, action_id, arguments)
+
+    async def execute_cooperative(
+        self, context: CooperativeOperationContext, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.validate_arguments(arguments)
+        if self.execution_mode != "cooperative" or self.cooperative_executor is None:
+            raise RuntimeError("SQLite-atomic tools cannot execute cooperatively")
+        return await self.cooperative_executor(context, arguments)
 
     def build_recovery_contract(
         self,
