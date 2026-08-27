@@ -437,7 +437,6 @@ class OperationLifecycleService:
                 raise
 
     async def accept_result(
-
         self,
         *,
         action_id: str,
@@ -448,66 +447,88 @@ class OperationLifecycleService:
         result: dict[str, Any],
         failed: bool = False,
     ) -> ResultAcceptance:
-        result_digest = payload_digest(result)
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
                 action = self._action(session, action_id)
-                self._require_result_identity(
-                    action,
+                accepted = await self._accept_result_in_session(
+                    session,
+                    action=action,
                     worker_instance_id=worker_instance_id,
                     worker_incarnation=worker_incarnation,
                     tool_name=tool_name,
                     arguments_digest=arguments_digest,
+                    result=result,
+                    failed=failed,
                 )
-                if action.execution_state in {"SUCCEEDED", "FAILED"}:
-                    if action.result_digest == result_digest:
-                        session.commit()
-                        return ResultAcceptance(action, accepted=True)
-                    raise ConflictError(
-                        "A different authoritative result was already accepted",
-                        code="ACTION_RESULT_ALREADY_TERMINAL",
-                    )
-                if action.execution_state == "STALE":
-                    if action.stale_result_digest == result_digest:
-                        session.commit()
-                        return ResultAcceptance(
-                            action, accepted=False, stale_reason=action.stale_reason_code
-                        )
-                    raise ConflictError(
-                        "Conflicting stale result evidence cannot overwrite the first observation",
-                        code="ACTION_STALE_EVIDENCE_CONFLICT",
-                    )
-                if action.execution_state != "DISPATCHED":
-                    raise ConflictError(
-                        "Operation result is not acceptable from its current lifecycle state",
-                        code="ACTION_RESULT_STATE_INVALID",
-                    )
-
-                authority = await evaluate_live_bound_action_authority(session, action)
-                if authority.status == OperationAuthorityStatus.REVOKED:
-                    stale_reason = authority.reason_code or "AUTHORITY_NOT_LIVE"
-                    action.execution_state = "STALE"
-                    action.stale_result_digest = result_digest
-                    action.stale_reason_code = stale_reason
-                    action.stale_observed_at = utcnow()
-                    session.commit()
-                    return ResultAcceptance(action, accepted=False, stale_reason=stale_reason)
-                if authority.status == OperationAuthorityStatus.UNCERTAIN:
-                    raise ConflictError(
-                        "Operation result authority could not be established",
-                        code=authority.reason_code or "OPERATION_AUTHORITY_UNCERTAIN",
-                    )
-
-                action.execution_state = "FAILED" if failed else "SUCCEEDED"
-                action.result_json = result
-                action.result_digest = result_digest
-                action.committed_at = utcnow()
                 session.commit()
-                return ResultAcceptance(action, accepted=True)
+                return accepted
             except Exception:
                 session.rollback()
                 raise
+
+    async def _accept_result_in_session(
+        self,
+        session: Session,
+        *,
+        action: ActionAttempt,
+        worker_instance_id: str,
+        worker_incarnation: int,
+        tool_name: str,
+        arguments_digest: str,
+        result: dict[str, Any],
+        failed: bool = False,
+    ) -> ResultAcceptance:
+        """Apply one result using the canonical v24 authority fence.
+
+        The caller owns a short writer transaction.  This is shared by normal
+        worker completion and C-C1 reconciliation evidence application.
+        """
+        result_digest = payload_digest(result)
+        self._require_result_identity(
+            action,
+            worker_instance_id=worker_instance_id,
+            worker_incarnation=worker_incarnation,
+            tool_name=tool_name,
+            arguments_digest=arguments_digest,
+        )
+        if action.execution_state in {"SUCCEEDED", "FAILED"}:
+            if action.result_digest == result_digest:
+                return ResultAcceptance(action, accepted=True)
+            raise ConflictError(
+                "A different authoritative result was already accepted",
+                code="ACTION_RESULT_ALREADY_TERMINAL",
+            )
+        if action.execution_state == "STALE":
+            if action.stale_result_digest == result_digest:
+                return ResultAcceptance(action, accepted=False, stale_reason=action.stale_reason_code)
+            raise ConflictError(
+                "Conflicting stale result evidence cannot overwrite the first observation",
+                code="ACTION_STALE_EVIDENCE_CONFLICT",
+            )
+        if action.execution_state not in {"DISPATCHED", "AMBIGUOUS"}:
+            raise ConflictError(
+                "Operation result is not acceptable from its current lifecycle state",
+                code="ACTION_RESULT_STATE_INVALID",
+            )
+        authority = await evaluate_live_bound_action_authority(session, action)
+        if authority.status == OperationAuthorityStatus.REVOKED:
+            stale_reason = authority.reason_code or "AUTHORITY_NOT_LIVE"
+            action.execution_state = "STALE"
+            action.stale_result_digest = result_digest
+            action.stale_reason_code = stale_reason
+            action.stale_observed_at = utcnow()
+            return ResultAcceptance(action, accepted=False, stale_reason=stale_reason)
+        if authority.status == OperationAuthorityStatus.UNCERTAIN:
+            raise ConflictError(
+                "Operation result authority could not be established",
+                code=authority.reason_code or "OPERATION_AUTHORITY_UNCERTAIN",
+            )
+        action.execution_state = "FAILED" if failed else "SUCCEEDED"
+        action.result_json = result
+        action.result_digest = result_digest
+        action.committed_at = utcnow()
+        return ResultAcceptance(action, accepted=True)
 
     def reject_stale_result(
         self,
