@@ -939,6 +939,53 @@ class ActionAuthorityBinding(Base):
     bound_version: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
+class ActionExternalOperationBinding(Base):
+    __tablename__ = "action_external_operation_bindings"
+    __table_args__ = (
+        PrimaryKeyConstraint("action_id", name="pk_action_external_operation_binding"),
+        UniqueConstraint("run_id", "action_id", name="uq_action_external_operation_binding_run_action"),
+        UniqueConstraint("provider_adapter_id", "provider_config_ref", "provider_scope_ref", "operation_key", name="uq_action_external_operation_binding_provider_key"),
+        ForeignKeyConstraint(["run_id", "action_id"], ["action_attempts.run_id", "action_attempts.id"], ondelete="CASCADE", name="fk_action_external_operation_binding_action"),
+        CheckConstraint("(provider_handle IS NULL AND provider_handle_bound_at IS NULL) OR (provider_handle IS NOT NULL AND provider_handle_bound_at IS NOT NULL)", name="ck_action_external_operation_binding_handle_shape"),
+    )
+    run_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    action_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    provider_adapter_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    provider_config_ref: Mapped[str] = mapped_column(String(160), nullable=False)
+    provider_scope_ref: Mapped[str] = mapped_column(String(160), nullable=False)
+    tool_reconciliation_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    provider_handle: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    provider_handle_bound_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ActionReconciliationEvidence(Base):
+    __tablename__ = "action_reconciliation_evidence"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_action_reconciliation_evidence"),
+        UniqueConstraint("action_id", "evidence_digest", name="uq_action_reconciliation_evidence_digest"),
+        ForeignKeyConstraint(["run_id", "action_id"], ["action_external_operation_bindings.run_id", "action_external_operation_bindings.action_id"], ondelete="CASCADE", name="fk_action_reconciliation_evidence_binding"),
+        CheckConstraint("observation_kind IN ('SUCCEEDED','FAILED','NONEXECUTION','CONFLICT')", name="ck_action_reconciliation_evidence_kind"),
+        CheckConstraint("outcome_class IN ('SUCCESS','FAILURE','NONEXECUTED','CONFLICT')", name="ck_action_reconciliation_evidence_outcome"),
+        CheckConstraint("(observation_kind = 'SUCCEEDED' AND outcome_class = 'SUCCESS') OR (observation_kind = 'FAILED' AND outcome_class = 'FAILURE') OR (observation_kind = 'NONEXECUTION' AND outcome_class = 'NONEXECUTED') OR (observation_kind = 'CONFLICT' AND outcome_class = 'CONFLICT')", name="ck_action_reconciliation_evidence_shape"),
+        CheckConstraint("(provider_evidence_ref IS NULL AND provider_evidence_digest IS NULL) OR (provider_evidence_ref IS NOT NULL AND provider_evidence_digest IS NOT NULL)", name="ck_action_reconciliation_evidence_provider_ref_shape"),
+        Index("ix_action_reconciliation_evidence_action", "action_id"),
+    )
+    id: Mapped[str] = mapped_column(String(36), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    action_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    observation_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    outcome_class: Mapped[str] = mapped_column(String(24), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_evidence_ref: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    provider_evidence_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    evidence_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class ActionCommandMatch(Base):
     __tablename__ = "action_command_matches"
     __table_args__ = (

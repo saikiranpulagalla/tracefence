@@ -18,6 +18,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from migrations.schema_baselines.v24 import V24_SCHEMA_INTEGRITY_TRIGGER_DDL
+from migrations.schema_baselines.v25 import V25_SCHEMA_INTEGRITY_TRIGGER_DDL
 from tracefence.config import settings
 from tracefence.db.models import (
     SCHEMA_INTEGRITY_TRIGGER_DDL,
@@ -41,6 +42,8 @@ _PROOF_RELEVANT_RUN_TABLES = (
     "control_commands",
     "command_acknowledgements",
     "action_attempts",
+    "action_external_operation_bindings",
+    "action_reconciliation_evidence",
     "action_command_matches",
     "invariant_violations",
     "telemetry_outbox",
@@ -56,6 +59,7 @@ _ALL_SCHEMA_INTEGRITY_TRIGGER_DDL = {
     **V22_SCHEMA_INTEGRITY_TRIGGER_DDL,
     **V23_SCHEMA_INTEGRITY_TRIGGER_DDL,
     **V24_SCHEMA_INTEGRITY_TRIGGER_DDL,
+    **V25_SCHEMA_INTEGRITY_TRIGGER_DDL,
 }
 _SCHEMA_INTEGRITY_TRIGGER_NAMES = set(_ALL_SCHEMA_INTEGRITY_TRIGGER_DDL)
 
@@ -166,7 +170,7 @@ def _install_v24_schema_integrity_triggers(selected_engine: Engine) -> None:
     if selected_engine.dialect.name != "sqlite":
         return
     with selected_engine.begin() as connection:
-        for trigger_ddl in V24_SCHEMA_INTEGRITY_TRIGGER_DDL.values():
+        for trigger_ddl in {**V24_SCHEMA_INTEGRITY_TRIGGER_DDL, **V25_SCHEMA_INTEGRITY_TRIGGER_DDL}.values():
             connection.exec_driver_sql(trigger_ddl)
 
 
@@ -479,8 +483,8 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 24
-ALEMBIC_HEAD = "008_schema_v24_action_lifecycle"
+SCHEMA_VERSION = 25
+ALEMBIC_HEAD = "009_schema_v25_action_reconciliation"
 
 
 def _stamp_alembic_head(selected_engine: Engine) -> None:
