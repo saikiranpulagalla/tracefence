@@ -175,13 +175,18 @@ class ReconcilerRegistry:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class TrustedReconciliationObservation:
-    """Raw provider data accompanied by a resolved trusted reconciler contract."""
+_PRODUCTION_RECONCILER_REGISTRY = ReconcilerRegistry()
 
-    identity: ReconciliationIdentity
-    contract: ReconcilerContract
-    observation: ReconciliationObservation
+
+def _resolve_registered_reconciler(
+    binding: ActionExternalOperationBinding,
+) -> RegisteredOperationReconciler | None:
+    """Resolve only server-composed production registrations.
+
+    Tests may monkeypatch this private composition seam; ordinary callers never
+    supply a registry, contract, capability, or observation to the service.
+    """
+    return _PRODUCTION_RECONCILER_REGISTRY.resolve(binding)
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,29 +199,33 @@ class ReconciliationApplication:
 
 
 class OperationReconciliationService:
-    """Applies already-obtained provider observations; it never performs provider I/O."""
+    """Reconcile a bound action through server-owned provider composition."""
 
-    def __init__(
-        self,
-        session_factory: sessionmaker,
-        registry: ReconcilerRegistry | None = None,
-    ) -> None:
+    def __init__(self, session_factory: sessionmaker) -> None:
         self.session_factory = session_factory
-        # Production composition registers no reconciler in C-C1. An empty
-        # registry fails closed until a later reviewed adapter is composed.
-        self.registry = registry or ReconcilerRegistry()
 
-    async def query(self, *, identity: ReconciliationIdentity) -> TrustedReconciliationObservation:
-        """Query one registered reconciler outside any SQLite writer transaction."""
+    async def reconcile_action(self, *, action_id: str) -> ReconciliationApplication:
+        """Query and apply one bound action through a registered reconciler.
+
+        Provider I/O occurs after the short read session has closed. No caller
+        supplies an observation or trusted wrapper: only this orchestration
+        path may carry a provider outcome into the material apply transaction.
+        """
         with self.session_factory() as session:
-            action, binding = self._load_exact(session, identity)
+            action = self._action(session, action_id)
+            binding = session.get(ActionExternalOperationBinding, action.id)
+            if binding is None:
+                raise ConflictError(
+                    "Action has no reconciliation binding",
+                    code="ACTION_RECONCILIATION_BINDING_MISSING",
+                )
             registered = self._registered_for_binding(binding)
             canonical_identity = self._identity(action, binding)
         observation = await registered.reconciler.reconcile(canonical_identity)
         self._validate_observation_capability(registered.contract, observation)
-        return TrustedReconciliationObservation(
+        return await self._apply_reconciled_observation(
             identity=canonical_identity,
-            contract=registered.contract,
+            registered=registered,
             observation=observation,
         )
 
@@ -299,36 +308,25 @@ class OperationReconciliationService:
                 session.rollback()
                 raise
 
-    async def apply(
+    async def _apply_reconciled_observation(
         self,
         *,
         identity: ReconciliationIdentity,
+        registered: RegisteredOperationReconciler,
         observation: ReconciliationObservation,
     ) -> ReconciliationApplication:
-        """Reject raw provider data at the public application boundary."""
-        raise ConflictError(
-            "Raw reconciliation observations cannot mutate durable operation state",
-            code="UNTRUSTED_RECONCILIATION_CLAIM",
-        )
-
-    async def apply_trusted_observation(
-        self,
-        *,
-        identity: ReconciliationIdentity,
-        trusted_observation: TrustedReconciliationObservation,
-    ) -> ReconciliationApplication:
-        """Apply an observation produced through the registered query boundary."""
-        if not isinstance(trusted_observation, TrustedReconciliationObservation):
-            raise ConflictError(
-                "Material reconciliation requires trusted reconciler provenance",
-                code="UNTRUSTED_RECONCILIATION_CLAIM",
-            )
+        """Apply a raw outcome received by reconciliation orchestration only."""
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
                 action, binding = self._load_exact(session, identity)
-                self._validate_trusted_observation(binding, identity, trusted_observation)
-                observation = trusted_observation.observation
+                current_registered = self._registered_for_binding(binding)
+                if current_registered is not registered:
+                    raise ConflictError(
+                        "Reconciler registration changed before outcome application",
+                        code="RECONCILER_CONTRACT_MISMATCH",
+                    )
+                self._validate_observation_capability(current_registered.contract, observation)
                 if not observation.is_material:
                     session.commit()
                     return ReconciliationApplication(action, False, False, observation.kind.value)
@@ -406,27 +404,13 @@ class OperationReconciliationService:
     def _registered_for_binding(
         self, binding: ActionExternalOperationBinding
     ) -> RegisteredOperationReconciler:
-        registered = self.registry.resolve(binding)
+        registered = _resolve_registered_reconciler(binding)
         if registered is None or not registered.contract.matches_binding(binding):
             raise ConflictError(
                 "No trusted reconciler contract matches this external operation binding",
                 code="RECONCILER_CONTRACT_UNREGISTERED",
             )
         return registered
-
-    def _validate_trusted_observation(
-        self,
-        binding: ActionExternalOperationBinding,
-        identity: ReconciliationIdentity,
-        trusted: TrustedReconciliationObservation,
-    ) -> None:
-        registered = self._registered_for_binding(binding)
-        if trusted.identity != identity or trusted.contract is not registered.contract:
-            raise ConflictError(
-                "Trusted reconciliation provenance does not match the durable binding",
-                code="RECONCILER_CONTRACT_MISMATCH",
-            )
-        self._validate_observation_capability(registered.contract, trusted.observation)
 
     @staticmethod
     def _validate_observation_capability(
