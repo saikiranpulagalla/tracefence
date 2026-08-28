@@ -185,7 +185,7 @@ def _install_v24_schema_integrity_triggers(selected_engine: Engine) -> None:
             connection.exec_driver_sql(trigger_ddl)
         for operation, row in (("insert", "NEW"), ("update", "NEW"), ("delete", "OLD")):
             connection.exec_driver_sql(
-                f"CREATE TRIGGER IF NOT EXISTS trg_action_recovery_links_{operation}_proof_revision "
+                f"CREATE TRIGGER IF NOT EXISTS trg_action_recovery_links_{operation}_proof_revision "  # nosec B608: fixed private operation tuple
                 f"AFTER {operation.upper()} ON action_recovery_links "
                 f"BEGIN UPDATE runs SET proof_revision = proof_revision + 1 "
                 f"WHERE id = {row}.source_run_id; END"
