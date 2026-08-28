@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from sqlalchemy import select, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from tracefence.db.models import (
     ActionAttempt,
@@ -211,7 +211,7 @@ class OperationRecoveryService:
 
     @staticmethod
     def _definitive_nonexecution(
-        session,
+        session: Session,
         source: ActionAttempt,
         binding: ActionExternalOperationBinding,
     ) -> ActionReconciliationEvidence:
