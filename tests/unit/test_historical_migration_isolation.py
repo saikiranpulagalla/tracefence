@@ -31,6 +31,7 @@ REVISIONS = (
     ("007_schema_v23_worker_stop_tasks", 23),
     ("008_schema_v24_action_lifecycle", 24),
     ("009_schema_v25_action_reconciliation", 25),
+    ("010_schema_v26_action_recovery", 26),
 )
 
 V17_TABLES = {
@@ -112,6 +113,8 @@ def test_blank_database_has_exact_historical_table_and_column_boundaries(
             expected_tables.add("action_authority_bindings")
         if version >= 25:
             expected_tables.update({"action_external_operation_bindings", "action_reconciliation_evidence"})
+        if version >= 26:
+            expected_tables.add("action_recovery_links")
         assert _tables(connection) == expected_tables
 
         run_columns = _columns(connection, "runs")
@@ -178,6 +181,7 @@ def test_blank_database_has_exact_historical_table_and_column_boundaries(
         assert ("action_authority_bindings" in _tables(connection)) is (version >= 24)
         assert ("action_external_operation_bindings" in _tables(connection)) is (version >= 25)
         assert ("action_reconciliation_evidence" in _tables(connection)) is (version >= 25)
+        assert ("action_recovery_links" in _tables(connection)) is (version >= 26)
     finally:
         connection.close()
 
@@ -202,6 +206,8 @@ def test_historical_trigger_and_index_ownership(
         assert ("trg_action_authority_bindings_immutable" in triggers) is (version >= 24)
         assert ("trg_action_external_operation_binding_immutable" in triggers) is (version >= 25)
         assert ("trg_action_reconciliation_evidence_immutable" in triggers) is (version >= 25)
+        assert ("trg_action_recovery_link_immutable" in triggers) is (version >= 26)
+        assert ("trg_action_recovery_link_no_delete" in triggers) is (version >= 26)
         assert ("uq_runtime_stop_intent_source_command" in indexes) is (version >= 22)
         assert ("ix_worker_stop_tasks_due" in indexes) is (version >= 23)
     finally:
@@ -217,6 +223,7 @@ def test_historical_trigger_and_index_ownership(
         ("006_schema_v22_runtime_stop_causality", "007_schema_v23_worker_stop_tasks"),
         ("007_schema_v23_worker_stop_tasks", "008_schema_v24_action_lifecycle"),
         ("008_schema_v24_action_lifecycle", "009_schema_v25_action_reconciliation"),
+        ("009_schema_v25_action_reconciliation", "010_schema_v26_action_recovery"),
     ),
 )
 def test_legacy_current_metadata_contamination_remains_upgradeable(
