@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from migrations.schema_baselines.v24 import V24_SCHEMA_INTEGRITY_TRIGGER_DDL
 from migrations.schema_baselines.v25 import V25_SCHEMA_INTEGRITY_TRIGGER_DDL
+from migrations.schema_baselines.v26 import V26_SCHEMA_INTEGRITY_TRIGGER_DDL
 from tracefence.config import settings
 from tracefence.db.models import (
     SCHEMA_INTEGRITY_TRIGGER_DDL,
@@ -60,6 +61,7 @@ _ALL_SCHEMA_INTEGRITY_TRIGGER_DDL = {
     **V23_SCHEMA_INTEGRITY_TRIGGER_DDL,
     **V24_SCHEMA_INTEGRITY_TRIGGER_DDL,
     **V25_SCHEMA_INTEGRITY_TRIGGER_DDL,
+    **V26_SCHEMA_INTEGRITY_TRIGGER_DDL,
 }
 _SCHEMA_INTEGRITY_TRIGGER_NAMES = set(_ALL_SCHEMA_INTEGRITY_TRIGGER_DDL)
 
@@ -82,7 +84,12 @@ def _proof_revision_trigger_names() -> set[str]:
         f"trg_{table}_{operation}_proof_revision"
         for table in _PROOF_RELEVANT_RUN_TABLES
         for operation in ("insert", "update", "delete")
-    } | {"trg_runs_update_proof_revision"}
+    } | {
+        "trg_action_recovery_links_insert_proof_revision",
+        "trg_action_recovery_links_update_proof_revision",
+        "trg_action_recovery_links_delete_proof_revision",
+        "trg_runs_update_proof_revision",
+    }
 
 
 def _install_proof_revision_triggers(selected_engine: Engine) -> None:
@@ -170,8 +177,19 @@ def _install_v24_schema_integrity_triggers(selected_engine: Engine) -> None:
     if selected_engine.dialect.name != "sqlite":
         return
     with selected_engine.begin() as connection:
-        for trigger_ddl in {**V24_SCHEMA_INTEGRITY_TRIGGER_DDL, **V25_SCHEMA_INTEGRITY_TRIGGER_DDL}.values():
+        for trigger_ddl in {
+            **V24_SCHEMA_INTEGRITY_TRIGGER_DDL,
+            **V25_SCHEMA_INTEGRITY_TRIGGER_DDL,
+            **V26_SCHEMA_INTEGRITY_TRIGGER_DDL,
+        }.values():
             connection.exec_driver_sql(trigger_ddl)
+        for operation, row in (("insert", "NEW"), ("update", "NEW"), ("delete", "OLD")):
+            connection.exec_driver_sql(
+                f"CREATE TRIGGER IF NOT EXISTS trg_action_recovery_links_{operation}_proof_revision "
+                f"AFTER {operation.upper()} ON action_recovery_links "
+                f"BEGIN UPDATE runs SET proof_revision = proof_revision + 1 "
+                f"WHERE id = {row}.source_run_id; END"
+            )
 
 
 def _validate_required_triggers(selected_engine: Engine) -> None:
@@ -483,8 +501,8 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 25
-ALEMBIC_HEAD = "009_schema_v25_action_reconciliation"
+SCHEMA_VERSION = 26
+ALEMBIC_HEAD = "010_schema_v26_action_recovery"
 
 
 def _stamp_alembic_head(selected_engine: Engine) -> None:

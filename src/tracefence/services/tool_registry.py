@@ -42,6 +42,13 @@ class ToolSpec:
     cooperative_executor: CooperativeToolExecutor | None = None
     recommended_replacement_role: str | None = None
     recovery_contract_builder: RecoveryContractBuilder | None = None
+    # Explicit successor recovery is intentionally disabled unless a
+    # server-owned tool registration supplies a stable policy identifier.
+    explicit_recovery_policy_version: str | None = None
+
+    @property
+    def allows_explicit_recovery(self) -> bool:
+        return self.explicit_recovery_policy_version is not None
 
     def __post_init__(self) -> None:
         if self.execution_mode == "sqlite_atomic":

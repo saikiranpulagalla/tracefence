@@ -15,7 +15,15 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from tracefence.db.models import ActionAttempt, ActionAuthorityBinding, Node, WorkerInstance
+from tracefence.db.models import (
+    ActionAttempt,
+    ActionAuthorityBinding,
+    ActionExternalOperationBinding,
+    ActionReconciliationEvidence,
+    ActionRecoveryLink,
+    Node,
+    WorkerInstance,
+)
 from tracefence.domain.errors import ConflictError, NotFoundError
 from tracefence.domain.schemas import ActionExecute
 from tracefence.security import payload_digest
@@ -293,6 +301,67 @@ async def _evaluate_live_bound_action_authority(
     return _allowed()
 
 
+def evaluate_recovery_dispatch_basis(
+    session: Session, action: ActionAttempt
+) -> OperationAuthorityDecision:
+    """Validate immutable recovery lineage in the dispatch-claim writer TX."""
+    link = session.scalar(
+        select(ActionRecoveryLink).where(
+            ActionRecoveryLink.recovery_action_id == action.id
+        )
+    )
+    if link is None:
+        return _allowed()
+    source = session.get(ActionAttempt, link.source_action_id)
+    binding = session.get(ActionExternalOperationBinding, link.source_action_id)
+    evidence = session.get(ActionReconciliationEvidence, link.basis_evidence_id)
+    if (
+        source is None
+        or binding is None
+        or evidence is None
+        or link.source_run_id != source.run_id
+        or link.recovery_run_id != action.run_id
+        or evidence.run_id != source.run_id
+        or evidence.action_id != source.id
+        or evidence.observation_kind != "NONEXECUTION"
+        or evidence.outcome_class != "NONEXECUTED"
+        or source.lifecycle_version != 1
+        or source.tool_name != action.tool_name
+        or source.arguments_digest != action.arguments_digest
+    ):
+        return _revoked("RECOVERY_BASIS_INVALID")
+    conflict = session.scalar(
+        select(ActionReconciliationEvidence.id).where(
+            ActionReconciliationEvidence.run_id == source.run_id,
+            ActionReconciliationEvidence.action_id == source.id,
+            ActionReconciliationEvidence.observation_kind == "CONFLICT",
+            ActionReconciliationEvidence.outcome_class == "CONFLICT",
+        )
+    )
+    if conflict is not None:
+        return _revoked("RECOVERY_SOURCE_CONFLICT")
+    # Avoid importing the registry while it imports this module's cooperative context.
+    from tracefence.services.tool_registry import get_tool_spec
+
+    spec = get_tool_spec(action.tool_name)
+    if (
+        not spec.allows_explicit_recovery
+        or spec.explicit_recovery_policy_version != link.recovery_policy_version
+    ):
+        return _revoked("RECOVERY_POLICY_INVALID")
+    request_digest = payload_digest(
+        {
+            "source_action_id": source.id,
+            "basis_evidence_id": evidence.id,
+            "recovery_policy_version": link.recovery_policy_version,
+            "request_payload_digest": action.request_payload_digest,
+        }
+    )
+    if request_digest != link.recovery_request_digest:
+        return _revoked("RECOVERY_REQUEST_MISMATCH")
+    return _allowed()
+
+
 class OperationLifecycleService:
     """Own ActionAttempt lifecycle transitions for eventual external execution."""
 
@@ -416,6 +485,8 @@ class OperationLifecycleService:
                     session.commit()
                     return DispatchClaim(action, DispatchClaimStatus.TERMINAL)
                 authority = await evaluate_live_bound_action_authority(session, action)
+                if authority.status == OperationAuthorityStatus.ALLOWED:
+                    authority = evaluate_recovery_dispatch_basis(session, action)
                 if authority.status == OperationAuthorityStatus.REVOKED:
                     action.execution_state = "STALE"
                     action.stale_result_digest = payload_digest(

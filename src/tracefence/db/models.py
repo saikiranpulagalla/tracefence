@@ -986,6 +986,52 @@ class ActionReconciliationEvidence(Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+
+class ActionRecoveryLink(Base):
+    """Immutable lineage from a proved-nonexecuted action to its successor."""
+
+    __tablename__ = "action_recovery_links"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "source_run_id", "source_action_id", name="pk_action_recovery_link"
+        ),
+        UniqueConstraint(
+            "recovery_run_id", "recovery_action_id", name="uq_action_recovery_link_child"
+        ),
+        ForeignKeyConstraint(
+            ["source_run_id", "source_action_id"],
+            ["action_attempts.run_id", "action_attempts.id"],
+            ondelete="RESTRICT",
+            name="fk_action_recovery_link_source",
+        ),
+        ForeignKeyConstraint(
+            ["recovery_run_id", "recovery_action_id"],
+            ["action_attempts.run_id", "action_attempts.id"],
+            ondelete="RESTRICT",
+            name="fk_action_recovery_link_recovery",
+        ),
+        ForeignKeyConstraint(
+            ["basis_evidence_id"],
+            ["action_reconciliation_evidence.id"],
+            ondelete="RESTRICT",
+            name="fk_action_recovery_link_basis",
+        ),
+        CheckConstraint(
+            "source_action_id <> recovery_action_id",
+            name="ck_action_recovery_link_distinct_actions",
+        ),
+    )
+
+    source_run_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    source_action_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    recovery_run_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    recovery_action_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    basis_evidence_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    recovery_policy_version: Mapped[str] = mapped_column(String(96), nullable=False)
+    recovery_request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class ActionCommandMatch(Base):
     __tablename__ = "action_command_matches"
     __table_args__ = (
