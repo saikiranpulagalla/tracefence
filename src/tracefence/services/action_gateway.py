@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Protocol
 from uuid import uuid4
 
@@ -54,6 +54,16 @@ class _Span(Protocol):
     def set_attribute(self, key: str, value: AttributeValue) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ActionReservation:
+    """Canonical reservation result owned by the caller transaction."""
+
+    node: Node
+    spec: ToolSpec
+    action: ActionAttempt
+    duplicate: bool
+
+
 class ActionGateway:
     def __init__(self, session_factory: sessionmaker) -> None:
         self.session_factory = session_factory
@@ -65,296 +75,35 @@ class ActionGateway:
         request: ActionExecute,
     ) -> ActionResult:
         started = time.perf_counter()
-        request_digest = payload_digest(request.model_dump(mode="json"))
 
         with self.session_factory() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             try:
-                principal = await authenticate_execution_principal(
-                    session, node_id=node_id, credential=node_token
+                reservation = await self._reserve_in_session(
+                    session,
+                    node_id=node_id,
+                    node_token=node_token,
+                    request=request,
                 )
-                node = principal.node
-
-                existing = session.execute(
-                    select(ActionAttempt).where(
-                        ActionAttempt.node_id == node_id,
-                        ActionAttempt.idempotency_key == request.idempotency_key,
-                    )
-                ).scalar_one_or_none()
-                if existing is not None:
-                    if existing.request_payload_digest != request_digest:
-                        raise ConflictError(
-                            "Idempotency key was reused with a different action payload",
-                            code="IDEMPOTENCY_PAYLOAD_MISMATCH",
-                        )
-                    if (
-                        principal.protocol_version == 2
-                        and principal.worker_instance is not None
-                        and existing.lifecycle_version == 1
-                        and existing.worker_instance_id != principal.worker_instance.id
-                    ):
-                        raise ConflictError(
-                            "Idempotency key belongs to a different worker incarnation",
-                            code="IDEMPOTENCY_OWNER_MISMATCH",
-                        )
-                    spec = get_tool_spec(request.tool_name)
+                node = reservation.node
+                spec = reservation.spec
+                attempt = reservation.action
+                if reservation.duplicate:
                     if (
                         spec.execution_mode == "cooperative"
-                        and existing.execution_state == "AUTHORIZED"
+                        and attempt.execution_state == "AUTHORIZED"
                     ):
                         session.commit()
                         return await self._execute_cooperative(
                             request=request,
                             spec=spec,
-                            action=existing,
+                            action=attempt,
                         )
                     session.commit()
-                    return self._result(existing, duplicate=True)
+                    return self._result(attempt, duplicate=True)
 
-                spec = get_tool_spec(request.tool_name)
-                authenticated_rate_limiter.check(
-                    "action",
-                    f"{node.run_id}:{node.id}",
-                )
-
-                # Tool existence and argument-shape errors are evaluated only after
-                # node authentication and exact replay handling, so the gateway
-                # cannot become an unauthenticated tool oracle and a committed
-                # response remains recoverable if policy changes later.
-                action_count = session.scalar(
-                    select(func.count(ActionAttempt.id)).where(
-                        ActionAttempt.run_id == node.run_id
-                    )
-                ) or 0
-                if action_count >= settings.max_actions_per_run:
-                    raise ConflictError(
-                        "Action quota exceeded for run",
-                        code="RUN_ACTION_QUOTA_EXCEEDED",
-                    )
-
-                run = await get_run(session, node.run_id)
-                evaluation = await evaluate_scopes(session, node)
-
-                checks: list[dict[str, str | None]] = []
-
-                def check(name: str, passed: bool, reason: str | None = None) -> None:
-                    checks.append(
-                        {
-                            "name": name,
-                            "outcome": "PASS" if passed else "FAIL",
-                            "reason": None if passed else reason,
-                        }
-                    )
-
-                denial_reason: str | None = None
-                if run.status != "RUNNING":
-                    denial_reason = "RUN_NOT_ACTIVE"
-                    check("run_active", False, denial_reason)
-                else:
-                    check("run_active", True)
-                    if node.status not in {"ACTIVE", "WAITING"}:
-                        denial_reason = "NODE_NOT_ACTIVE"
-                        check("node_active", False, denial_reason)
-                    else:
-                        check("node_active", True)
-                        if (
-                            node.lease_expires_at is None
-                            or node.lease_expires_at <= utcnow()
-                        ):
-                            denial_reason = "LEASE_EXPIRED"
-                            check("lease_valid", False, denial_reason)
-                        else:
-                            check("lease_valid", True)
-                            if not evaluation.allowed:
-                                denial_reason = (
-                                    evaluation.primary_reason or "SCOPE_INVALID"
-                                )
-                                check("scope_current", False, denial_reason)
-                            else:
-                                check("scope_current", True)
-                                denial_reason = self._recovery_contract_denial(
-                                    session,
-                                    node,
-                                    request,
-                                    spec,
-                                )
-                                if node.caused_by_command_id is not None:
-                                    check(
-                                        "recovery_contract",
-                                        denial_reason is None,
-                                        denial_reason,
-                                    )
-                                if denial_reason is None:
-                                    capability_allowed = spec.capability in set(
-                                        node.capabilities_json or []
-                                    )
-                                    if not capability_allowed:
-                                        denial_reason = "TOOL_NOT_ALLOWED"
-                                    check(
-                                        "capability_allowed",
-                                        capability_allowed,
-                                        denial_reason,
-                                    )
-                                if denial_reason is None:
-                                    spec.validate_arguments(request.arguments)
-                                    check("arguments_valid", True)
-
-                commands = []
-                command = None
-                matched_mismatch = None
-                if denial_reason in STALE_REASONS:
-                    commands = await commands_for_scope_mismatches(
-                        session, evaluation.mismatches, run_id=node.run_id
-                    )
-                    command = commands[-1] if commands else None
-                    if command is not None:
-                        matched_mismatch = next(
-                            (
-                                mismatch
-                                for mismatch in evaluation.mismatches
-                                if mismatch.scope_id == command.target_scope_id
-                            ),
-                            None,
-                        )
-                    if matched_mismatch is None and evaluation.mismatches:
-                        matched_mismatch = evaluation.mismatches[0]
-
-                attempt = ActionAttempt(
-                    id=str(uuid4()),
-                    run_id=node.run_id,
-                    node_id=node.id,
-                    tool_name=request.tool_name,
-                    side_effecting=spec.side_effecting,
-                    idempotency_key=request.idempotency_key,
-                    decision=(ActionDecision.DENY if denial_reason else ActionDecision.ALLOW),
-                    denial_reason=denial_reason,
-                    matched_command_id=command.id if command else None,
-                    matched_scope_id=matched_mismatch.scope_id if matched_mismatch else None,
-                    matched_snapshot_version=(
-                        matched_mismatch.snapshot_version if matched_mismatch else None
-                    ),
-                    matched_live_version=matched_mismatch.live_version if matched_mismatch else None,
-                    matched_live_status=matched_mismatch.live_status if matched_mismatch else None,
-                    scope_evaluation_json={
-                        "allowed": evaluation.allowed,
-                        "effective_status": evaluation.effective_status,
-                        "mismatches": [asdict(m) for m in evaluation.mismatches],
-                        "live_scopes": list(evaluation.live_scopes),
-                    },
-                    decision_explanation_json={
-                        "schema_version": 1,
-                        "idempotency": "NEW",
-                        "checks": checks,
-                        "final_decision": (
-                            ActionDecision.DENY.value
-                            if denial_reason
-                            else ActionDecision.ALLOW.value
-                        ),
-                        "final_reason": denial_reason,
-                    },
-                    request_payload_digest=request_digest,
-                    arguments_json=dict(request.arguments),
-                    arguments_digest=payload_digest(request.arguments),
-                    attempted_at=utcnow(),
-                    lifecycle_version=1,
-                    execution_state=(
-                        "DENIED"
-                        if denial_reason
-                        else ("AUTHORIZED" if spec.execution_mode == "cooperative" else "SUCCEEDED")
-                    ),
-                    worker_instance_id=(
-                        principal.worker_instance.id if principal.worker_instance is not None else None
-                    ),
-                    worker_incarnation=(
-                        principal.worker_instance.incarnation
-                        if principal.worker_instance is not None
-                        else None
-                    ),
-                    authority_vector_digest=(
-                        authority_vector_digest(evaluation) if denial_reason is None else None
-                    ),
-                    authorization_proof_revision=(
-                        run.proof_revision + 1 if denial_reason is None else None
-                    ),
-                )
-                session.add(attempt)
-                if denial_reason is None:
-                    for authority_scope in authority_vector(evaluation):
-                        session.add(
-                            ActionAuthorityBinding(
-                                run_id=node.run_id,
-                                action_id=attempt.id,
-                                scope_id=authority_scope["scope_id"],
-                                bound_version=authority_scope["bound_version"],
-                            )
-                        )
-                record_runtime_event(
-                    session,
-                    run_id=node.run_id,
-                    event_type="ACTION_REQUESTED",
-                    occurred_at=attempt.attempted_at,
-                    node_id=node.id,
-                    action_id=attempt.id,
-                    command_id=command.id if command else None,
-                    scope_id=matched_mismatch.scope_id if matched_mismatch else None,
-                    snapshot_version=(
-                        matched_mismatch.snapshot_version if matched_mismatch else None
-                    ),
-                    authoritative_version=(
-                        matched_mismatch.live_version if matched_mismatch else None
-                    ),
-                    metadata={"tool_name": request.tool_name},
-                )
-                if commands:
-                    for applicable_command in commands:
-                        mismatch = next(
-                            (
-                                item
-                                for item in evaluation.mismatches
-                                if item.scope_id == applicable_command.target_scope_id
-                            ),
-                            None,
-                        )
-                        if mismatch is None or mismatch.live_version is None or mismatch.live_status is None:
-                            continue
-                        session.add(
-                            ActionCommandMatch(
-                                run_id=node.run_id,
-                                action_id=attempt.id,
-                                command_id=applicable_command.id,
-                                scope_id=mismatch.scope_id,
-                                snapshot_version=mismatch.snapshot_version,
-                                live_version=mismatch.live_version,
-                                live_status=mismatch.live_status,
-                            )
-                        )
-
-                if denial_reason is not None:
-                    if denial_reason in STALE_REASONS:
-                        node.status = evaluation.effective_status
-                    for applicable_command in commands:
-                        self._record_gateway_ack(
-                            session,
-                            node.run_id,
-                            applicable_command.id,
-                            node.id,
-                            applicable_command.to_version,
-                        )
-                    record_runtime_event(
-                        session,
-                        run_id=node.run_id,
-                        event_type="ACTION_DENIED",
-                        occurred_at=attempt.attempted_at,
-                        node_id=node.id,
-                        action_id=attempt.id,
-                        command_id=attempt.matched_command_id,
-                        scope_id=attempt.matched_scope_id,
-                        decision=ActionDecision.DENY.value,
-                        reason_code=denial_reason,
-                        snapshot_version=attempt.matched_snapshot_version,
-                        authoritative_version=attempt.matched_live_version,
-                        metadata={"tool_name": request.tool_name},
-                    )
+                if attempt.decision == ActionDecision.DENY:
+                    denial_reason = attempt.denial_reason or "ACTION_DENIED"
                     session.commit()
                     self._record_metrics(request, denial_reason, started)
                     with telemetry.tracer.start_as_current_span(
@@ -457,6 +206,307 @@ class ActionGateway:
             except Exception:
                 session.rollback()
                 raise
+
+    async def _reserve_in_session(
+        self,
+        session: Session,
+        *,
+        node_id: str,
+        node_token: str,
+        request: ActionExecute,
+    ) -> ActionReservation:
+        """Apply canonical ActionGateway policy in the caller's transaction.
+
+        This helper neither begins nor ends a transaction.  It performs no
+        protected execution, cooperative dispatch, or provider I/O.
+        """
+        request_digest = payload_digest(request.model_dump(mode="json"))
+
+        principal = await authenticate_execution_principal(
+            session, node_id=node_id, credential=node_token
+        )
+        node = principal.node
+
+        existing = session.execute(
+            select(ActionAttempt).where(
+                ActionAttempt.node_id == node_id,
+                ActionAttempt.idempotency_key == request.idempotency_key,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if existing.request_payload_digest != request_digest:
+                raise ConflictError(
+                    "Idempotency key was reused with a different action payload",
+                    code="IDEMPOTENCY_PAYLOAD_MISMATCH",
+                )
+            if (
+                principal.protocol_version == 2
+                and principal.worker_instance is not None
+                and existing.lifecycle_version == 1
+                and existing.worker_instance_id != principal.worker_instance.id
+            ):
+                raise ConflictError(
+                    "Idempotency key belongs to a different worker incarnation",
+                    code="IDEMPOTENCY_OWNER_MISMATCH",
+                )
+            spec = get_tool_spec(request.tool_name)
+            return ActionReservation(
+                node=node,
+                spec=spec,
+                action=existing,
+                duplicate=True,
+            )
+
+        spec = get_tool_spec(request.tool_name)
+        authenticated_rate_limiter.check(
+            "action",
+            f"{node.run_id}:{node.id}",
+        )
+
+        # Tool existence and argument-shape errors are evaluated only after
+        # node authentication and exact replay handling, so the gateway
+        # cannot become an unauthenticated tool oracle and a committed
+        # response remains recoverable if policy changes later.
+        action_count = session.scalar(
+            select(func.count(ActionAttempt.id)).where(
+                ActionAttempt.run_id == node.run_id
+            )
+        ) or 0
+        if action_count >= settings.max_actions_per_run:
+            raise ConflictError(
+                "Action quota exceeded for run",
+                code="RUN_ACTION_QUOTA_EXCEEDED",
+            )
+
+        run = await get_run(session, node.run_id)
+        evaluation = await evaluate_scopes(session, node)
+
+        checks: list[dict[str, str | None]] = []
+
+        def check(name: str, passed: bool, reason: str | None = None) -> None:
+            checks.append(
+                {
+                    "name": name,
+                    "outcome": "PASS" if passed else "FAIL",
+                    "reason": None if passed else reason,
+                }
+            )
+
+        denial_reason: str | None = None
+        if run.status != "RUNNING":
+            denial_reason = "RUN_NOT_ACTIVE"
+            check("run_active", False, denial_reason)
+        else:
+            check("run_active", True)
+            if node.status not in {"ACTIVE", "WAITING"}:
+                denial_reason = "NODE_NOT_ACTIVE"
+                check("node_active", False, denial_reason)
+            else:
+                check("node_active", True)
+                if (
+                    node.lease_expires_at is None
+                    or node.lease_expires_at <= utcnow()
+                ):
+                    denial_reason = "LEASE_EXPIRED"
+                    check("lease_valid", False, denial_reason)
+                else:
+                    check("lease_valid", True)
+                    if not evaluation.allowed:
+                        denial_reason = (
+                            evaluation.primary_reason or "SCOPE_INVALID"
+                        )
+                        check("scope_current", False, denial_reason)
+                    else:
+                        check("scope_current", True)
+                        denial_reason = self._recovery_contract_denial(
+                            session,
+                            node,
+                            request,
+                            spec,
+                        )
+                        if node.caused_by_command_id is not None:
+                            check(
+                                "recovery_contract",
+                                denial_reason is None,
+                                denial_reason,
+                            )
+                        if denial_reason is None:
+                            capability_allowed = spec.capability in set(
+                                node.capabilities_json or []
+                            )
+                            if not capability_allowed:
+                                denial_reason = "TOOL_NOT_ALLOWED"
+                            check(
+                                "capability_allowed",
+                                capability_allowed,
+                                denial_reason,
+                            )
+                        if denial_reason is None:
+                            spec.validate_arguments(request.arguments)
+                            check("arguments_valid", True)
+
+        commands = []
+        command = None
+        matched_mismatch = None
+        if denial_reason in STALE_REASONS:
+            commands = await commands_for_scope_mismatches(
+                session, evaluation.mismatches, run_id=node.run_id
+            )
+            command = commands[-1] if commands else None
+            if command is not None:
+                matched_mismatch = next(
+                    (
+                        mismatch
+                        for mismatch in evaluation.mismatches
+                        if mismatch.scope_id == command.target_scope_id
+                    ),
+                    None,
+                )
+            if matched_mismatch is None and evaluation.mismatches:
+                matched_mismatch = evaluation.mismatches[0]
+
+        attempt = ActionAttempt(
+            id=str(uuid4()),
+            run_id=node.run_id,
+            node_id=node.id,
+            tool_name=request.tool_name,
+            side_effecting=spec.side_effecting,
+            idempotency_key=request.idempotency_key,
+            decision=(ActionDecision.DENY if denial_reason else ActionDecision.ALLOW),
+            denial_reason=denial_reason,
+            matched_command_id=command.id if command else None,
+            matched_scope_id=matched_mismatch.scope_id if matched_mismatch else None,
+            matched_snapshot_version=(
+                matched_mismatch.snapshot_version if matched_mismatch else None
+            ),
+            matched_live_version=matched_mismatch.live_version if matched_mismatch else None,
+            matched_live_status=matched_mismatch.live_status if matched_mismatch else None,
+            scope_evaluation_json={
+                "allowed": evaluation.allowed,
+                "effective_status": evaluation.effective_status,
+                "mismatches": [asdict(m) for m in evaluation.mismatches],
+                "live_scopes": list(evaluation.live_scopes),
+            },
+            decision_explanation_json={
+                "schema_version": 1,
+                "idempotency": "NEW",
+                "checks": checks,
+                "final_decision": (
+                    ActionDecision.DENY.value
+                    if denial_reason
+                    else ActionDecision.ALLOW.value
+                ),
+                "final_reason": denial_reason,
+            },
+            request_payload_digest=request_digest,
+            arguments_json=dict(request.arguments),
+            arguments_digest=payload_digest(request.arguments),
+            attempted_at=utcnow(),
+            lifecycle_version=1,
+            execution_state=(
+                "DENIED"
+                if denial_reason
+                else ("AUTHORIZED" if spec.execution_mode == "cooperative" else "SUCCEEDED")
+            ),
+            worker_instance_id=(
+                principal.worker_instance.id if principal.worker_instance is not None else None
+            ),
+            worker_incarnation=(
+                principal.worker_instance.incarnation
+                if principal.worker_instance is not None
+                else None
+            ),
+            authority_vector_digest=(
+                authority_vector_digest(evaluation) if denial_reason is None else None
+            ),
+            authorization_proof_revision=(
+                run.proof_revision + 1 if denial_reason is None else None
+            ),
+        )
+        session.add(attempt)
+        if denial_reason is None:
+            for authority_scope in authority_vector(evaluation):
+                session.add(
+                    ActionAuthorityBinding(
+                        run_id=node.run_id,
+                        action_id=attempt.id,
+                        scope_id=authority_scope["scope_id"],
+                        bound_version=authority_scope["bound_version"],
+                    )
+                )
+        record_runtime_event(
+            session,
+            run_id=node.run_id,
+            event_type="ACTION_REQUESTED",
+            occurred_at=attempt.attempted_at,
+            node_id=node.id,
+            action_id=attempt.id,
+            command_id=command.id if command else None,
+            scope_id=matched_mismatch.scope_id if matched_mismatch else None,
+            snapshot_version=(
+                matched_mismatch.snapshot_version if matched_mismatch else None
+            ),
+            authoritative_version=(
+                matched_mismatch.live_version if matched_mismatch else None
+            ),
+            metadata={"tool_name": request.tool_name},
+        )
+        if commands:
+            for applicable_command in commands:
+                mismatch = next(
+                    (
+                        item
+                        for item in evaluation.mismatches
+                        if item.scope_id == applicable_command.target_scope_id
+                    ),
+                    None,
+                )
+                if mismatch is None or mismatch.live_version is None or mismatch.live_status is None:
+                    continue
+                session.add(
+                    ActionCommandMatch(
+                        run_id=node.run_id,
+                        action_id=attempt.id,
+                        command_id=applicable_command.id,
+                        scope_id=mismatch.scope_id,
+                        snapshot_version=mismatch.snapshot_version,
+                        live_version=mismatch.live_version,
+                        live_status=mismatch.live_status,
+                    )
+                )
+
+        if denial_reason is not None:
+            if denial_reason in STALE_REASONS:
+                node.status = evaluation.effective_status
+            for applicable_command in commands:
+                self._record_gateway_ack(
+                    session,
+                    node.run_id,
+                    applicable_command.id,
+                    node.id,
+                    applicable_command.to_version,
+                )
+            record_runtime_event(
+                session,
+                run_id=node.run_id,
+                event_type="ACTION_DENIED",
+                occurred_at=attempt.attempted_at,
+                node_id=node.id,
+                action_id=attempt.id,
+                command_id=attempt.matched_command_id,
+                scope_id=attempt.matched_scope_id,
+                decision=ActionDecision.DENY.value,
+                reason_code=denial_reason,
+                snapshot_version=attempt.matched_snapshot_version,
+                authoritative_version=attempt.matched_live_version,
+                metadata={"tool_name": request.tool_name},
+            )
+        return ActionReservation(
+            node=node,
+            spec=spec,
+            action=attempt,
+            duplicate=False,
+        )
 
     async def _execute_cooperative(
         self,
