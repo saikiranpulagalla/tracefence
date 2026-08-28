@@ -88,7 +88,9 @@ class ReconciliationObservation:
 
 
 class OperationReconciler(Protocol):
-    async def reconcile(self, identity: ReconciliationIdentity) -> ReconciliationObservation: ...
+    async def reconcile(self, identity: ReconciliationIdentity) -> ReconciliationObservation:
+        """Read external status/evidence only; never dispatch, retry, or resume an effect."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
