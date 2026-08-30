@@ -68,6 +68,32 @@ from tracefence.telemetry.instruments import telemetry
 logger = logging.getLogger(__name__)
 
 
+_UNRESOLVED_V2_ACTION_STATES = ("AUTHORIZED", "DISPATCHED", "AMBIGUOUS")
+
+
+def _has_unresolved_v2_actions(
+    session: Session,
+    *,
+    run_id: str,
+    worker_instance_id: str | None = None,
+) -> bool:
+    """Return whether the requested lifecycle scope owns unresolved v2 work.
+
+    This predicate is shared by cooperative worker completion and successful
+    root-run completion. Its caller owns the SQLite writer transaction.
+    """
+    statement = select(ActionAttempt.id).where(
+        ActionAttempt.run_id == run_id,
+        ActionAttempt.lifecycle_version == 1,
+        ActionAttempt.execution_state.in_(_UNRESOLVED_V2_ACTION_STATES),
+    )
+    if worker_instance_id is not None:
+        statement = statement.where(
+            ActionAttempt.worker_instance_id == worker_instance_id
+        )
+    return session.scalar(statement.limit(1)) is not None
+
+
 class SpawnService:
     def __init__(self, session_factory: sessionmaker) -> None:
         self.session_factory = session_factory
@@ -757,20 +783,15 @@ class SpawnService:
                         f"Node cannot complete: {reason}",
                         code=reason or "COMPLETE_DENIED",
                     )
-                if principal.worker_instance is not None:
-                    unresolved = session.scalar(
-                        select(ActionAttempt.id).where(
-                            ActionAttempt.worker_instance_id == principal.worker_instance.id,
-                            ActionAttempt.execution_state.in_(
-                                ("AUTHORIZED", "DISPATCHED", "AMBIGUOUS")
-                            ),
-                        ).limit(1)
+                if principal.worker_instance is not None and _has_unresolved_v2_actions(
+                    session,
+                    run_id=node.run_id,
+                    worker_instance_id=principal.worker_instance.id,
+                ):
+                    raise ConflictError(
+                        "Worker cannot complete while owned operations remain unresolved",
+                        code="WORKER_HAS_UNRESOLVED_ACTIONS",
                     )
-                    if unresolved is not None:
-                        raise ConflictError(
-                            "Worker cannot complete while owned operations remain unresolved",
-                            code="WORKER_HAS_UNRESOLVED_ACTIONS",
-                        )
 
                 run = session.get(Run, node.run_id)
                 if run is None:
@@ -835,6 +856,11 @@ class SpawnService:
                         raise ConflictError(
                             "Root cannot complete while valid descendant nodes remain live",
                             code="RUN_HAS_LIVE_NODES",
+                        )
+                    if _has_unresolved_v2_actions(session, run_id=run.id):
+                        raise ConflictError(
+                            "Root cannot complete while Run operations remain unresolved",
+                            code="RUN_HAS_UNRESOLVED_ACTIONS",
                         )
                     transition_run(
                         session,
