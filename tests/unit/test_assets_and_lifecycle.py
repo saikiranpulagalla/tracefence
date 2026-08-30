@@ -249,6 +249,54 @@ async def test_legacy_v0_action_does_not_block_modern_completion(session_factory
         assert action.lifecycle_version == 0
         assert action.execution_state is None
         assert stored_run.status == RunStatus.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("failed", "expected_state"),
+    [(False, "SUCCEEDED"), (True, "FAILED")],
+)
+async def test_terminal_v2_action_does_not_block_root_completion(
+    session_factory,
+    failed: bool,
+    expected_state: str,
+):
+    run = await create_v2_run(session_factory, f"terminal-{expected_state.lower()}")
+    lifecycle = OperationLifecycleService(session_factory)
+    action = await lifecycle.reserve(
+        node_id=run.root_node_id,
+        credential=run.root_token,
+        request=_action_request(f"terminal-{expected_state.lower()}"),
+    )
+    with session_factory() as session:
+        stored_action = session.get(ActionAttempt, action.id)
+        assert stored_action is not None
+        worker_instance_id = stored_action.worker_instance_id
+        worker_incarnation = stored_action.worker_incarnation
+    assert worker_instance_id is not None and worker_incarnation is not None
+    await lifecycle.mark_dispatched(
+        action_id=action.id,
+        worker_instance_id=worker_instance_id,
+        worker_incarnation=worker_incarnation,
+    )
+    await lifecycle.accept_result(
+        action_id=action.id,
+        worker_instance_id=worker_instance_id,
+        worker_incarnation=worker_incarnation,
+        tool_name="restart_postgres",
+        arguments_digest=payload_digest({}),
+        result={"terminal": expected_state},
+        failed=failed,
+    )
+
+    await SpawnService(session_factory).complete(run.root_node_id, run.root_token)
+    with session_factory() as session:
+        stored_action = session.get(ActionAttempt, action.id)
+        stored_run = session.get(Run, run.run_id)
+        assert stored_action is not None and stored_run is not None
+        assert stored_action.execution_state == expected_state
+        assert stored_run.status == RunStatus.COMPLETED
+
+
 async def test_manual_lease_expiry_is_scoped_to_requested_run(session_factory):
 
     spawns = SpawnService(session_factory)
