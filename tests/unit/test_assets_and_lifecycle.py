@@ -4,17 +4,20 @@ import importlib.util
 import json
 from datetime import timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
 
-from tests.helpers import activate, create_seeded_run
-from tracefence.db.models import Node, Run
-from tracefence.domain.enums import NodeStatus, RunStatus
+from tests.helpers import activate, create_seeded_run, create_v2_run
+from tracefence.db.models import ActionAttempt, Node, Run
+from tracefence.domain.enums import ActionDecision, NodeStatus, RunStatus
 from tracefence.domain.errors import ConflictError
-from tracefence.domain.schemas import SpawnCreate
+from tracefence.domain.schemas import ActionExecute, SpawnCreate
+from tracefence.security import payload_digest
 from tracefence.services.common import utcnow
 from tracefence.services.lease_service import LeaseService
+from tracefence.services.operation_lifecycle import OperationLifecycleService
 from tracefence.services.spawn_service import SpawnService
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -127,7 +130,127 @@ async def test_root_completion_closes_run_only_after_valid_descendants_finish(se
         assert session.get(Node, run.root_node_id).status == NodeStatus.COMPLETED
 
 
+def _action_request(key: str) -> ActionExecute:
+    return ActionExecute(
+        tool_name="restart_postgres",
+        arguments={},
+        idempotency_key=key,
+    )
+
+
+async def _run_with_unresolved_child_action(
+    session_factory, state: str, node_status: NodeStatus
+):
+    spawns = SpawnService(session_factory)
+    run = await create_v2_run(session_factory, f"completion-{state.lower()}")
+    child = await activate(
+        spawns,
+        await spawns.create_spawn(
+            run.root_node_id,
+            run.root_token,
+            SpawnCreate(role="child", capabilities=["tool:restart_postgres"]),
+        ),
+    )
+    lifecycle = OperationLifecycleService(session_factory)
+    action = await lifecycle.reserve(
+        node_id=child.node_id,
+        credential=child.node_token,
+        request=_action_request(f"action-{state.lower()}"),
+    )
+    if state in {"DISPATCHED", "AMBIGUOUS"}:
+        with session_factory() as session:
+            stored_action = session.get(ActionAttempt, action.id)
+            assert stored_action is not None
+            worker_instance_id = stored_action.worker_instance_id
+            worker_incarnation = stored_action.worker_incarnation
+        assert worker_instance_id is not None and worker_incarnation is not None
+        claim = await lifecycle.mark_dispatched(
+            action_id=action.id,
+            worker_instance_id=worker_instance_id,
+            worker_incarnation=worker_incarnation,
+        )
+        assert claim.status.value == "CLAIMED"
+    if state == "AMBIGUOUS":
+        with session_factory.begin() as session:
+            stored_action = session.get(ActionAttempt, action.id)
+            assert stored_action is not None
+            stored_action.execution_state = "AMBIGUOUS"
+    with session_factory.begin() as session:
+        stored_child = session.get(Node, child.node_id)
+        assert stored_child is not None
+        stored_child.status = node_status
+    return run, action.id
+
+
+@pytest.mark.parametrize("state", ["AUTHORIZED", "DISPATCHED", "AMBIGUOUS"])
+@pytest.mark.parametrize(
+    "node_status",
+    [NodeStatus.CANCELLED, NodeStatus.SUPERSEDED, NodeStatus.LEASE_EXPIRED],
+)
+async def test_root_completion_rejects_unresolved_v2_action_on_nonlive_descendant(
+    session_factory,
+    state: str,
+    node_status: NodeStatus,
+):
+    run, action_id = await _run_with_unresolved_child_action(
+        session_factory, state, node_status
+    )
+    with session_factory() as session:
+        before_revision = session.get(Run, run.run_id).proof_revision
+
+    with pytest.raises(ConflictError) as captured:
+        await SpawnService(session_factory).complete(run.root_node_id, run.root_token)
+    assert captured.value.code == "RUN_HAS_UNRESOLVED_ACTIONS"
+
+    with session_factory() as session:
+        stored_run = session.get(Run, run.run_id)
+        stored_action = session.get(ActionAttempt, action_id)
+        assert stored_run is not None and stored_action is not None
+        assert stored_run.status == RunStatus.RUNNING
+        assert stored_run.proof_revision == before_revision
+        assert stored_action.execution_state == state
+
+
+async def test_legacy_v0_action_does_not_block_modern_completion(session_factory):
+    run = await create_v2_run(session_factory, "legacy-v0-completion")
+    action_id = str(uuid4())
+    result = {"legacy": True}
+    now = utcnow()
+    with session_factory.begin() as session:
+        session.add(
+            ActionAttempt(
+                id=action_id,
+                run_id=run.run_id,
+                node_id=run.root_node_id,
+                tool_name="restart_postgres",
+                side_effecting=True,
+                idempotency_key="legacy-v0-action",
+                decision=ActionDecision.ALLOW,
+                denial_reason=None,
+                scope_evaluation_json={"allowed": True},
+                request_payload_digest=payload_digest({"legacy": "request"}),
+                arguments_json={},
+                arguments_digest=payload_digest({}),
+                result_json=result,
+                result_digest=payload_digest(result),
+                attempted_at=now,
+                committed_at=now,
+                lifecycle_version=0,
+                execution_state=None,
+            )
+        )
+
+    await SpawnService(session_factory).complete(run.root_node_id, run.root_token)
+
+    with session_factory() as session:
+        action = session.get(ActionAttempt, action_id)
+        stored_run = session.get(Run, run.run_id)
+        assert action is not None and stored_run is not None
+        assert action.lifecycle_version == 0
+        assert action.execution_state is None
+        assert stored_run.status == RunStatus.COMPLETED
 async def test_manual_lease_expiry_is_scoped_to_requested_run(session_factory):
+
     spawns = SpawnService(session_factory)
     leases = LeaseService(session_factory)
     run_a = await create_seeded_run(session_factory, "lease-a")
