@@ -23,6 +23,8 @@ from tracefence.db.models import (
 from tracefence.domain.errors import ConflictError, NotFoundError
 from tracefence.providers.contracts import (
     ProviderAdapterContract,
+    ProviderDispatchOutcome,
+    ProviderDispatchOutcomeKind,
     ProviderDispatchRequest,
 )
 from tracefence.providers.registry import (
@@ -33,7 +35,10 @@ from tracefence.security import payload_digest
 from tracefence.services.common import utcnow
 from tracefence.services.operation_lifecycle import (
     DispatchClaimStatus,
+    OperationAuthorityStatus,
     OperationLifecycleService,
+    evaluate_live_bound_action_authority,
+    evaluate_recovery_dispatch_basis,
 )
 from tracefence.services.operation_reconciliation import (
     OperationReconciliationService,
@@ -53,7 +58,7 @@ class ProviderDeliveryClaimStatus(StrEnum):
 @dataclass(frozen=True, slots=True)
 class ProviderDeliveryClaim:
     action: ActionAttempt
-    intent: ProviderExecutionIntent
+    intent: ProviderExecutionIntent | None
     status: ProviderDeliveryClaimStatus
     request: ProviderDispatchRequest | None = None
 
@@ -164,6 +169,34 @@ class ProviderExecutionService:
                 action = session.get(ActionAttempt, action_id)
                 if action is None:
                     raise NotFoundError(f"Action attempt {action_id} was not found")
+                lifecycle = OperationLifecycleService(self.session_factory)
+                lifecycle._require_owner(
+                    action, worker_instance_id, worker_incarnation
+                )
+                authority = await evaluate_live_bound_action_authority(session, action)
+                if authority.status == OperationAuthorityStatus.ALLOWED:
+                    authority = evaluate_recovery_dispatch_basis(session, action)
+                if authority.status != OperationAuthorityStatus.ALLOWED:
+                    if action.execution_state == "AUTHORIZED":
+                        claim = await lifecycle._claim_dispatch_in_session(
+                            session,
+                            action_id=action_id,
+                            worker_instance_id=worker_instance_id,
+                            worker_incarnation=worker_incarnation,
+                        )
+                        session.commit()
+                        return ProviderDeliveryClaim(
+                            claim.action,
+                            None,
+                            ProviderDeliveryClaimStatus(claim.status.value),
+                        )
+                    session.commit()
+                    status = (
+                        ProviderDeliveryClaimStatus.REVOKED
+                        if authority.status == OperationAuthorityStatus.REVOKED
+                        else ProviderDeliveryClaimStatus.UNCERTAIN
+                    )
+                    return ProviderDeliveryClaim(action, None, status)
                 intent = self._intent_for_action(session, action_id)
                 binding = session.get(ActionExternalOperationBinding, action_id)
                 if intent is None or binding is None:
@@ -202,7 +235,6 @@ class ProviderExecutionService:
                         action, intent, ProviderDeliveryClaimStatus.ALREADY_DISPATCHED
                     )
 
-                lifecycle = OperationLifecycleService(self.session_factory)
                 claim = await lifecycle._claim_dispatch_in_session(
                     session,
                     action_id=action_id,
@@ -267,22 +299,93 @@ class ProviderExecutionService:
                 session.rollback()
                 raise
 
-    async def bind_provider_handle(
-        self, *, action_id: str, provider_handle: str
+    async def record_dispatch_outcome(
+        self,
+        *,
+        claim_token: str,
+        worker_instance_id: str,
+        worker_incarnation: int,
+        outcome: ProviderDispatchOutcome,
     ) -> ReconciliationIdentity:
-        """Use the existing reconciliation binding-once service and conflict model."""
+        """Record a typed outcome only when its exact delivery claim authorizes it.
+
+        The opaque claim token is a server-generated, process-internal
+        correlation capability. It identifies one committed provider claim; it
+        is not an external credential and cannot select an arbitrary action.
+        """
+        if not claim_token:
+            raise ValueError("claim_token must be non-empty")
         with self.session_factory() as session:
-            action = session.get(ActionAttempt, action_id)
-            binding = session.get(ActionExternalOperationBinding, action_id)
-            if action is None or binding is None:
-                raise ConflictError(
-                    "Action has no external operation binding",
-                    code="ACTION_RECONCILIATION_BINDING_MISSING",
+            session.execute(text("BEGIN IMMEDIATE"))
+            try:
+                intents = session.scalars(
+                    select(ProviderExecutionIntent).where(
+                        ProviderExecutionIntent.claim_token == claim_token
+                    )
+                ).all()
+                if len(intents) != 1:
+                    raise ConflictError(
+                        "Provider delivery claim correlation is invalid",
+                        code="PROVIDER_DELIVERY_CLAIM_INVALID",
+                    )
+                intent = intents[0]
+                action = session.get(ActionAttempt, intent.action_id)
+                binding = session.get(ActionExternalOperationBinding, intent.action_id)
+                if action is None or binding is None:
+                    raise ConflictError(
+                        "Provider execution intent binding is invalid",
+                        code="PROVIDER_EXECUTION_INTENT_BINDING_INVALID",
+                    )
+                lifecycle = OperationLifecycleService(self.session_factory)
+                lifecycle._require_owner(
+                    action, worker_instance_id, worker_incarnation
                 )
-            identity = OperationReconciliationService._identity(action, binding)
-        return await OperationReconciliationService(self.session_factory).bind_provider_handle(
-            identity=identity, provider_handle=provider_handle
-        )
+                if (
+                    intent.delivery_status != "CLAIMED"
+                    or action.execution_state != "DISPATCHED"
+                ):
+                    raise ConflictError(
+                        "Provider delivery claim is not eligible for outcome recording",
+                        code="PROVIDER_DELIVERY_CLAIM_INVALID",
+                    )
+                contract = ProviderAdapterContract(
+                    binding.provider_adapter_id,
+                    binding.provider_config_ref,
+                    binding.provider_scope_ref,
+                    binding.tool_reconciliation_version,
+                    intent.provider_dispatch_contract_version,
+                )
+                if self.adapter_registry.resolve(contract) is None:
+                    raise ConflictError(
+                        "No trusted provider adapter matches the execution intent",
+                        code="PROVIDER_ADAPTER_UNREGISTERED",
+                    )
+                if intent.provider_request_digest != payload_digest(
+                    self._request_envelope(action, binding, contract)
+                ):
+                    raise ConflictError(
+                        "Provider execution intent request identity is invalid",
+                        code="PROVIDER_EXECUTION_INTENT_MISMATCH",
+                    )
+                if (
+                    outcome.kind == ProviderDispatchOutcomeKind.ACCEPTED
+                    and outcome.provider_handle is not None
+                ):
+                    if binding.provider_handle is None:
+                        binding.provider_handle = outcome.provider_handle
+                        binding.provider_handle_bound_at = utcnow()
+                    elif binding.provider_handle != outcome.provider_handle:
+                        raise ConflictError(
+                            "Provider handle cannot be overwritten",
+                            code="ACTION_PROVIDER_HANDLE_CONFLICT",
+                        )
+                session.flush()
+                identity = OperationReconciliationService._identity(action, binding)
+                session.commit()
+                return identity
+            except Exception:
+                session.rollback()
+                raise
 
     @staticmethod
     def _request_envelope(
