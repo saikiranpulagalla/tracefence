@@ -3,14 +3,21 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from tests.unit.test_provider_execution_intents import _request, _rows, _run
+from tracefence.db.models import Node, WorkerInstance
 from tracefence.domain.errors import ConflictError
 from tracefence.domain.schemas import ActionExecute
+from tracefence.providers.contracts import (
+    ProviderDispatchOutcome,
+    ProviderDispatchOutcomeKind,
+)
+from tracefence.security import hash_token
 from tracefence.services.action_gateway import ActionGateway
 from tracefence.services.provider_execution import (
     ProviderDeliveryClaimStatus,
@@ -31,6 +38,8 @@ CASES = (
     "handle-conflict-rejected",
     "intent-immutable",
     "intent-no-delete",
+    "active-claim-w2-rejected",
+    "correlated-handle-rejects-foreign",
 )
 
 
@@ -141,23 +150,123 @@ async def test_provider_execution_intent_matrix(session_factory, monkeypatch, it
         return
 
     if case in {"handle-first-bind", "handle-replay-idempotent", "handle-conflict-rejected"}:
-        first = await service.bind_provider_handle(
-            action_id=action.id, provider_handle=f"handle-{iteration}-{case}"
+        claim = await service.claim_delivery(
+            action_id=action.id,
+            worker_instance_id=action.worker_instance_id or "",
+            worker_incarnation=action.worker_incarnation or 0,
+        )
+        assert claim.request is not None
+        outcome = ProviderDispatchOutcome(
+            ProviderDispatchOutcomeKind.ACCEPTED,
+            provider_handle=f"handle-{iteration}-{case}",
+        )
+        first = await service.record_dispatch_outcome(
+            claim_token=claim.request.claim_token,
+            worker_instance_id=action.worker_instance_id or "",
+            worker_incarnation=action.worker_incarnation or 0,
+            outcome=outcome,
         )
         if case == "handle-first-bind":
             assert first.provider_handle
             return
-        replay = await service.bind_provider_handle(
-            action_id=action.id, provider_handle=first.provider_handle or ""
+        replay = await service.record_dispatch_outcome(
+            claim_token=claim.request.claim_token,
+            worker_instance_id=action.worker_instance_id or "",
+            worker_incarnation=action.worker_incarnation or 0,
+            outcome=outcome,
         )
         assert replay == first
         if case == "handle-replay-idempotent":
             return
         with pytest.raises(ConflictError) as error:
-            await service.bind_provider_handle(
-                action_id=action.id, provider_handle=f"other-{iteration}"
+            await service.record_dispatch_outcome(
+                claim_token=claim.request.claim_token,
+                worker_instance_id=action.worker_instance_id or "",
+                worker_incarnation=action.worker_incarnation or 0,
+                outcome=ProviderDispatchOutcome(
+                    ProviderDispatchOutcomeKind.ACCEPTED,
+                    provider_handle=f"other-{iteration}",
+                ),
             )
         assert error.value.code == "ACTION_PROVIDER_HANDLE_CONFLICT"
+        return
+
+    if case == "active-claim-w2-rejected":
+        claim = await service.claim_delivery(
+            action_id=action.id,
+            worker_instance_id=action.worker_instance_id or "",
+            worker_incarnation=action.worker_incarnation or 0,
+        )
+        assert claim.request is not None
+        _claimed_action, _claimed_binding, claimed_intent, _claimed_proof = _rows(
+            session_factory, run.run_id
+        )
+        with session_factory.begin() as session:
+            node = session.get(Node, action.node_id)
+            w1 = session.get(WorkerInstance, action.worker_instance_id)
+            assert node is not None and w1 is not None
+            w2 = WorkerInstance(
+                id=str(uuid4()),
+                node_id=w1.node_id,
+                incarnation=w1.incarnation + 1,
+                observed_state="ACTIVE",
+                activated_at=w1.activated_at,
+                credential_hash=hash_token(f"provider-active-w2-{iteration}"),
+            )
+            session.add(w2)
+            session.flush()
+            node.current_worker_instance_id = w2.id
+        _current, _binding, _current_intent, before = _rows(session_factory, run.run_id)
+        with pytest.raises(ConflictError) as error:
+            await service.claim_delivery(
+                action_id=action.id,
+                worker_instance_id=w2.id,
+                worker_incarnation=w2.incarnation,
+            )
+        details = f"{error.value!r} {error.value}"
+        assert error.value.code == "ACTION_WORKER_OWNER_MISMATCH"
+        assert claimed_intent.provider_idempotency_key not in details
+        assert claimed_intent.provider_request_digest not in details
+        assert claimed_intent.claim_token not in details
+        current, _binding, current_intent, after = _rows(session_factory, run.run_id)
+        assert current.execution_state == "DISPATCHED"
+        assert current_intent.claim_token == claimed_intent.claim_token
+        assert after.proof_revision == before.proof_revision
+        return
+
+    if case == "correlated-handle-rejects-foreign":
+        claim = await service.claim_delivery(
+            action_id=action.id,
+            worker_instance_id=action.worker_instance_id or "",
+            worker_incarnation=action.worker_incarnation or 0,
+        )
+        assert claim.request is not None
+        with pytest.raises(ConflictError) as error:
+            await service.record_dispatch_outcome(
+                claim_token=f"fabricated-{iteration}",
+                worker_instance_id=action.worker_instance_id or "",
+                worker_incarnation=action.worker_incarnation or 0,
+                outcome=ProviderDispatchOutcome(
+                    ProviderDispatchOutcomeKind.ACCEPTED,
+                    provider_handle=f"evil-{iteration}",
+                ),
+            )
+        assert error.value.code == "PROVIDER_DELIVERY_CLAIM_INVALID"
+        _current, binding_after_invalid, _intent, after_invalid = _rows(
+            session_factory, run.run_id
+        )
+        assert binding_after_invalid.provider_handle is None
+        identity = await service.record_dispatch_outcome(
+            claim_token=claim.request.claim_token,
+            worker_instance_id=action.worker_instance_id or "",
+            worker_incarnation=action.worker_incarnation or 0,
+            outcome=ProviderDispatchOutcome(
+                ProviderDispatchOutcomeKind.ACCEPTED,
+                provider_handle=f"trusted-{iteration}",
+            ),
+        )
+        assert identity.provider_handle == f"trusted-{iteration}"
+        assert _rows(session_factory, run.run_id)[3].proof_revision > after_invalid.proof_revision
         return
 
     if case == "intent-immutable":
