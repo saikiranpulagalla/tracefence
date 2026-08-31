@@ -960,8 +960,65 @@ class ActionExternalOperationBinding(Base):
     provider_handle_bound_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class ProviderExecutionIntent(Base):
+    """Immutable provider request identity with narrowly mutable delivery metadata."""
+
+    __tablename__ = "provider_execution_intents"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_provider_execution_intent"),
+        UniqueConstraint("run_id", "action_id", name="uq_provider_execution_intent_action"),
+        UniqueConstraint(
+            "provider_idempotency_key", name="uq_provider_execution_intent_idempotency_key"
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "action_id"],
+            ["action_external_operation_bindings.run_id", "action_external_operation_bindings.action_id"],
+            ondelete="CASCADE",
+            name="fk_provider_execution_intent_binding",
+        ),
+        CheckConstraint(
+            "delivery_status IN ('PENDING','CLAIMED','HANDED_OFF')",
+            name="ck_provider_execution_intent_delivery_status",
+        ),
+        CheckConstraint(
+            "(delivery_status = 'CLAIMED' AND claim_token IS NOT NULL AND claim_expires_at IS NOT NULL) OR "
+            "(delivery_status != 'CLAIMED' AND claim_token IS NULL AND claim_expires_at IS NULL)",
+            name="ck_provider_execution_intent_claim_shape",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_provider_execution_intent_attempt_count"),
+        CheckConstraint(
+            "observation_attempt_count >= 0",
+            name="ck_provider_execution_intent_observation_attempt_count",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    action_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    provider_idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    provider_dispatch_contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_request_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    provider_request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    delivery_status: Mapped[str] = mapped_column(String(24), nullable=False, default="PENDING")
+    claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    next_delivery_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error_class: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    observation_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    next_observation_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_observation_error_class: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
 class ActionReconciliationEvidence(Base):
     __tablename__ = "action_reconciliation_evidence"
+
     __table_args__ = (
         PrimaryKeyConstraint("id", name="pk_action_reconciliation_evidence"),
         UniqueConstraint("action_id", "evidence_digest", name="uq_action_reconciliation_evidence_digest"),

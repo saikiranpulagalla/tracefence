@@ -41,6 +41,7 @@ from tracefence.services.operation_lifecycle import (
     OperationLifecycleService,
     OperationRevoked,
 )
+from tracefence.services.provider_execution import ProviderExecutionService
 from tracefence.services.runtime_events import record_runtime_event
 from tracefence.services.tool_registry import ToolSpec, get_tool_spec
 from tracefence.telemetry.instruments import telemetry
@@ -149,6 +150,11 @@ class ActionGateway:
                         spec=spec,
                         action=attempt,
                     )
+                if spec.execution_mode == "provider_external":
+                    # Phase 3A-1 persists intent only. Provider delivery is an
+                    # explicit later caller action, never ActionGateway I/O.
+                    session.commit()
+                    return self._result(attempt)
 
                 # The persisted ALLOW row is constrained to contain its final
                 # result and commit timestamp. Tool executors may query/update
@@ -406,7 +412,11 @@ class ActionGateway:
             execution_state=(
                 "DENIED"
                 if denial_reason
-                else ("AUTHORIZED" if spec.execution_mode == "cooperative" else "SUCCEEDED")
+                else (
+                    "AUTHORIZED"
+                    if spec.execution_mode in {"cooperative", "provider_external"}
+                    else "SUCCEEDED"
+                )
             ),
             worker_instance_id=(
                 principal.worker_instance.id if principal.worker_instance is not None else None
@@ -433,6 +443,12 @@ class ActionGateway:
                         scope_id=authority_scope["scope_id"],
                         bound_version=authority_scope["bound_version"],
                     )
+                )
+            if spec.execution_mode == "provider_external":
+                if spec.provider_contract is None:
+                    raise RuntimeError("provider_external tool is missing its provider contract")
+                ProviderExecutionService.create_intent_in_session(
+                    session, action=attempt, contract=spec.provider_contract
                 )
         record_runtime_event(
             session,

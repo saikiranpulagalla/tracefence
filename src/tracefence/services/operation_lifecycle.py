@@ -507,6 +507,39 @@ class OperationLifecycleService:
                 session.rollback()
                 raise
 
+
+    async def _claim_dispatch_in_session(
+        self,
+        session: Session,
+        *,
+        action_id: str,
+        worker_instance_id: str,
+        worker_incarnation: int,
+    ) -> DispatchClaim:
+        """Claim dispatch using the caller-owned serialized writer transaction."""
+        action = self._action(session, action_id)
+        self._require_owner(action, worker_instance_id, worker_incarnation)
+        if action.execution_state == "DISPATCHED":
+            return DispatchClaim(action, DispatchClaimStatus.ALREADY_DISPATCHED)
+        if action.execution_state != "AUTHORIZED":
+            return DispatchClaim(action, DispatchClaimStatus.TERMINAL)
+        authority = await evaluate_live_bound_action_authority(session, action)
+        if authority.status == OperationAuthorityStatus.ALLOWED:
+            authority = evaluate_recovery_dispatch_basis(session, action)
+        if authority.status == OperationAuthorityStatus.REVOKED:
+            action.execution_state = "STALE"
+            action.stale_result_digest = payload_digest(
+                {"dispatch": "not_started", "reason": authority.reason_code}
+            )
+            action.stale_reason_code = authority.reason_code or "AUTHORITY_NOT_LIVE"
+            action.stale_observed_at = utcnow()
+            return DispatchClaim(action, DispatchClaimStatus.REVOKED)
+        if authority.status == OperationAuthorityStatus.UNCERTAIN:
+            return DispatchClaim(action, DispatchClaimStatus.UNCERTAIN)
+        action.execution_state = "DISPATCHED"
+        action.dispatched_at = utcnow()
+        return DispatchClaim(action, DispatchClaimStatus.CLAIMED)
+
     async def accept_result(
         self,
         *,

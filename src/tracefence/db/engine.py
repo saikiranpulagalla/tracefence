@@ -20,6 +20,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from migrations.schema_baselines.v24 import V24_SCHEMA_INTEGRITY_TRIGGER_DDL
 from migrations.schema_baselines.v25 import V25_SCHEMA_INTEGRITY_TRIGGER_DDL
 from migrations.schema_baselines.v26 import V26_SCHEMA_INTEGRITY_TRIGGER_DDL
+from migrations.schema_baselines.v27 import (
+    V27_PROVIDER_HANDLE_UNIQUE_INDEX_DDL,
+    V27_SCHEMA_INTEGRITY_TRIGGER_DDL,
+)
 from tracefence.config import settings
 from tracefence.db.models import (
     SCHEMA_INTEGRITY_TRIGGER_DDL,
@@ -62,6 +66,7 @@ _ALL_SCHEMA_INTEGRITY_TRIGGER_DDL = {
     **V24_SCHEMA_INTEGRITY_TRIGGER_DDL,
     **V25_SCHEMA_INTEGRITY_TRIGGER_DDL,
     **V26_SCHEMA_INTEGRITY_TRIGGER_DDL,
+    **V27_SCHEMA_INTEGRITY_TRIGGER_DDL,
 }
 _SCHEMA_INTEGRITY_TRIGGER_NAMES = set(_ALL_SCHEMA_INTEGRITY_TRIGGER_DDL)
 
@@ -89,6 +94,7 @@ def _proof_revision_trigger_names() -> set[str]:
         "trg_action_recovery_links_update_proof_revision",
         "trg_action_recovery_links_delete_proof_revision",
         "trg_runs_update_proof_revision",
+        "trg_provider_execution_intents_insert_proof_revision",
     }
 
 
@@ -181,8 +187,16 @@ def _install_v24_schema_integrity_triggers(selected_engine: Engine) -> None:
             **V24_SCHEMA_INTEGRITY_TRIGGER_DDL,
             **V25_SCHEMA_INTEGRITY_TRIGGER_DDL,
             **V26_SCHEMA_INTEGRITY_TRIGGER_DDL,
+            **V27_SCHEMA_INTEGRITY_TRIGGER_DDL,
         }.values():
             connection.exec_driver_sql(trigger_ddl)
+        connection.exec_driver_sql(V27_PROVIDER_HANDLE_UNIQUE_INDEX_DDL)
+        connection.exec_driver_sql(
+            """CREATE TRIGGER IF NOT EXISTS trg_provider_execution_intents_insert_proof_revision
+            AFTER INSERT ON provider_execution_intents
+            BEGIN UPDATE runs SET proof_revision = proof_revision + 1
+            WHERE id = NEW.run_id; END"""
+        )
         for operation, row in (("insert", "NEW"), ("update", "NEW"), ("delete", "OLD")):
             connection.exec_driver_sql(
                 f"CREATE TRIGGER IF NOT EXISTS trg_action_recovery_links_{operation}_proof_revision "  # nosec B608: fixed private operation tuple
@@ -413,6 +427,12 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
             "ck_worker_stop_task_state",
             "ck_worker_stop_task_attempt_count_nonnegative",
         },
+        "provider_execution_intents": {
+            "ck_provider_execution_intent_delivery_status",
+            "ck_provider_execution_intent_claim_shape",
+            "ck_provider_execution_intent_attempt_count",
+            "ck_provider_execution_intent_observation_attempt_count",
+        },
     }
     for table_name, required_checks in versioned_checks.items():
         expected_checks = {
@@ -475,9 +495,13 @@ def _validate_schema_shape(selected_engine: Engine) -> None:
     v22_partial_unique_indexes = {
         "uq_runtime_stop_intent_source_command": V22_PARTIAL_UNIQUE_INDEX_DDL[0],
     }
+    v27_partial_unique_indexes = {
+        "uq_action_external_operation_binding_provider_handle": V27_PROVIDER_HANDLE_UNIQUE_INDEX_DDL,
+    }
     partial_unique_indexes = {
         **v21_partial_unique_indexes,
         **v22_partial_unique_indexes,
+        **v27_partial_unique_indexes,
     }
     malformed_indexes = sorted(
         name
@@ -501,8 +525,8 @@ engine = build_engine()
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=Session)
 
 
-SCHEMA_VERSION = 26
-ALEMBIC_HEAD = "010_schema_v26_action_recovery"
+SCHEMA_VERSION = 27
+ALEMBIC_HEAD = "011_schema_v27_provider_execution_intents"
 
 
 def _stamp_alembic_head(selected_engine: Engine) -> None:

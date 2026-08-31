@@ -12,6 +12,7 @@ from tracefence.config import settings
 from tracefence.db.models import ServiceState, utcnow
 from tracefence.domain.errors import ConflictError
 from tracefence.domain.schemas import RecoveryContract
+from tracefence.providers.contracts import ProviderAdapterContract
 from tracefence.security import payload_digest
 from tracefence.services.operation_lifecycle import CooperativeOperationContext
 
@@ -38,8 +39,9 @@ class ToolSpec:
     allowed_argument_keys: frozenset[str]
     resources: frozenset[str]
     executor: ToolExecutor | None = None
-    execution_mode: Literal["sqlite_atomic", "cooperative"] = "sqlite_atomic"
+    execution_mode: Literal["sqlite_atomic", "cooperative", "provider_external"] = "sqlite_atomic"
     cooperative_executor: CooperativeToolExecutor | None = None
+    provider_contract: ProviderAdapterContract | None = None
     recommended_replacement_role: str | None = None
     recovery_contract_builder: RecoveryContractBuilder | None = None
     # Explicit successor recovery is intentionally disabled unless a
@@ -56,11 +58,27 @@ class ToolSpec:
                 raise ValueError(
                     "sqlite_atomic tools require exactly one synchronous executor"
                 )
-            return
+            if self.provider_contract is None:
+                return
+            raise ValueError("sqlite_atomic tools cannot declare a provider contract")
         if self.execution_mode == "cooperative":
-            if self.executor is not None or self.cooperative_executor is None:
+            if (
+                self.executor is not None
+                or self.cooperative_executor is None
+                or self.provider_contract is not None
+            ):
                 raise ValueError(
                     "cooperative tools require exactly one cooperative executor"
+                )
+            return
+        if self.execution_mode == "provider_external":
+            if (
+                self.executor is not None
+                or self.cooperative_executor is not None
+                or self.provider_contract is None
+            ):
+                raise ValueError(
+                    "provider_external tools require exactly one provider contract"
                 )
             return
         raise ValueError(f"Unsupported tool execution mode: {self.execution_mode}")
@@ -82,7 +100,7 @@ class ToolSpec:
     ) -> dict[str, Any]:
         self.validate_arguments(arguments)
         if self.execution_mode != "sqlite_atomic" or self.executor is None:
-            raise RuntimeError("Cooperative tools cannot execute in a SQLite transaction")
+            raise RuntimeError("Non-SQLite tools cannot execute in a SQLite transaction")
         return self.executor(session, run_id, action_id, arguments)
 
     async def execute_cooperative(
@@ -90,7 +108,7 @@ class ToolSpec:
     ) -> dict[str, Any]:
         self.validate_arguments(arguments)
         if self.execution_mode != "cooperative" or self.cooperative_executor is None:
-            raise RuntimeError("SQLite-atomic tools cannot execute cooperatively")
+            raise RuntimeError("Only cooperative tools can execute cooperatively")
         return await self.cooperative_executor(context, arguments)
 
     def build_recovery_contract(
