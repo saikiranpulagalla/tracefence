@@ -36,9 +36,7 @@ CASES = (
 
 @pytest.mark.parametrize("iteration", REPETITIONS)
 @pytest.mark.parametrize("case", CASES)
-async def test_provider_execution_intent_matrix(
-    session_factory, monkeypatch, iteration, case
-):
+async def test_provider_execution_intent_matrix(session_factory, monkeypatch, iteration, case):
     run, provider, registry = await _run(
         session_factory, monkeypatch, f"provider-intent-{case}-{iteration}"
     )
@@ -185,4 +183,3 @@ async def test_provider_execution_intent_matrix(
                 {"id": intent.id},
             )
     assert _rows(session_factory, run.run_id)[2].id == intent.id
-
