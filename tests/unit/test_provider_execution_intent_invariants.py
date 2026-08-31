@@ -100,4 +100,3 @@ async def test_expired_claim_never_reauthorizes_or_rekeys_provider_action(
     assert duplicate.status == ProviderDeliveryClaimStatus.ALREADY_DISPATCHED
     assert current.execution_state == "DISPATCHED"
     assert current_intent.provider_idempotency_key == intent.provider_idempotency_key
-

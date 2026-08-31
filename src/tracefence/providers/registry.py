@@ -50,4 +50,3 @@ class ProviderAdapterRegistry:
 
 
 PRODUCTION_PROVIDER_ADAPTER_REGISTRY = ProviderAdapterRegistry()
-

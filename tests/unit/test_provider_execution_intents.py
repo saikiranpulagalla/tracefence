@@ -193,4 +193,3 @@ async def test_intent_operational_retry_metadata_does_not_change_proof_revision(
     assert after_intent.id == intent.id
     assert after_intent.last_error_class == "TEST_DELIVERY_ERROR"
     assert after.proof_revision == before.proof_revision
-
