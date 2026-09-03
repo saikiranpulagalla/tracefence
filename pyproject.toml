@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.28.1,<2"]
+mcp = ["mcp>=1.28.1,<3"]
 otel-instrumentation = [
   "opentelemetry-instrumentation-fastapi==0.65b0",
   "opentelemetry-instrumentation-httpx==0.65b0",
