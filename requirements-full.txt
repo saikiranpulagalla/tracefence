@@ -1,4 +1,4 @@
 -r requirements.txt
-mcp==1.28.1
-opentelemetry-instrumentation-fastapi==0.65b0
-opentelemetry-instrumentation-httpx==0.65b0
+mcp==2.2.0
+opentelemetry-instrumentation-fastapi==0.66b0
+opentelemetry-instrumentation-httpx==0.66b0
